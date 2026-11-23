@@ -3048,24 +3048,51 @@
   }
 
   function render() {
-    let mainContent = '';
-    if (S.view === 'home') mainContent = renderHomeView();
-    else if (S.view === 'room') mainContent = renderRoomView();
-    else if (S.view === 'setup') mainContent = renderSetupView();
-    else if (S.view === 'race') mainContent = renderRaceView();
-    else if (S.view === 'wallet') mainContent = renderWalletView();
-    else if (S.view === 'rank') mainContent = renderRankView();
-    else if (S.view === 'admin') mainContent = renderAdminView();
+    try {
+      // Auto-reparo de circuito caso a sala estivesse com id antigo removido (ex: 'nur')
+      if (S.room && S.room.race && S.room.race.circuit) {
+        if (!CIRCUITS.find(c => c.id === S.room.race.circuit.id)) {
+          S.room.race.circuit = CIRCUITS[0];
+          S.room.circuitId = CIRCUITS[0].id;
+        }
+      }
+      if (S.room && S.room.circuitId && !CIRCUITS.find(c => c.id === S.room.circuitId)) {
+        S.room.circuitId = CIRCUITS[0].id;
+      }
 
-    $('#app').innerHTML = `${renderHeader()}<main>${mainContent}</main>${renderProfileModal()}${renderSpectatorOverlay()}`;
+      let mainContent = '';
+      if (S.view === 'home') mainContent = renderHomeView();
+      else if (S.view === 'room') mainContent = renderRoomView();
+      else if (S.view === 'setup') mainContent = renderSetupView();
+      else if (S.view === 'race') mainContent = renderRaceView();
+      else if (S.view === 'wallet') mainContent = renderWalletView();
+      else if (S.view === 'rank') mainContent = renderRankView();
+      else if (S.view === 'admin') mainContent = renderAdminView();
 
-    if (S.view === 'race' && S.room && S.room.race && !S.room.race.done) {
-      const mountEl = $('#sim3d-mount');
-      if (mountEl) {
-        SIM3D.mount(mountEl, S.room.race, S.highlightedDriver, (drvId) => {
-          S.highlightedDriver = drvId;
-          updateDriverHighlightUI();
-        });
+      const appEl = $('#app');
+      if (appEl) {
+        appEl.innerHTML = `${renderHeader()}<main>${mainContent}</main>${renderProfileModal()}${renderSpectatorOverlay()}`;
+      }
+
+      if (S.view === 'race' && S.room && S.room.race && !S.room.race.done) {
+        const mountEl = $('#sim3d-mount');
+        if (mountEl) {
+          SIM3D.mount(mountEl, S.room.race, S.highlightedDriver, (drvId) => {
+            S.highlightedDriver = drvId;
+            updateDriverHighlightUI();
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Render error:', err);
+      // Fallback seguro caso ocorra qualquer erro em tela
+      const appEl = $('#app');
+      if (appEl) {
+        appEl.innerHTML = `${renderHeader()}<main><div class="card" style="text-align:center;padding:30px">
+          <h2>Recarregando Simulador...</h2>
+          <p class="mut">Atualizando circuitos e sincronizando sala.</p>
+          <button class="btn ok" onclick="localStorage.removeItem('f1bs_active_room_code_v2');sessionStorage.clear();location.reload()">Limpar Cache e Recarregar</button>
+        </div></main>`;
       }
     }
   }
