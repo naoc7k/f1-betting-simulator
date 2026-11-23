@@ -168,7 +168,7 @@
       pl: 21,
       theme: 'day',
       groundColor: '#192218',
-      desc: 'Design inspirado no ideograma 'shang', com a caracol inicial e a reta oposta de 1.2 km.',
+      desc: 'Design inspirado no ideograma "shang", com o caracol inicial e a reta oposta de 1.2 km.',
       pts: [
         [80.0, -14.4, 0],
         [60.7, -16.6, 0],
@@ -828,7 +828,7 @@
       pl: 20,
       theme: 'day',
       groundColor: '#192415',
-      desc: 'O 'kartódromo' da F1: sinuoso, técnico e sem pausas para respirar no calor húngaro.',
+      desc: 'O "kartódromo" da F1: sinuoso, técnico e sem pausas para respirar no calor húngaro.',
       pts: [
         [-61.9, 27.8, 0],
         [-62.1, 14.5, 0],
