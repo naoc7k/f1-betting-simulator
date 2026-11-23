@@ -374,6 +374,36 @@
   /* =====================================================================
    * 2. ADMINISTRATOR PANEL (SERVER-VALIDATED AUTH & BALANCE CONTROLS)
    * ===================================================================== */
+  /**
+   * Helper to perform Admin API requests with graceful fallback
+   * when running on static hosts (like GitHub Pages) where Python/Node backend is not running.
+   */
+  const FALLBACK_ADMIN_USER = 'LN';
+  const FALLBACK_ADMIN_PASS = 'jairo';
+
+  function getLocalPlayersForAdmin() {
+    const map = loadAccountsMap();
+    const list = Object.values(map).map(p => ({
+      id: p.id,
+      name: p.name,
+      avatarId: p.avatarId,
+      chips: r2(p.chips || 0),
+      balanceVersion: p.balanceVersion || 1,
+      lastSeen: p.lastSeen || Date.now()
+    }));
+    if (S.user && !list.find(x => x.id === S.user.id)) {
+      list.push({
+        id: S.user.id,
+        name: S.user.name,
+        avatarId: S.user.avatarId,
+        chips: r2(S.user.chips || 0),
+        balanceVersion: S.user.balanceVersion || 1,
+        lastSeen: Date.now()
+      });
+    }
+    return list;
+  }
+
   async function adminLogin(ev) {
     if (ev && ev.preventDefault) ev.preventDefault();
     const loginEl = $('#admin-login-input');
@@ -385,27 +415,48 @@
       return toast('Preencha o login e a senha de administrador.');
     }
 
+    // 1. Try Authoritative Server First
+    let serverSuccess = false;
     try {
       const res = await fetch('/api/admin/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ login, password })
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        return toast(data.error || 'Credenciais de administrador inválidas.');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok) {
+          S.admin.token = data.token;
+          S.admin.authenticated = true;
+          S.admin.loginName = data.admin || login;
+          S.admin.players = data.players || [];
+          try { sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token); } catch (e) {}
+          toast(`Painel Administrativo autenticado (${S.admin.loginName})!`, 'ok');
+          render();
+          serverSuccess = true;
+          return;
+        } else {
+          return toast(data.error || 'Credenciais de administrador inválidas.');
+        }
       }
-
-      S.admin.token = data.token;
-      S.admin.authenticated = true;
-      S.admin.loginName = data.admin || login;
-      S.admin.players = data.players || [];
-      try { sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token); } catch (e) {}
-
-      toast(`Painel Administrativo autenticado (${S.admin.loginName})!`, 'ok');
-      render();
     } catch (e) {
-      toast('Erro ao conectar ao servidor de autenticação administrativa.');
+      // Backend not running on this host (e.g. GitHub Pages or file://)
+    }
+
+    // 2. Resilient Static / Peer Fallback (GitHub Pages & Offline Mode)
+    if (!serverSuccess) {
+      if (login === FALLBACK_ADMIN_USER && password === FALLBACK_ADMIN_PASS) {
+        const localToken = 'admin-token-gh-' + Date.now();
+        S.admin.token = localToken;
+        S.admin.authenticated = true;
+        S.admin.loginName = FALLBACK_ADMIN_USER;
+        S.admin.players = getLocalPlayersForAdmin();
+        try { sessionStorage.setItem(ADMIN_TOKEN_KEY, localToken); } catch (e) {}
+        toast(`Painel Administrativo autenticado (${FALLBACK_ADMIN_USER})!`, 'ok');
+        render();
+      } else {
+        toast('Credenciais de administrador inválidas.');
+      }
     }
   }
 
@@ -416,7 +467,7 @@
     S.admin.players = [];
     try { sessionStorage.removeItem(ADMIN_TOKEN_KEY); } catch (e) {}
 
-    if (token) {
+    if (token && !token.startsWith('admin-token-gh-')) {
       try {
         await fetch('/api/admin/logout', {
           method: 'POST',
@@ -431,6 +482,14 @@
 
   async function fetchAdminPlayers(silent = false) {
     if (!S.admin.token) return;
+
+    if (S.admin.token.startsWith('admin-token-gh-')) {
+      S.admin.authenticated = true;
+      S.admin.players = getLocalPlayersForAdmin();
+      if (S.view === 'admin') render();
+      return;
+    }
+
     try {
       const res = await fetch('/api/admin/players', {
         headers: { 'Authorization': 'Bearer ' + S.admin.token },
@@ -450,7 +509,9 @@
         if (S.view === 'admin') render();
       }
     } catch (e) {
-      if (!silent) toast('Falha ao consultar lista de jogadores no servidor.');
+      // Fallback to local accounts list
+      S.admin.players = getLocalPlayersForAdmin();
+      if (S.view === 'admin') render();
     }
   }
 
@@ -465,60 +526,103 @@
       return toast('Informe um valor numérico válido para a operação.');
     }
 
-    try {
-      const res = await fetch('/api/admin/balance', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + S.admin.token
-        },
-        body: JSON.stringify({
-          token: S.admin.token,
-          playerId,
-          operation, // 'add' | 'remove' | 'set'
-          amount
-        })
-      });
+    // Try server update first if not purely offline token
+    let serverDone = false;
+    if (!S.admin.token.startsWith('admin-token-gh-')) {
+      try {
+        const res = await fetch('/api/admin/balance', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + S.admin.token
+          },
+          body: JSON.stringify({
+            token: S.admin.token,
+            playerId,
+            operation,
+            amount
+          })
+        });
 
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        if (res.status === 401) {
-          S.admin.authenticated = false;
-          S.admin.token = null;
-          render();
-        }
-        return toast(data.error || 'Falha ao alterar saldo no servidor.');
-      }
-
-      S.admin.players = data.players || S.admin.players;
-      const updatedPlayer = data.player;
-
-      // Also update local storage account map if the player exists on this browser
-      if (updatedPlayer) {
-        const map = loadAccountsMap();
-        if (map[updatedPlayer.id]) {
-          map[updatedPlayer.id].chips = r2(updatedPlayer.chips);
-          map[updatedPlayer.id].balanceVersion = updatedPlayer.balanceVersion;
-          saveAccountsMap(map);
-        }
-        if (S.user && S.user.id === updatedPlayer.id) {
-          applyAuthoritativeServerPlayerRecord(updatedPlayer);
-        }
-        if (S.room && Array.isArray(S.room.players)) {
-          const rp = S.room.players.find(p => p.id === updatedPlayer.id);
-          if (rp) {
-            rp.chips = r2(updatedPlayer.chips);
-            rp.balanceVersion = updatedPlayer.balanceVersion;
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ok) {
+            serverDone = true;
+            S.admin.players = data.players || S.admin.players;
+            const updatedPlayer = data.player;
+            if (updatedPlayer) {
+              const map = loadAccountsMap();
+              if (map[updatedPlayer.id]) {
+                map[updatedPlayer.id].chips = r2(updatedPlayer.chips);
+                map[updatedPlayer.id].balanceVersion = updatedPlayer.balanceVersion;
+                saveAccountsMap(map);
+              }
+              if (S.user && S.user.id === updatedPlayer.id) {
+                applyAuthoritativeServerPlayerRecord(updatedPlayer);
+              }
+              if (S.room && Array.isArray(S.room.players)) {
+                const rp = S.room.players.find(p => p.id === updatedPlayer.id);
+                if (rp) {
+                  rp.chips = r2(updatedPlayer.chips);
+                  rp.balanceVersion = updatedPlayer.balanceVersion;
+                }
+              }
+            }
+            const opNames = { add: 'adicionado a', remove: 'removido de', set: 'definido para' };
+            toast(`✓ Saldo ${opNames[operation] || 'atualizado:'} ${updatedPlayer ? updatedPlayer.name : playerId} → ${fmt(updatedPlayer.chips)} 🪙`, 'gold');
+            render();
+            return;
           }
         }
+      } catch (e) {
+        // Fallback to local mutation below
       }
-
-      const opNames = { add: 'adicionado a', remove: 'removido de', set: 'definido para' };
-      toast(`✓ Saldo ${opNames[operation] || 'atualizado:'} ${updatedPlayer ? updatedPlayer.name : playerId} → ${fmt(updatedPlayer.chips)} 🪙`, 'gold');
-      render();
-    } catch (e) {
-      toast('Erro ao comunicar com o servidor administrativo.');
     }
+
+    // Local Mutation Fallback (GitHub Pages & Peer sync)
+    const map = loadAccountsMap();
+    let target = map[playerId] || (S.user && S.user.id === playerId ? S.user : null);
+    if (!target) {
+      // Find in S.admin.players
+      const ap = S.admin.players.find(p => p.id === playerId);
+      if (ap) {
+        target = { id: ap.id, name: ap.name, avatarId: ap.avatarId, chips: ap.chips, balanceVersion: 1 };
+        map[playerId] = target;
+      }
+    }
+
+    if (!target) return toast('Jogador não encontrado.');
+
+    let newChips = target.chips || 0;
+    if (operation === 'add') newChips += amount;
+    else if (operation === 'remove') newChips = Math.max(0, newChips - amount);
+    else if (operation === 'set') newChips = Math.max(0, amount);
+
+    target.chips = r2(newChips);
+    target.balanceVersion = (target.balanceVersion || 1) + 1;
+    saveAccountsMap(map);
+
+    if (S.user && S.user.id === playerId) {
+      S.user.chips = target.chips;
+      S.user.balanceVersion = target.balanceVersion;
+      saveLocalUser(S.user);
+    }
+
+    if (S.room && Array.isArray(S.room.players)) {
+      const rp = S.room.players.find(p => p.id === playerId);
+      if (rp) {
+        rp.chips = target.chips;
+        rp.balanceVersion = target.balanceVersion;
+        if (MP.isHost && typeof MP.broadcastRoomState === 'function') {
+          MP.broadcastRoomState(S.room);
+        }
+      }
+    }
+
+    S.admin.players = getLocalPlayersForAdmin();
+    const opNames = { add: 'adicionado a', remove: 'removido de', set: 'definido para' };
+    toast(`✓ Saldo ${opNames[operation] || 'atualizado:'} ${target.name || playerId} → ${fmt(target.chips)} 🪙`, 'gold');
+    render();
   }
 
   /* =====================================================================
@@ -1891,7 +1995,7 @@
         </div>
       </div>
 
-      <div class="row" style="max-width:580px;margin:auto">
+      <div class="row row-stack-mobile" style="max-width:580px;margin:auto">
         <button class="btn" style="padding:13px 22px;font-size:14px" onclick="F1App.createRoom()">🏁 Criar Nova Sala</button>
         <input id="jc" placeholder="Código da sala (ex: ABC123)" maxlength="8" style="text-transform:uppercase;font-weight:800;letter-spacing:1.5px" onkeydown="if(event.key==='Enter')F1App.joinRoom()">
         <button class="btn ghost" style="padding:13px 20px" onclick="F1App.joinRoom()">Entrar na Sala</button>
@@ -2100,7 +2204,7 @@
                 <div class="dr">
                   <span class="tm" style="background:${t.color};height:22px"></span>
                   <div>
-                    <b>${d.id}</b> <span style="font-size:12.5px">${esc(d.name)} ${d.flag || ''}</span>
+                    <b>${d.id}</b> <span style="font-size:12.5px">${esc(d.name)}</span>
                     <small>${esc(t.name)}</small>
                   </div>
                 </div>
@@ -2141,7 +2245,7 @@
         <span class="bet-pos-badge mono ${posNum <= 3 ? 'podium-' + posNum : ''}">${isDnf ? 'OUT' : posNum + 'º'}</span>
         <span class="tm" style="background:${t.color};height:28px"></span>
         <div style="min-width:0;flex:1">
-          <div style="font-weight:900;font-size:13px">${id} ${d.flag || ''} <span class="mut" style="font-size:11px">#${d.num}</span></div>
+          <div style="font-weight:900;font-size:13px">${id} <span class="mut" style="font-size:11px">#${d.num}</span></div>
           <div style="font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.name)}</div>
           <small class="mut" style="font-size:10px">${esc(t.name)}</small>
         </div>
@@ -2317,7 +2421,7 @@
                 <div class="dr">
                   <span class="tm" style="background:${t.color};height:22px"></span>
                   <div>
-                    <b>${id}</b> <span class="mut" style="font-size:11.5px">${drv.flag || ''} ${esc(drv.name.split(' ').pop())}</span>
+                    <b>${id}</b> <span class="mut" style="font-size:11.5px">${esc(drv.name.split(' ').pop())}</span>
                     ${isSel ? '<span style="color:var(--gold);font-size:11px;margin-left:4px">★</span>' : ''}
                   </div>
                 </div>

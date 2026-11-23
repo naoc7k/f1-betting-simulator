@@ -229,11 +229,19 @@
         try {
           this.scene = new THREE.Scene();
           this.camera = new THREE.PerspectiveCamera(42, w / h, 1, 1400);
-          this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+
+          const isMobile = window.innerWidth <= 768 || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+          this.renderer = new THREE.WebGLRenderer({
+            antialias: !isMobile, // Desativa MSAA pesado em mobile para ganho imediato de 60 FPS
+            alpha: false,
+            powerPreference: 'high-performance'
+          });
           this.renderer.setSize(w, h);
-          this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-          this.renderer.shadowMap.enabled = true;
-          this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+          this.renderer.setPixelRatio(isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+          this.renderer.shadowMap.enabled = !isMobile; // Desativa sombras em tempo real no mobile para rodar liso
+          if (!isMobile) {
+            this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+          }
           this.canvasWrap.appendChild(this.renderer.domElement);
           this.useFallback25D = false;
           this.circuitId = null;
@@ -291,6 +299,8 @@
         this.camera.aspect = w / h;
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(w, h);
+        const isMobile = window.innerWidth <= 768 || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+        this.renderer.setPixelRatio(isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 2));
       } else if (this.fallbackCanvas) {
         this.fallbackCanvas.width = w;
         this.fallbackCanvas.height = h;

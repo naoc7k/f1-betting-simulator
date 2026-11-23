@@ -30,38 +30,38 @@
 
   const DRIVERS = [
     // McLaren
-    { id: 'NOR', name: 'Lando Norris',      flag: '🇬🇧', team: 'MCL', num: 4,  skill: -0.22, ov: 0.89, helmet: '#ccff00' },
-    { id: 'PIA', name: 'Oscar Piastri',     flag: '🇦🇺', team: 'MCL', num: 81, skill: -0.18, ov: 0.88, helmet: '#ff5500' },
+    { id: 'NOR', name: 'Lando Norris',      team: 'MCL', num: 4,  skill: -0.22, ov: 0.89, helmet: '#ccff00' },
+    { id: 'PIA', name: 'Oscar Piastri',     team: 'MCL', num: 81, skill: -0.18, ov: 0.88, helmet: '#ff5500' },
     // Mercedes
-    { id: 'RUS', name: 'George Russell',    flag: '🇬🇧', team: 'MER', num: 63, skill: -0.15, ov: 0.86, helmet: '#00d2be' },
-    { id: 'ANT', name: 'Kimi Antonelli',    flag: '🇮🇹', team: 'MER', num: 12, skill: -0.04, ov: 0.83, helmet: '#39ff14' },
+    { id: 'RUS', name: 'George Russell',    team: 'MER', num: 63, skill: -0.15, ov: 0.86, helmet: '#00d2be' },
+    { id: 'ANT', name: 'Kimi Antonelli',    team: 'MER', num: 12, skill: -0.04, ov: 0.83, helmet: '#39ff14' },
     // Red Bull Racing
-    { id: 'VER', name: 'Max Verstappen',    flag: '🇳🇱', team: 'RBR', num: 1,  skill: -0.32, ov: 0.92, helmet: '#ff4500' },
-    { id: 'HAD', name: 'Isack Hadjar',      flag: '🇫🇷', team: 'RBR', num: 6,  skill:  0.03, ov: 0.80, helmet: '#6692ff' },
+    { id: 'VER', name: 'Max Verstappen',    team: 'RBR', num: 1,  skill: -0.32, ov: 0.92, helmet: '#ff4500' },
+    { id: 'HAD', name: 'Isack Hadjar',      team: 'RBR', num: 6,  skill:  0.03, ov: 0.80, helmet: '#6692ff' },
     // Ferrari
-    { id: 'LEC', name: 'Charles Leclerc',   flag: '🇲🇨', team: 'FER', num: 16, skill: -0.19, ov: 0.89, helmet: '#ff1801' },
-    { id: 'HAM', name: 'Lewis Hamilton',    flag: '🇬🇧', team: 'FER', num: 44, skill: -0.18, ov: 0.90, helmet: '#f5d000' },
+    { id: 'LEC', name: 'Charles Leclerc',   team: 'FER', num: 16, skill: -0.19, ov: 0.89, helmet: '#ff1801' },
+    { id: 'HAM', name: 'Lewis Hamilton',    team: 'FER', num: 44, skill: -0.18, ov: 0.90, helmet: '#f5d000' },
     // Williams
-    { id: 'SAI', name: 'Carlos Sainz',      flag: '🇪🇸', team: 'WIL', num: 55, skill: -0.10, ov: 0.85, helmet: '#ffcc00' },
-    { id: 'ALB', name: 'Alexander Albon',   flag: '🇹🇭', team: 'WIL', num: 23, skill: -0.05, ov: 0.83, helmet: '#ff3366' },
+    { id: 'SAI', name: 'Carlos Sainz',      team: 'WIL', num: 55, skill: -0.10, ov: 0.85, helmet: '#ffcc00' },
+    { id: 'ALB', name: 'Alexander Albon',   team: 'WIL', num: 23, skill: -0.05, ov: 0.83, helmet: '#ff3366' },
     // Racing Bulls
-    { id: 'LAW', name: 'Liam Lawson',       flag: '🇳🇿', team: 'RB',  num: 30, skill:  0.02, ov: 0.80, helmet: '#ffffff' },
-    { id: 'LIN', name: 'Arvid Lindblad',    flag: '🇬🇧', team: 'RB',  num: 40, skill:  0.07, ov: 0.78, helmet: '#38bdf8' },
+    { id: 'LAW', name: 'Liam Lawson',       team: 'RB',  num: 30, skill:  0.02, ov: 0.80, helmet: '#ffffff' },
+    { id: 'LIN', name: 'Arvid Lindblad',    team: 'RB',  num: 40, skill:  0.07, ov: 0.78, helmet: '#38bdf8' },
     // Aston Martin
-    { id: 'ALO', name: 'Fernando Alonso',   flag: '🇪🇸', team: 'AST', num: 14, skill: -0.14, ov: 0.89, helmet: '#00bfff' },
-    { id: 'STR', name: 'Lance Stroll',      flag: '🇨🇦', team: 'AST', num: 18, skill:  0.08, ov: 0.74, helmet: '#006644' },
+    { id: 'ALO', name: 'Fernando Alonso',   team: 'AST', num: 14, skill: -0.14, ov: 0.89, helmet: '#00bfff' },
+    { id: 'STR', name: 'Lance Stroll',      team: 'AST', num: 18, skill:  0.08, ov: 0.74, helmet: '#006644' },
     // Haas
-    { id: 'CAM', name: 'Rafael Câmara',     flag: '🇧🇷', team: 'HAA', num: 88, skill:  0.03, ov: 0.81, helmet: '#009c3b' },
-    { id: 'BEA', name: 'Oliver Bearman',    flag: '🇬🇧', team: 'HAA', num: 87, skill:  0.04, ov: 0.79, helmet: '#4aa3ff' },
+    { id: 'CAM', name: 'Rafael Câmara',     team: 'HAA', num: 88, skill:  0.03, ov: 0.81, helmet: '#009c3b' },
+    { id: 'BEA', name: 'Oliver Bearman',    team: 'HAA', num: 87, skill:  0.04, ov: 0.79, helmet: '#4aa3ff' },
     // Audi
-    { id: 'HUL', name: 'Nico Hülkenberg',   flag: '🇩🇪', team: 'AUD', num: 27, skill: -0.02, ov: 0.81, helmet: '#f50537' },
-    { id: 'BOR', name: 'Gabriel Bortoleto', flag: '🇧🇷', team: 'AUD', num: 5,  skill:  0.02, ov: 0.82, helmet: '#009c3b' },
+    { id: 'HUL', name: 'Nico Hülkenberg',   team: 'AUD', num: 27, skill: -0.02, ov: 0.81, helmet: '#f50537' },
+    { id: 'BOR', name: 'Gabriel Bortoleto', team: 'AUD', num: 5,  skill:  0.02, ov: 0.82, helmet: '#009c3b' },
     // Alpine
-    { id: 'GAS', name: 'Pierre Gasly',      flag: '🇫🇷', team: 'ALP', num: 10, skill: -0.03, ov: 0.81, helmet: '#ff66b2' },
-    { id: 'COL', name: 'Franco Colapinto',  flag: '🇦🇷', team: 'ALP', num: 43, skill:  0.05, ov: 0.79, helmet: '#74acdf' },
+    { id: 'GAS', name: 'Pierre Gasly',      team: 'ALP', num: 10, skill: -0.03, ov: 0.81, helmet: '#ff66b2' },
+    { id: 'COL', name: 'Franco Colapinto',  team: 'ALP', num: 43, skill:  0.05, ov: 0.79, helmet: '#74acdf' },
     // Cadillac
-    { id: 'BOT', name: 'Valtteri Bottas',   flag: '🇫🇮', team: 'CAD', num: 77, skill: -0.02, ov: 0.81, helmet: '#3b82f6' },
-    { id: 'PER', name: 'Sergio Pérez',      flag: '🇲🇽', team: 'CAD', num: 11, skill: -0.04, ov: 0.83, helmet: '#eab308' }
+    { id: 'BOT', name: 'Valtteri Bottas',   team: 'CAD', num: 77, skill: -0.02, ov: 0.81, helmet: '#3b82f6' },
+    { id: 'PER', name: 'Sergio Pérez',      team: 'CAD', num: 11, skill: -0.04, ov: 0.83, helmet: '#eab308' }
   ];
 
   const TEAM_PACE = {
