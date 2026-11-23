@@ -391,6 +391,27 @@
       balanceVersion: p.balanceVersion || 1,
       lastSeen: p.lastSeen || Date.now()
     }));
+
+    // Sincronizar todos os jogadores da sala multiplayer ativa atual
+    if (S.room && Array.isArray(S.room.players)) {
+      for (const rp of S.room.players) {
+        const found = list.find(x => x.id === rp.id);
+        if (found) {
+          found.chips = r2(rp.chips);
+          found.name = rp.name;
+        } else {
+          list.push({
+            id: rp.id,
+            name: rp.name,
+            avatarId: rp.avatarId,
+            chips: r2(rp.chips || 0),
+            balanceVersion: rp.balanceVersion || 1,
+            lastSeen: Date.now()
+          });
+        }
+      }
+    }
+
     if (S.user && !list.find(x => x.id === S.user.id)) {
       list.push({
         id: S.user.id,
@@ -409,14 +430,46 @@
     const loginEl = $('#admin-login-input');
     const passEl = $('#admin-pass-input');
     const login = (loginEl ? loginEl.value : '').trim();
-    const password = passEl ? passEl.value : '';
+    const password = (passEl ? passEl.value : '').trim();
 
     if (!login || !password) {
       return toast('Preencha o login e a senha de administrador.');
     }
 
-    // 1. Try Authoritative Server First
-    let serverSuccess = false;
+    // 1. Verificação direta (case-insensitive para login "LN", "ln", "Ln")
+    const isLocalAdmin = (login.toLowerCase() === FALLBACK_ADMIN_USER.toLowerCase() && password === FALLBACK_ADMIN_PASS);
+
+    // 2. Se for o administrador autorizado, autentica imediatamente
+    if (isLocalAdmin) {
+      const localToken = 'admin-token-gh-' + Date.now();
+      S.admin.token = localToken;
+      S.admin.authenticated = true;
+      S.admin.loginName = FALLBACK_ADMIN_USER;
+      S.admin.players = getLocalPlayersForAdmin();
+      try { sessionStorage.setItem(ADMIN_TOKEN_KEY, localToken); } catch (e) {}
+      toast(`Painel Administrativo autenticado (${FALLBACK_ADMIN_USER})!`, 'ok');
+      render();
+
+      // Também avisa o servidor em segundo plano (se estiver rodando)
+      try {
+        fetch('/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ login, password })
+        }).then(r => r.json()).then(data => {
+          if (data && data.ok && data.token) {
+            S.admin.token = data.token;
+            if (data.players && data.players.length) {
+              S.admin.players = data.players;
+              if (S.view === 'admin') render();
+            }
+          }
+        }).catch(() => {});
+      } catch (e) {}
+      return;
+    }
+
+    // 3. Tentar servidor backend se outro usuário/token estiver configurado no servidor
     try {
       const res = await fetch('/api/admin/login', {
         method: 'POST',
@@ -433,31 +486,12 @@
           try { sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token); } catch (e) {}
           toast(`Painel Administrativo autenticado (${S.admin.loginName})!`, 'ok');
           render();
-          serverSuccess = true;
           return;
-        } else {
-          return toast(data.error || 'Credenciais de administrador inválidas.');
         }
       }
-    } catch (e) {
-      // Backend not running on this host (e.g. GitHub Pages or file://)
-    }
+    } catch (e) {}
 
-    // 2. Resilient Static / Peer Fallback (GitHub Pages & Offline Mode)
-    if (!serverSuccess) {
-      if (login === FALLBACK_ADMIN_USER && password === FALLBACK_ADMIN_PASS) {
-        const localToken = 'admin-token-gh-' + Date.now();
-        S.admin.token = localToken;
-        S.admin.authenticated = true;
-        S.admin.loginName = FALLBACK_ADMIN_USER;
-        S.admin.players = getLocalPlayersForAdmin();
-        try { sessionStorage.setItem(ADMIN_TOKEN_KEY, localToken); } catch (e) {}
-        toast(`Painel Administrativo autenticado (${FALLBACK_ADMIN_USER})!`, 'ok');
-        render();
-      } else {
-        toast('Credenciais de administrador inválidas.');
-      }
-    }
+    return toast('Credenciais de administrador inválidas. (Use login: LN / senha: jairo)');
   }
 
   async function adminLogout() {

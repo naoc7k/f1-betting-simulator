@@ -26,108 +26,32 @@
     W: 0x38bdf8
   };
 
-  // Visual theme & custom palette per circuit ID
+  // Visual theme & custom palette per circuit ID (All 24 circuits from PDF)
   const CIRCUIT_STYLES = {
-    int: {
-      sky: 0x0b1726,
-      fog: 0x0b1726,
-      ground: 0x162b19,
-      asphalt: 0x1e222a,
-      kerbA: [0.0, 0.62, 0.23], // Brazilian Green
-      kerbB: [0.98, 0.82, 0.08], // Brazilian Yellow
-      gantryColor: 0x009c3b,
-      runoffColor: 0x15803d
-    },
-    mon: {
-      sky: 0x0b1e36,
-      fog: 0x0b1e36,
-      ground: 0x1b2430, // Urban Monte Carlo slate
-      asphalt: 0x232730,
-      kerbA: [0.88, 0.08, 0.12], // Monaco Red
-      kerbB: [0.96, 0.96, 0.98], // White
-      gantryColor: 0xe10600,
-      runoffColor: 0x1e3a8a
-    },
-    sil: {
-      sky: 0x0d1722,
-      fog: 0x0d1722,
-      ground: 0x142618,
-      asphalt: 0x1c2026,
-      kerbA: [0.12, 0.25, 0.68], // British Blue/Red
-      kerbB: [0.95, 0.95, 0.97],
-      gantryColor: 0x1e3a8a,
-      runoffColor: 0x334155
-    },
-    mza: {
-      sky: 0x0e1921,
-      fog: 0x0e1921,
-      ground: 0x162a16,
-      asphalt: 0x1f232b,
-      kerbA: [0.85, 0.08, 0.12], // Italian Red / Green
-      kerbB: [0.05, 0.62, 0.25],
-      gantryColor: 0xdc2626,
-      runoffColor: 0x92400e
-    },
-    spa: {
-      sky: 0x09151d,
-      fog: 0x09151d,
-      ground: 0x0e2112,
-      asphalt: 0x1a1e24,
-      kerbA: [0.88, 0.08, 0.08], // Belgian Red
-      kerbB: [0.98, 0.80, 0.06], // Belgian Yellow
-      gantryColor: 0xf59e0b,
-      runoffColor: 0x78350f
-    },
-    suz: {
-      sky: 0x0c1828,
-      fog: 0x0c1828,
-      ground: 0x15271a,
-      asphalt: 0x1f242d,
-      kerbA: [0.90, 0.08, 0.14],
-      kerbB: [0.96, 0.96, 0.98],
-      gantryColor: 0xe10600,
-      runoffColor: 0x92400e
-    },
-    nur: {
-      sky: 0x0a131c,
-      fog: 0x0a131c,
-      ground: 0x112215,
-      asphalt: 0x1c2028,
-      kerbA: [0.88, 0.06, 0.06],
-      kerbB: [0.95, 0.95, 0.97],
-      gantryColor: 0xb91c1c,
-      runoffColor: 0x475569
-    },
-    yas: {
-      sky: 0x050811,
-      fog: 0x050811,
-      ground: 0x181512, // Night desert & marina
-      asphalt: 0x171a22,
-      kerbA: [0.06, 0.72, 0.88], // Yas Cyan Blue
-      kerbB: [0.95, 0.95, 0.98],
-      gantryColor: 0x06b6d4,
-      runoffColor: 0x0284c7
-    },
-    rbr: {
-      sky: 0x0b1929,
-      fog: 0x0b1929,
-      ground: 0x182e18,
-      asphalt: 0x1e222a,
-      kerbA: [0.88, 0.05, 0.08],
-      kerbB: [0.98, 0.85, 0.10],
-      gantryColor: 0x1d4ed8,
-      runoffColor: 0x15803d
-    },
-    can: {
-      sky: 0x0b1d2e,
-      fog: 0x0b1d2e,
-      ground: 0x0b253a, // Surrounding river water base
-      asphalt: 0x1f242c,
-      kerbA: [0.88, 0.06, 0.08],
-      kerbB: [0.96, 0.96, 0.98],
-      gantryColor: 0xdc2626,
-      runoffColor: 0x475569
-    }
+    int: { sky: 0x0b1726, fog: 0x0b1726, ground: 0x162b19, asphalt: 0x1e222a, kerbA: [0.0, 0.62, 0.23], kerbB: [0.98, 0.82, 0.08], gantryColor: 0x009c3b, runoffColor: 0x15803d },
+    mon: { sky: 0x0b1e36, fog: 0x0b1e36, ground: 0x1b2430, asphalt: 0x232730, kerbA: [0.88, 0.08, 0.12], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xe10600, runoffColor: 0x1e3a8a },
+    sil: { sky: 0x0d1722, fog: 0x0d1722, ground: 0x142618, asphalt: 0x1c2026, kerbA: [0.12, 0.25, 0.68], kerbB: [0.95, 0.95, 0.97], gantryColor: 0x1e3a8a, runoffColor: 0x334155 },
+    mza: { sky: 0x0e1921, fog: 0x0e1921, ground: 0x162a16, asphalt: 0x1f232b, kerbA: [0.85, 0.08, 0.12], kerbB: [0.05, 0.62, 0.25], gantryColor: 0xdc2626, runoffColor: 0x92400e },
+    spa: { sky: 0x09151d, fog: 0x09151d, ground: 0x0e2112, asphalt: 0x1a1e24, kerbA: [0.88, 0.08, 0.08], kerbB: [0.98, 0.80, 0.06], gantryColor: 0xf59e0b, runoffColor: 0x78350f },
+    suz: { sky: 0x0c1828, fog: 0x0c1828, ground: 0x15271a, asphalt: 0x1f242d, kerbA: [0.90, 0.08, 0.14], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xe10600, runoffColor: 0x92400e },
+    yas: { sky: 0x050811, fog: 0x050811, ground: 0x181512, asphalt: 0x171a22, kerbA: [0.06, 0.72, 0.88], kerbB: [0.95, 0.95, 0.98], gantryColor: 0x06b6d4, runoffColor: 0x0284c7 },
+    rbr: { sky: 0x0b1929, fog: 0x0b1929, ground: 0x182e18, asphalt: 0x1e222a, kerbA: [0.88, 0.05, 0.08], kerbB: [0.98, 0.85, 0.10], gantryColor: 0x1d4ed8, runoffColor: 0x15803d },
+    can: { sky: 0x0b1d2e, fog: 0x0b1d2e, ground: 0x0b253a, asphalt: 0x1f242c, kerbA: [0.88, 0.06, 0.08], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xdc2626, runoffColor: 0x475569 },
+    alb: { sky: 0x0e1c2b, fog: 0x0e1c2b, ground: 0x15291b, asphalt: 0x20242d, kerbA: [0.92, 0.08, 0.12], kerbB: [0.96, 0.96, 0.98], gantryColor: 0x2563eb, runoffColor: 0x15803d },
+    sha: { sky: 0x0f1822, fog: 0x0f1822, ground: 0x18201a, asphalt: 0x1e2228, kerbA: [0.88, 0.06, 0.06], kerbB: [0.98, 0.82, 0.08], gantryColor: 0xdc2626, runoffColor: 0x78350f },
+    bah: { sky: 0x070b16, fog: 0x070b16, ground: 0x1a1612, asphalt: 0x181a22, kerbA: [0.88, 0.06, 0.08], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xdc2626, runoffColor: 0x92400e },
+    jed: { sky: 0x060914, fog: 0x060914, ground: 0x0f1722, asphalt: 0x161820, kerbA: [0.08, 0.65, 0.35], kerbB: [0.96, 0.96, 0.98], gantryColor: 0x10b981, runoffColor: 0x0284c7 },
+    mia: { sky: 0x0a1c2d, fog: 0x0a1c2d, ground: 0x14222e, asphalt: 0x222630, kerbA: [0.06, 0.76, 0.82], kerbB: [0.96, 0.96, 0.98], gantryColor: 0x06b6d4, runoffColor: 0x0369a1 },
+    imo: { sky: 0x0c1723, fog: 0x0c1723, ground: 0x162617, asphalt: 0x1e222a, kerbA: [0.85, 0.08, 0.12], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xdc2626, runoffColor: 0x15803d },
+    cat: { sky: 0x0e1b26, fog: 0x0e1b26, ground: 0x192518, asphalt: 0x1f232b, kerbA: [0.88, 0.08, 0.10], kerbB: [0.98, 0.82, 0.08], gantryColor: 0xdc2626, runoffColor: 0x78350f },
+    hun: { sky: 0x0e1922, fog: 0x0e1922, ground: 0x192617, asphalt: 0x1e2228, kerbA: [0.85, 0.08, 0.12], kerbB: [0.05, 0.62, 0.25], gantryColor: 0x15803d, runoffColor: 0x92400e },
+    zan: { sky: 0x0b1e2e, fog: 0x0b1e2e, ground: 0x242018, asphalt: 0x20242c, kerbA: [0.88, 0.08, 0.10], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xe10600, runoffColor: 0xb45309 },
+    bak: { sky: 0x0a1624, fog: 0x0a1624, ground: 0x171f2a, asphalt: 0x1f232c, kerbA: [0.08, 0.58, 0.78], kerbB: [0.96, 0.96, 0.98], gantryColor: 0x0284c7, runoffColor: 0x334155 },
+    sin: { sky: 0x050812, fog: 0x050812, ground: 0x0e141e, asphalt: 0x171922, kerbA: [0.88, 0.08, 0.12], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xdc2626, runoffColor: 0x1e3a8a },
+    cot: { sky: 0x0d1a28, fog: 0x0d1a28, ground: 0x221b16, asphalt: 0x1f232b, kerbA: [0.12, 0.25, 0.68], kerbB: [0.88, 0.08, 0.12], gantryColor: 0x1e3a8a, runoffColor: 0xb45309 },
+    mex: { sky: 0x0d1822, fog: 0x0d1822, ground: 0x1b2019, asphalt: 0x1e2229, kerbA: [0.05, 0.62, 0.25], kerbB: [0.88, 0.08, 0.12], gantryColor: 0x059669, runoffColor: 0x78350f },
+    las: { sky: 0x050711, fog: 0x050711, ground: 0x0c0f18, asphalt: 0x161820, kerbA: [0.88, 0.08, 0.12], kerbB: [0.96, 0.96, 0.98], gantryColor: 0xdc2626, runoffColor: 0x312e81 },
+    lus: { sky: 0x060914, fog: 0x060914, ground: 0x181518, asphalt: 0x181a22, kerbA: [0.65, 0.08, 0.25], kerbB: [0.96, 0.96, 0.98], gantryColor: 0x831843, runoffColor: 0x581c87 }
   };
 
   class F1Sim3D {
