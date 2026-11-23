@@ -1,5 +1,5 @@
 /**
- * F1 Betting Simulator 3D · Full-Stack Multiplayer, Betting & Cashbox Application
+ * F1 Betting Simulator 3D · Full-Stack Multiplayer, Admin Panel, Betting & Cashbox Application
  */
 (function () {
   const { TEAMS, DRIVERS, TEAM_PACE, AVATARS, CIRCUITS } = window.F1Tracks;
@@ -11,13 +11,14 @@
   const MAX_RACE_LAPS = 90;
   const MIN_PLAYERS_TO_START = 2;
   const LAP_DURATION_MS = 30000; // 30 seconds per lap
-  const INITIAL_CHIPS = 25000;   // 25.000 fichas iniciais para testar apostas até 10.000
+  const INITIAL_CHIPS = 100;     // Saldo inicial de todos os jogadores: 100 fichas
 
   const ACCOUNTS_STORAGE_KEY = 'f1bs_accounts_v2';
   const LAST_ACCOUNT_KEY = 'f1bs_last_account_id_v2';
   const TAB_ACCOUNT_KEY = 'f1bs_tab_account_id_v2';
   const GLOBAL_HISTORY_KEY = 'f1bs_history_v2';
   const ACTIVE_ROOM_KEY = 'f1bs_active_room_code_v2';
+  const ADMIN_TOKEN_KEY = 'f1bs_admin_token_v2';
 
   const TYRES = {
     S: { p: -0.5, d: 0.07, l: 14, name: 'Macio (S)' },
@@ -32,17 +33,32 @@
     profileModalOpen: false,
     profileDraftName: '',
     profileDraftAvatar: 'av1',
-    user: null, // Persistent player profile { id, name, avatarId, chips, wins, cashbox, settledBets }
-    room: null, // Synchronized room { code, hostId, circuitId, laps, wxMode, grid, players, race, chat }
+    user: null, // Persistent player profile { id, name, avatarId, chips, balanceVersion, wins, cashbox, settledBets }
+    room: null, // Synchronized room { code, hostId, creatorId, circuitId, laps, wxMode, grid, players, race }
     selectedBetDriver: 'VER',
-    betAmountInput: 500,
+    betAmountInput: 20,
     highlightedDriver: null,
     spectator: false,
     history: [],
     champ: { d: {}, t: {}, n: 0 },
     connStatus: { backend: false, webrtc: false, ws: false, local: true },
     hostTickTimer: null,
-    presenceTimer: null
+    presenceTimer: null,
+    // Admin Panel State
+    admin: {
+      token: null,
+      authenticated: false,
+      loginName: '',
+      players: [],
+      loading: false,
+      searchQuery: ''
+    },
+    // Anti-flicker render signatures
+    _lastEventsSig: '',
+    _lastTowerSig: '',
+    _lastBetsSig: '',
+    _lastBetDriverOrderSig: '',
+    _lastRoomPlayersSig: ''
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -67,7 +83,7 @@
   }
 
   /* =====================================================================
-   * 1. PERSISTENT PROFILE, LOGIN & CASHBOX (CAIXA DE FICHAS)
+   * 1. PERSISTENT PROFILE, LOGIN, SERVER BALANCE SYNC & CASHBOX
    * ===================================================================== */
   function loadAccountsMap() {
     try {
@@ -90,15 +106,17 @@
       name: name.trim() || 'Piloto',
       avatarId: avatarId || 'av1',
       chips: INITIAL_CHIPS,
+      balanceVersion: 1,
+      initial100Applied: true,
       wins: 0,
-      settledBets: {}, // betId -> true (anti-duplication)
+      settledBets: {},
       cashbox: {
         totalBet: 0,
         totalWon: 0,
         totalLost: 0,
         netProfit: 0,
-        betHistory: [],       // { id, raceId, circuit, driver, amount, round, lap, mult, status, ret, net, date }
-        financialHistory: []  // { txId, type, title, detail, amount, balanceAfter, date }
+        betHistory: [],
+        financialHistory: []
       }
     };
   }
@@ -115,11 +133,23 @@
     acc.cashbox.financialHistory = acc.cashbox.financialHistory || [];
     acc.settledBets = acc.settledBets || {};
     acc.avatarId = acc.avatarId || 'av1';
-    if (typeof acc.chips !== 'number' || isNaN(acc.chips)) acc.chips = INITIAL_CHIPS;
+    acc.balanceVersion = Number(acc.balanceVersion || 1);
+
+    // Migrate accounts that had the previous 25.000 default initial balance to 100
+    if (!acc.initial100Applied) {
+      acc.initial100Applied = true;
+      if (acc.chips === 25000 && acc.cashbox.betHistory.length === 0) {
+        acc.chips = INITIAL_CHIPS;
+        acc.balanceVersion += 1;
+      }
+    }
+    if (typeof acc.chips !== 'number' || isNaN(acc.chips)) {
+      acc.chips = INITIAL_CHIPS;
+    }
     return acc;
   }
 
-  function saveCurrentUser(setAsDefaultLast = true) {
+  function saveCurrentUser(setAsDefaultLast = true, syncServer = true) {
     if (!S.user) return;
     ensureAccountIntegrity(S.user);
     const map = loadAccountsMap();
@@ -131,7 +161,69 @@
         localStorage.setItem(LAST_ACCOUNT_KEY, S.user.id);
       }
     } catch (e) {}
+    if (syncServer) {
+      syncPlayerWithBackend(S.user);
+    }
   }
+
+  async function syncPlayerWithBackend(userObj) {
+    if (!userObj || location.protocol === 'file:') return;
+    try {
+      const res = await fetch('/api/player/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          player: {
+            id: userObj.id,
+            name: userObj.name,
+            avatarId: userObj.avatarId,
+            chips: userObj.chips,
+            wins: userObj.wins || 0,
+            balanceVersion: userObj.balanceVersion || 1
+          }
+        })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.ok && data.player) {
+          applyAuthoritativeServerPlayerRecord(data.player);
+        }
+      }
+    } catch (e) {}
+  }
+
+  function applyAuthoritativeServerPlayerRecord(srvRec) {
+    if (!srvRec || !S.user || srvRec.id !== S.user.id) return;
+    const srvVer = Number(srvRec.balanceVersion || 1);
+    const myVer = Number(S.user.balanceVersion || 1);
+    if (srvVer > myVer) {
+      const diff = r2(srvRec.chips - S.user.chips);
+      S.user.chips = r2(srvRec.chips);
+      S.user.balanceVersion = srvVer;
+      if (srvRec.lastAdminOp && srvRec.lastAdminOp.id) {
+        recordFinancialTx(
+          'tx_' + srvRec.lastAdminOp.id,
+          diff >= 0 ? 'RACE_WIN' : 'RACE_LOSS',
+          'Ajuste Administrativo de Saldo',
+          srvRec.lastAdminOp.label || 'Alteração realizada pelo Administrador',
+          diff
+        );
+      }
+      saveCurrentUser(true, false);
+      const balanceEl = $('#header-balance-val');
+      if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
+      if (S.view === 'wallet' || S.view === 'home' || S.view === 'admin') {
+        render();
+      } else {
+        updateHeaderAndRoomDOM();
+      }
+    }
+  }
+
+  // Listen to authoritative balance updates piggybacked on multiplayer polling
+  MP.onServerMeUpdate = (meRec) => {
+    applyAuthoritativeServerPlayerRecord(meRec);
+  };
 
   function initUserAuth() {
     const map = loadAccountsMap();
@@ -142,6 +234,15 @@
       lastAccId = localStorage.getItem(LAST_ACCOUNT_KEY);
     } catch (e) {}
 
+    // Migrate any existing local accounts with untouched 25000 chips to 100
+    let mapChanged = false;
+    Object.values(map).forEach(acc => {
+      const prevChips = acc.chips;
+      ensureAccountIntegrity(acc);
+      if (acc.chips !== prevChips) mapChanged = true;
+    });
+    if (mapChanged) saveAccountsMap(map);
+
     const urlParams = new URLSearchParams(window.location.search);
     const forceNewPlayer = urlParams.get('newplayer') === '1';
 
@@ -151,24 +252,35 @@
       S.user = ensureAccountIntegrity(map[lastAccId]);
       try { sessionStorage.setItem(TAB_ACCOUNT_KEY, S.user.id); } catch (e) {}
     } else {
-      // Check if any account exists in map
       const existingIds = Object.keys(map);
       if (!forceNewPlayer && existingIds.length > 0) {
         S.user = ensureAccountIntegrity(map[existingIds[0]]);
-        saveCurrentUser(true);
+        saveCurrentUser(true, false);
       } else {
-        // First time ever on this device (or ?newplayer=1 for testing friend tab)
         const num = existingIds.length + 1;
         const defAv = AVATARS[(num - 1) % AVATARS.length].id;
         S.user = createDefaultAccount(`Piloto ${num}`, defAv);
-        saveCurrentUser(!forceNewPlayer);
+        saveCurrentUser(!forceNewPlayer, false);
       }
     }
 
     S.profileDraftName = S.user.name;
     S.profileDraftAvatar = S.user.avatarId;
 
-    // Load global history & championship
+    // Register / sync all local accounts with backend so Admin can see all registered players
+    Object.values(loadAccountsMap()).forEach(acc => {
+      syncPlayerWithBackend(acc);
+    });
+
+    // Restore admin token if saved in sessionStorage
+    try {
+      const savedToken = sessionStorage.getItem(ADMIN_TOKEN_KEY);
+      if (savedToken) {
+        S.admin.token = savedToken;
+        fetchAdminPlayers(true);
+      }
+    } catch (e) {}
+
     try {
       const gh = JSON.parse(localStorage.getItem(GLOBAL_HISTORY_KEY) || 'null');
       if (gh) {
@@ -191,7 +303,7 @@
     if (!S.user) return false;
     ensureAccountIntegrity(S.user);
     if (S.user.cashbox.financialHistory.some(x => x.txId === txId)) {
-      return false; // Deduplicated!
+      return false;
     }
     S.user.cashbox.financialHistory.unshift({
       txId,
@@ -213,7 +325,6 @@
     if (!clean) return toast('Digite um nome de login válido');
     const map = loadAccountsMap();
 
-    // Check if user wants to log into an existing saved profile by name
     const existingByName = Object.values(map).find(
       a => a.name.toLowerCase() === clean.toLowerCase() && a.id !== S.user.id
     );
@@ -226,10 +337,9 @@
       S.user.avatarId = avatarId || S.user.avatarId;
     }
 
-    saveCurrentUser(true);
+    saveCurrentUser(true, true);
     S.profileModalOpen = false;
 
-    // Sync updated profile with active room if inside one
     if (S.room) {
       syncMyPlayerInRoom();
     }
@@ -246,11 +356,10 @@
       map[newAcc.id] = newAcc;
       saveAccountsMap(map);
       S.user = newAcc;
-      // Save in sessionStorage for this tab, and also update last account
-      saveCurrentUser(true);
+      saveCurrentUser(true, true);
     } else if (map[accId]) {
       S.user = ensureAccountIntegrity(map[accId]);
-      saveCurrentUser(true);
+      saveCurrentUser(true, true);
     }
     S.profileDraftName = S.user.name;
     S.profileDraftAvatar = S.user.avatarId;
@@ -263,7 +372,157 @@
   }
 
   /* =====================================================================
-   * 2. MULTIPLAYER ROOMS, REAL-TIME SYNC & PRESENCE
+   * 2. ADMINISTRATOR PANEL (SERVER-VALIDATED AUTH & BALANCE CONTROLS)
+   * ===================================================================== */
+  async function adminLogin(ev) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    const loginEl = $('#admin-login-input');
+    const passEl = $('#admin-pass-input');
+    const login = (loginEl ? loginEl.value : '').trim();
+    const password = passEl ? passEl.value : '';
+
+    if (!login || !password) {
+      return toast('Preencha o login e a senha de administrador.');
+    }
+
+    try {
+      const res = await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login, password })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        return toast(data.error || 'Credenciais de administrador inválidas.');
+      }
+
+      S.admin.token = data.token;
+      S.admin.authenticated = true;
+      S.admin.loginName = data.admin || login;
+      S.admin.players = data.players || [];
+      try { sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token); } catch (e) {}
+
+      toast(`Painel Administrativo autenticado (${S.admin.loginName})!`, 'ok');
+      render();
+    } catch (e) {
+      toast('Erro ao conectar ao servidor de autenticação administrativa.');
+    }
+  }
+
+  async function adminLogout() {
+    const token = S.admin.token;
+    S.admin.token = null;
+    S.admin.authenticated = false;
+    S.admin.players = [];
+    try { sessionStorage.removeItem(ADMIN_TOKEN_KEY); } catch (e) {}
+
+    if (token) {
+      try {
+        await fetch('/api/admin/logout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+          body: JSON.stringify({ token })
+        });
+      } catch (e) {}
+    }
+    toast('Sessão administrativa encerrada.');
+    render();
+  }
+
+  async function fetchAdminPlayers(silent = false) {
+    if (!S.admin.token) return;
+    try {
+      const res = await fetch('/api/admin/players', {
+        headers: { 'Authorization': 'Bearer ' + S.admin.token },
+        cache: 'no-store'
+      });
+      if (res.status === 401) {
+        S.admin.token = null;
+        S.admin.authenticated = false;
+        try { sessionStorage.removeItem(ADMIN_TOKEN_KEY); } catch (e) {}
+        if (!silent) render();
+        return;
+      }
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        S.admin.authenticated = true;
+        S.admin.players = data.players || [];
+        if (S.view === 'admin') render();
+      }
+    } catch (e) {
+      if (!silent) toast('Falha ao consultar lista de jogadores no servidor.');
+    }
+  }
+
+  async function adminModifyBalance(playerId, operation) {
+    if (!S.admin.authenticated || !S.admin.token) {
+      return toast('Acesso negado: faça login como administrador.');
+    }
+    const inputEl = document.getElementById(`adm-amt-${playerId}`);
+    const amount = r2(+(inputEl ? inputEl.value : 0));
+
+    if (isNaN(amount) || amount < 0 || (operation !== 'set' && amount <= 0)) {
+      return toast('Informe um valor numérico válido para a operação.');
+    }
+
+    try {
+      const res = await fetch('/api/admin/balance', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + S.admin.token
+        },
+        body: JSON.stringify({
+          token: S.admin.token,
+          playerId,
+          operation, // 'add' | 'remove' | 'set'
+          amount
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        if (res.status === 401) {
+          S.admin.authenticated = false;
+          S.admin.token = null;
+          render();
+        }
+        return toast(data.error || 'Falha ao alterar saldo no servidor.');
+      }
+
+      S.admin.players = data.players || S.admin.players;
+      const updatedPlayer = data.player;
+
+      // Also update local storage account map if the player exists on this browser
+      if (updatedPlayer) {
+        const map = loadAccountsMap();
+        if (map[updatedPlayer.id]) {
+          map[updatedPlayer.id].chips = r2(updatedPlayer.chips);
+          map[updatedPlayer.id].balanceVersion = updatedPlayer.balanceVersion;
+          saveAccountsMap(map);
+        }
+        if (S.user && S.user.id === updatedPlayer.id) {
+          applyAuthoritativeServerPlayerRecord(updatedPlayer);
+        }
+        if (S.room && Array.isArray(S.room.players)) {
+          const rp = S.room.players.find(p => p.id === updatedPlayer.id);
+          if (rp) {
+            rp.chips = r2(updatedPlayer.chips);
+            rp.balanceVersion = updatedPlayer.balanceVersion;
+          }
+        }
+      }
+
+      const opNames = { add: 'adicionado a', remove: 'removido de', set: 'definido para' };
+      toast(`✓ Saldo ${opNames[operation] || 'atualizado:'} ${updatedPlayer ? updatedPlayer.name : playerId} → ${fmt(updatedPlayer.chips)} 🪙`, 'gold');
+      render();
+    } catch (e) {
+      toast('Erro ao comunicar com o servidor administrativo.');
+    }
+  }
+
+  /* =====================================================================
+   * 3. MULTIPLAYER ROOMS, RACE CREATOR PERMISSION & ANTI-FLICKER SYNC
    * ===================================================================== */
   function genRoomCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -281,7 +540,7 @@
     return 'SEED-' + (arr[0] ^ arr[1]).toString(36).toUpperCase();
   }
 
-  function makePlayerEntry(user, isHost = false) {
+  function makePlayerEntry(user, isCreator = false) {
     const av = avObj(user.avatarId);
     return {
       id: user.id,
@@ -290,23 +549,27 @@
       avatarIcon: av.icon,
       color: av.color,
       chips: r2(user.chips),
+      balanceVersion: user.balanceVersion || 1,
       wins: user.wins || 0,
       online: true,
-      isHost: !!isHost,
+      isHost: !!isCreator,
+      isCreator: !!isCreator,
       lastSeen: Date.now()
     };
   }
 
-  function isRoomHost() {
+  /**
+   * Checks if the current user is the single authorized Race Creator in the room.
+   * Only this player can create/configure races, close the betting window, or start the race.
+   */
+  function isAuthorizedCreator() {
     if (!S.room || !S.user) return false;
-    if (S.room.hostId === S.user.id) return true;
-    // Host failover: if host is offline and I am the first online player
-    const hostPlayer = S.room.players.find(p => p.id === S.room.hostId);
-    if (!hostPlayer || !hostPlayer.online) {
-      const firstOnline = S.room.players.find(p => p.online);
-      if (firstOnline && firstOnline.id === S.user.id) return true;
-    }
-    return false;
+    const creatorId = S.room.creatorId || S.room.hostId;
+    return creatorId === S.user.id;
+  }
+
+  function isRoomHost() {
+    return isAuthorizedCreator();
   }
 
   function getOnlinePlayers(room = S.room) {
@@ -320,6 +583,7 @@
     const room = {
       code,
       hostId: S.user.id,
+      creatorId: S.user.id, // Single authorized race creator assigned upon entering the lobby
       createdAt: Date.now(),
       circuitId: 'int',
       laps: 15,
@@ -333,7 +597,7 @@
     try { sessionStorage.setItem(ACTIVE_ROOM_KEY, code); } catch (e) {}
     MP.connectRoom(code, S.user.id, true, room);
     startPresenceLoop();
-    toast(`Sala ${code} criada! Convide seu amigo.`, 'ok');
+    toast(`Sala ${code} criada! Você é o Criador Autorizado de corridas desta sala.`, 'ok');
     go('room');
   }
 
@@ -341,13 +605,11 @@
     const rawCode = (codeInput || ($('#jc') ? $('#jc').value : '') || '').trim().toUpperCase();
     if (rawCode.length < 4) return toast('Digite um código de sala válido');
 
-    // Check if joining on the same browser where another tab already has our exact playerId online in that room
     const cachedRoom = MP._loadLocalRoomState(rawCode);
     if (cachedRoom && Array.isArray(cachedRoom.players)) {
       const alreadyInRoom = cachedRoom.players.find(p => p.id === S.user.id && p.online);
       const otherTabMarker = sessionStorage.getItem('f1bs_tab_joined_' + rawCode);
       if (alreadyInRoom && !otherTabMarker) {
-        // Automatically create or switch to a second guest profile for this tab if the user opened a 2nd tab on the same browser!
         const map = loadAccountsMap();
         const otherAcc = Object.values(map).find(a => a.id !== S.user.id && !cachedRoom.players.some(p => p.id === a.id && p.online));
         if (otherAcc) {
@@ -362,6 +624,7 @@
           S.user = friendAcc;
           try { sessionStorage.setItem(TAB_ACCOUNT_KEY, S.user.id); } catch (e) {}
         }
+        syncPlayerWithBackend(S.user);
         toast(`2ª Aba detectada: conectado como ${S.user.name}`, 'gold');
       }
     }
@@ -380,6 +643,7 @@
       S.room = {
         code: rawCode,
         hostId: null,
+        creatorId: null,
         createdAt: Date.now(),
         circuitId: 'int',
         laps: 15,
@@ -391,7 +655,7 @@
       };
     }
 
-    const amHost = S.room.hostId === S.user.id;
+    const amHost = isAuthorizedCreator();
     await MP.connectRoom(rawCode, S.user.id, amHost, amHost ? S.room : null);
 
     MP.sendAction({
@@ -402,7 +666,7 @@
     });
 
     startPresenceLoop();
-    toast(`Conectado à sala ${rawCode}!`, 'ok');
+    toast(`Conectado ao lobby da sala ${rawCode}!`, 'ok');
     go(S.room.race && !S.room.race.done ? 'race' : 'room');
   }
 
@@ -431,27 +695,41 @@
     if (!room || !playerEntry) return;
     room.players = room.players || [];
     const existing = room.players.find(p => p.id === playerEntry.id);
+
+    // Ensure room has a single creatorId assigned to the first authorized player
+    if (!room.creatorId && !room.hostId) {
+      room.creatorId = playerEntry.id;
+      room.hostId = playerEntry.id;
+    } else if (!room.creatorId) {
+      room.creatorId = room.hostId;
+    }
+
     if (existing) {
       const wasOffline = existing.online === false;
       existing.name = playerEntry.name;
       existing.avatarId = playerEntry.avatarId;
       existing.avatarIcon = playerEntry.avatarIcon;
       existing.color = playerEntry.color;
-      existing.chips = r2(playerEntry.chips);
+
+      const inVer = Number(playerEntry.balanceVersion || 1);
+      const exVer = Number(existing.balanceVersion || 1);
+      if (inVer >= exVer) {
+        existing.chips = r2(playerEntry.chips);
+        existing.balanceVersion = inVer;
+      }
+
       existing.wins = playerEntry.wins ?? existing.wins;
       existing.online = true;
       existing.lastSeen = Date.now();
-      if (!room.hostId) room.hostId = existing.id;
-      existing.isHost = (room.hostId === existing.id);
+      existing.isHost = (room.creatorId === existing.id);
+      existing.isCreator = (room.creatorId === existing.id);
       return { joinedNew: false, reconnected: wasOffline };
     } else {
       if (room.players.length >= 8) return { joinedNew: false, full: true };
-      if (!room.hostId) {
-        room.hostId = playerEntry.id;
-        playerEntry.isHost = true;
-      }
       playerEntry.online = true;
       playerEntry.lastSeen = Date.now();
+      playerEntry.isHost = (room.creatorId === playerEntry.id);
+      playerEntry.isCreator = (room.creatorId === playerEntry.id);
       room.players.push(playerEntry);
       return { joinedNew: true, reconnected: false };
     }
@@ -459,9 +737,9 @@
 
   function syncMyPlayerInRoom() {
     if (!S.room || !S.user) return;
-    const myEntry = makePlayerEntry(S.user, S.room.hostId === S.user.id);
+    const myEntry = makePlayerEntry(S.user, isAuthorizedCreator());
     upsertPlayerInRoom(S.room, myEntry);
-    if (isRoomHost()) {
+    if (isAuthorizedCreator()) {
       MP.broadcastState(S.room);
     } else {
       MP.sendAction({
@@ -478,10 +756,10 @@
     S.presenceTimer = setInterval(() => {
       if (!S.room || !S.user) return;
       const now = Date.now();
-      const myEntry = makePlayerEntry(S.user, S.room.hostId === S.user.id);
+      const myEntry = makePlayerEntry(S.user, isAuthorizedCreator());
       upsertPlayerInRoom(S.room, myEntry);
 
-      if (isRoomHost()) {
+      if (isAuthorizedCreator()) {
         let changed = false;
         S.room.players.forEach(p => {
           if (p.id === S.user.id) {
@@ -508,36 +786,57 @@
     }, 2400);
   }
 
-  // Incoming state from Authoritative Host / Server
+  // Incoming state from Authoritative Creator / Server
   MP.onStateUpdate = (newState) => {
     if (!newState || !S.room || newState.code !== S.room.code) return;
 
     const prevRaceId = S.room.race ? S.room.race.id : null;
     const wasDone = S.room.race ? S.room.race.done : false;
+    const prevCreator = S.room.creatorId || S.room.hostId;
 
     S.room = newState;
+    if (!S.room.creatorId) S.room.creatorId = S.room.hostId;
 
-    // Ensure our own local player presence & settled bets are synchronized with our persistent account
+    // Update MultiplayerManager host flag if creator role was assigned to us
+    MP.isHost = isAuthorizedCreator();
+
     if (S.user) {
       const meInRoom = S.room.players.find(p => p.id === S.user.id);
       if (meInRoom) {
         meInRoom.online = true;
         meInRoom.lastSeen = Date.now();
+        // Sync server-updated balance if balanceVersion increased
+        if (Number(meInRoom.balanceVersion || 1) > Number(S.user.balanceVersion || 1)) {
+          S.user.chips = r2(meInRoom.chips);
+          S.user.balanceVersion = Number(meInRoom.balanceVersion);
+          saveCurrentUser(true, false);
+        }
       } else {
-        // Re-announce our presence if state snapshot didn't include us yet
         const myEntry = makePlayerEntry(S.user, false);
         MP.sendAction({ type: 'JOIN_ROOM', playerId: S.user.id, player: myEntry, ts: Date.now() });
       }
     }
 
-    // Check if race just finished -> settle our personal bets once!
     if (S.room.race && S.room.race.done && (!wasDone || prevRaceId !== S.room.race.id)) {
       settleMyBetsForFinishedRace(S.room.race);
     }
 
-    // Auto-switch view to race if host prepared/started a race while we were on room/setup screen
-    if (S.room.race && !S.room.race.done && (S.view === 'room' || S.view === 'setup')) {
+    // If a non-creator was somehow on 'setup' view, redirect them to 'room' or 'race'
+    if (S.view === 'setup' && !isAuthorizedCreator()) {
+      S.view = (S.room.race && !S.room.race.done) ? 'race' : 'room';
+      render();
+      return;
+    }
+
+    // Auto-switch view to race if creator prepared/started a race while we were in the lobby
+    if (S.room.race && !S.room.race.done && S.view === 'room' && prevRaceId !== S.room.race.id) {
       S.view = 'race';
+      render();
+      return;
+    }
+
+    // If creator role changed, update UI cleanly
+    if (prevCreator !== (S.room.creatorId || S.room.hostId) && S.view === 'room') {
       render();
       return;
     }
@@ -545,12 +844,12 @@
     refreshUI();
   };
 
-  // Incoming actions from Guests (processed by Host and also applied optimistically)
+  // Incoming actions from Guests
   MP.onActionReceived = (act) => {
     if (!S.room || !act) return;
 
     if (act.type === 'REQUEST_STATE') {
-      if (isRoomHost()) {
+      if (isAuthorizedCreator()) {
         MP.broadcastState(S.room);
       }
       return;
@@ -563,7 +862,7 @@
       } else if (res.reconnected) {
         toast(`🟢 ${act.player.name} reconectou à corrida!`, 'ok');
       }
-      if (isRoomHost()) MP.broadcastState(S.room);
+      if (isAuthorizedCreator()) MP.broadcastState(S.room);
       refreshUI();
       return;
     }
@@ -573,10 +872,11 @@
       if (res.reconnected) {
         toast(`🟢 ${act.player.name} reconectou à sala!`, 'ok');
       }
-      if (act.type === 'PLAYER_SYNC' && isRoomHost()) {
+      if (act.type === 'PLAYER_SYNC' && isAuthorizedCreator()) {
         MP.broadcastState(S.room);
       }
-      refreshUI();
+      // Do NOT trigger a full DOM re-render on silent heartbeats! Only update targeted elements if needed.
+      updateHeaderAndRoomDOM();
       return;
     }
 
@@ -585,7 +885,7 @@
       if (pl && pl.online) {
         pl.online = false;
         toast(`⚠️ ${pl.name} desconectou.`);
-        if (isRoomHost()) MP.broadcastState(S.room);
+        if (isAuthorizedCreator()) MP.broadcastState(S.room);
         refreshUI();
       }
       return;
@@ -595,33 +895,48 @@
       const pl = S.room.players.find(p => p.id === act.playerId);
       if (pl) {
         S.room.players = S.room.players.filter(p => p.id !== act.playerId);
+        // Reassign creator if the creator left the room
+        if (S.room.creatorId === act.playerId && S.room.players.length > 0) {
+          const nextCreator = S.room.players.find(p => p.online !== false) || S.room.players[0];
+          S.room.creatorId = nextCreator.id;
+          S.room.hostId = nextCreator.id;
+          S.room.players.forEach(p => {
+            p.isHost = (p.id === nextCreator.id);
+            p.isCreator = (p.id === nextCreator.id);
+          });
+          MP.isHost = isAuthorizedCreator();
+        }
         toast(`🚪 ${pl.name} saiu da sala.`);
-        if (isRoomHost()) MP.broadcastState(S.room);
+        if (isAuthorizedCreator()) MP.broadcastState(S.room);
         refreshUI();
       }
       return;
     }
 
     if (act.type === 'PLACE_BET' && act.bet) {
-      applyPlaceBetToRoom(act.bet, act.playerChips);
-      if (isRoomHost()) MP.broadcastState(S.room);
+      applyPlaceBetToRoom(act.bet, act.playerChips, act.balanceVersion);
+      if (isAuthorizedCreator()) MP.broadcastState(S.room);
       refreshUI();
       return;
     }
 
     if (act.type === 'CANCEL_BET' && act.betId) {
-      applyCancelBetToRoom(act.betId, act.playerId, act.playerChips);
-      if (isRoomHost()) MP.broadcastState(S.room);
+      applyCancelBetToRoom(act.betId, act.playerId, act.playerChips, act.balanceVersion);
+      if (isAuthorizedCreator()) MP.broadcastState(S.room);
       refreshUI();
       return;
     }
 
     if (act.type === 'UPDATE_CONFIG' && act.config) {
+      // Strictly reject config updates from non-authorized players
+      if (act.playerId && act.playerId !== (S.room.creatorId || S.room.hostId)) {
+        return;
+      }
       if (act.config.circuitId) S.room.circuitId = act.config.circuitId;
       if (act.config.laps) S.room.laps = act.config.laps;
       if (act.config.wxMode) S.room.wxMode = act.config.wxMode;
       if (act.config.grid) S.room.grid = act.config.grid;
-      if (isRoomHost()) MP.broadcastState(S.room);
+      if (isAuthorizedCreator()) MP.broadcastState(S.room);
       refreshUI();
       return;
     }
@@ -632,7 +947,7 @@
   };
 
   /* =====================================================================
-   * 3. AUTHORITATIVE DETERMINISTIC RACE ENGINE (30s PER LAP)
+   * 4. AUTHORITATIVE DETERMINISTIC RACE ENGINE (30s PER LAP)
    * ===================================================================== */
   const hashStr = (s) => {
     let h = 2166136261;
@@ -656,6 +971,12 @@
     const c = rem > 30 ? 'H' : rem > 14 ? 'M' : 'S';
     return c === cur ? (c === 'M' ? 'H' : 'M') : c;
   };
+
+  function pushEvent(r, lapNum, text, kind) {
+    r.seq = (r.seq || 0) + 1;
+    r.events.unshift({ id: 'ev_' + r.seq, l: lapNum, t: text, k: kind });
+    if (r.events.length > 100) r.events.length = 100;
+  }
 
   function lapT(r, d, id) {
     const y = TYRES[d.tyre] || TYRES.M;
@@ -703,10 +1024,9 @@
     const c = r.circuit;
     const L = ++r.lap;
     const sc = r.sc;
-    const ev = (t, k) => r.events.unshift({ l: L, t, k });
+    const ev = (t, k) => pushEvent(r, L, t, k);
     const T = (i) => r.drv[i];
 
-    // Record previous rank and gap for smooth 3D interpolation across next lap
     const prevLead = T(r.order[0]);
     r.order.forEach((id, idx) => {
       const d = T(id);
@@ -805,11 +1125,14 @@
     }
 
     r.order = act.concat(r.dnf.slice().reverse().sort((a, b) => T(b).lapsDone - T(a).lapsDone));
-    if (r.events.length > 100) r.events.length = 100;
   }
 
   function prepareRace() {
     if (!S.room) return toast('Crie ou entre em uma sala primeiro');
+    // Strict Creator Permission Check
+    if (!isAuthorizedCreator()) {
+      return toast('Acesso negado: apenas o Criador Autorizado da sala pode criar e iniciar corridas.');
+    }
     if (S.room.race && !S.room.race.done) {
       go('race');
       return toast('Já existe uma corrida em andamento nesta sala');
@@ -827,7 +1150,6 @@
     const total = Math.min(MAX_RACE_LAPS, Math.max(MIN_RACE_LAPS, Math.floor(+S.room.laps || c.laps)));
     S.room.laps = total;
 
-    // Seed is ALWAYS automatically generated by the system
     const autoSeed = genAutoSeed();
     const wx = S.room.wxMode || 'auto';
 
@@ -850,7 +1172,7 @@
       done: false,
       started: false,
       running: false,
-      bettingOpen: true, // Betting window starts OPEN on the grid; must be closed before start!
+      bettingOpen: true,
       round: 0,
       bets: [],
       res: {},
@@ -893,11 +1215,7 @@
 
     r.order = ids.slice();
     r.start = ids.slice();
-    r.events.unshift({
-      l: 0,
-      t: `Grid formado em ${c.name} (${total} voltas). Janela de apostas ABERTA!`,
-      k: 'g'
-    });
+    pushEvent(r, 0, `Grid formado em ${c.name} (${total} voltas). Janela de apostas ABERTA!`, 'g');
 
     S.room.race = r;
     if (!r.order.includes(S.selectedBetDriver)) {
@@ -908,64 +1226,56 @@
     go('race');
   }
 
-  function toggleBettingWindow(openState) {
+  /**
+   * Permanently closes the current betting window for this round.
+   * Reopening a closed betting window is strictly forbidden and removed!
+   */
+  function closeBettingWindow() {
     if (!S.room || !S.room.race) return;
-    if (!isRoomHost()) return toast('Apenas o criador/líder da sala pode abrir ou encerrar a janela de apostas.');
+    if (!isAuthorizedCreator()) {
+      return toast('Apenas o criador autorizado da sala pode encerrar a janela de apostas.');
+    }
     const r = S.room.race;
     if (r.running || r.done) return;
-
-    r.bettingOpen = !!openState;
     if (!r.bettingOpen) {
-      // Lock all active bets in this window so they can no longer be cancelled
-      r.bets.forEach(b => {
-        if (!b.cancelled) b.locked = true;
-      });
-      r.events.unshift({
-        l: r.lap,
-        t: `🔒 Janela de apostas encerrada (Rodada ${r.round + 1}). Apostas confirmadas e bloqueadas!`,
-        k: 'g'
-      });
-      toast('Janela de apostas encerrada! Pronto para a largada.', 'gold');
-    } else {
-      r.events.unshift({
-        l: r.lap,
-        t: `🟢 Janela de apostas reaberta.`,
-        k: 'g'
-      });
-      toast('Janela de apostas aberta.');
+      return toast('A janela de apostas já foi encerrada definitivamente para esta rodada.');
     }
+
+    r.bettingOpen = false;
+    r.bets.forEach(b => {
+      if (!b.cancelled) b.locked = true;
+    });
+    pushEvent(r, r.lap, `🔒 Janela de apostas encerrada definitivamente (Rodada ${r.round + 1}). Apostas bloqueadas!`, 'g');
+    toast('Janela de apostas encerrada! Pronto para a largada.', 'gold');
     MP.broadcastState(S.room);
     refreshUI();
   }
 
   function startOrResumeRace() {
     if (!S.room || !S.room.race) return;
-    if (!isRoomHost()) return toast('Apenas o líder da sala pode iniciar/retomar a corrida.');
+    if (!isAuthorizedCreator()) {
+      return toast('Apenas o criador autorizado da sala pode iniciar/retomar a corrida.');
+    }
     const r = S.room.race;
     if (r.done || r.running) return;
 
-    // 1. Validate at least 2 connected players
     const onlinePlayers = getOnlinePlayers();
     if (onlinePlayers.length < MIN_PLAYERS_TO_START) {
       return toast(`Mínimo de ${MIN_PLAYERS_TO_START} jogadores conectados na sala para iniciar a corrida! (Conectados: ${onlinePlayers.length})`);
     }
 
-    // 2. Validate minimum 5 laps
     if (!r.total || r.total < MIN_RACE_LAPS) {
       return toast(`A corrida precisa ter no mínimo ${MIN_RACE_LAPS} voltas configuradas.`);
     }
 
-    // 3. Validate required info
     if (!r.circuit || !r.order || r.order.length < 3) {
       return toast('Informações do circuito ou grid incompletas.');
     }
 
-    // 4. Validate betting window is closed before race start/resume
     if (r.bettingOpen) {
       return toast('Encerre a janela de apostas antes de autorizar a largada!');
     }
 
-    // Ensure all bets placed so far are locked
     r.bets.forEach(b => {
       if (!b.cancelled) b.locked = true;
     });
@@ -974,11 +1284,11 @@
       r.started = true;
       r.lap = 1;
       r.lapProgress = 0;
-      r.events.unshift({ l: 1, t: '🚦 Luzes vermelhas se apagam! LARGADA AUTORIZADA!', k: 'g' });
+      pushEvent(r, 1, '🚦 Luzes vermelhas se apagam! LARGADA AUTORIZADA!', 'g');
     } else {
       r.lap = r.lap + 1;
       r.lapProgress = 0;
-      r.events.unshift({ l: r.lap, t: `▶ Corrida retomada para a volta ${r.lap}!`, k: 'g' });
+      pushEvent(r, r.lap, `▶ Corrida retomada para a volta ${r.lap}!`, 'g');
     }
 
     r.running = true;
@@ -989,12 +1299,12 @@
   }
 
   function pauseRace() {
-    if (!S.room || !S.room.race || !isRoomHost()) return;
+    if (!S.room || !S.room.race || !isAuthorizedCreator()) return;
     const r = S.room.race;
     if (!r.running) return;
     r.running = false;
     stopHostRaceLoop();
-    r.events.unshift({ l: r.lap, t: '⏸ Simulação pausada pelo líder da sala.', k: 's' });
+    pushEvent(r, r.lap, '⏸ Simulação pausada pelo criador da corrida.', 's');
     MP.broadcastState(S.room);
     refreshUI();
   }
@@ -1003,7 +1313,7 @@
     stopHostRaceLoop();
     let tickCounter = 0;
     S.hostTickTimer = setInterval(() => {
-      if (!S.room || !S.room.race || !S.room.race.running || !isRoomHost()) {
+      if (!S.room || !S.room.race || !S.room.race.running || !isAuthorizedCreator()) {
         stopHostRaceLoop();
         return;
       }
@@ -1015,7 +1325,6 @@
       const lapDur = r.lapDurationMs || LAP_DURATION_MS;
       r.lapProgress = (r.lapProgress || 0) + dt / lapDur;
 
-      // Live mid-lap micro-overtakes / telemetry updates at 33% and 66% of the 30-second lap
       if (r.lapProgress >= 0.35 && r.lapProgress - dt / lapDur < 0.35) {
         triggerMidLapAction(r, 1);
       } else if (r.lapProgress >= 0.70 && r.lapProgress - dt / lapDur < 0.70) {
@@ -1023,13 +1332,11 @@
       }
 
       if (r.lapProgress >= 1.0) {
-        // Complete current lap
         const completedLapNum = r.lap;
-        r.lap = completedLapNum - 1; // simCompleteLap increments ++r.lap
+        r.lap = completedLapNum - 1;
         simCompleteLap(r);
         r.lapProgress = 0;
 
-        // Check if race finished
         if (r.lap >= r.total) {
           r.running = false;
           r.bettingOpen = false;
@@ -1040,24 +1347,23 @@
           return;
         }
 
-        // Check if a 10-lap block just completed (e.g. lap 10, 20, 30...) while race is still ongoing
         if (r.lap % 10 === 0 && r.lap < r.total) {
           r.running = false;
           r.bettingOpen = true;
           r.round = Math.floor(r.lap / 10);
           stopHostRaceLoop();
-          r.events.unshift({
-            l: r.lap,
-            t: `🔔 ${r.lap} voltas concluídas! Nova rodada de apostas aberta (Multiplicador ${vm(mult(r.lap))}).`,
-            k: 'g'
-          });
+          pushEvent(
+            r,
+            r.lap,
+            `🔔 ${r.lap} voltas concluídas! Nova rodada de apostas aberta (Multiplicador ${vm(mult(r.lap))}).`,
+            'g'
+          );
           MP.broadcastState(S.room);
           toast(`Volta ${r.lap} concluída! Nova rodada de apostas aberta!`, 'gold');
           refreshUI();
           return;
         }
 
-        // Otherwise advance seamlessly to the next lap!
         r.lap = r.lap + 1;
         MP.broadcastState(S.room);
         refreshUI();
@@ -1065,7 +1371,6 @@
       }
 
       tickCounter++;
-      // Broadcast smooth authoritative progress every 300ms
       if (tickCounter % 3 === 0) {
         MP.broadcastState(S.room, true);
       }
@@ -1084,7 +1389,6 @@
         const posA = r.order.indexOf(ahead);
         const posB = r.order.indexOf(behind);
         if (posA >= 0 && posB === posA + 1) {
-          // Record prevRank for smooth visual overtake lane weave
           r.order.forEach((id, i) => { r.drv[id].prevRank = i; });
           r.order[posA] = behind;
           r.order[posB] = ahead;
@@ -1092,11 +1396,12 @@
           r.drv[ahead].t = r.drv[behind].t + 0.18;
           r.drv[behind].t = tmpT;
           r.drv[behind].ov = (r.drv[behind].ov || 0) + 1;
-          r.events.unshift({
-            l: r.lap,
-            t: `⚔️ Setor ${sector}: ${behind} mergulha por dentro e ultrapassa ${ahead} pela P${posA + 1}!`,
-            k: 'o'
-          });
+          pushEvent(
+            r,
+            r.lap,
+            `⚔️ Setor ${sector}: ${behind} mergulha por dentro e ultrapassa ${ahead} pela P${posA + 1}!`,
+            'o'
+          );
         }
       }
     }
@@ -1110,9 +1415,8 @@
   }
 
   /* =====================================================================
-   * 4. BETTING SYSTEM, CANCELLATION & PAYOUT SETTLEMENT
+   * 5. BETTING SYSTEM (SORTED BY CURRENT CLASSIFICATION, LOCKED CLOSURE)
    * ===================================================================== */
-  // Round multiplier: Pre-start (lap 0) = 1.0x; After 10 laps = 0.9x; After 20 laps = 0.8x...
   function mult(lap) {
     const completedBlocks = Math.floor(Math.max(0, lap) / 10);
     return Math.max(0.2, Math.round((1 - completedBlocks * 0.1) * 10) / 10);
@@ -1122,10 +1426,6 @@
     return r.order.indexOf(id) + 1;
   }
 
-  /**
-   * Payout calculation:
-   * Rewards Podium finishes (1st = 3.0x, 2nd = 2.0x, 3rd = 1.5x) AND position gains!
-   */
   function calculateBetPayout(bet, finalPos, isDnf) {
     if (bet.cancelled || isDnf || finalPos <= 0) return 0;
     let baseFactor = 0;
@@ -1145,7 +1445,7 @@
     const r = S.room.race;
     if (r.done) return toast('A corrida já foi encerrada.');
     if (r.running || !r.bettingOpen) {
-      return toast('A janela de apostas está fechada no momento! Aguarde a próxima janela.');
+      return toast('A janela de apostas já foi encerrada! Não são permitidas novas apostas neste momento.');
     }
 
     const driverId = S.selectedBetDriver;
@@ -1166,8 +1466,9 @@
       return toast(`Saldo insuficiente! Seu saldo atual é de ${fmt(S.user.chips)} fichas.`);
     }
 
-    // Deduct immediately from current user's balance
     S.user.chips = r2(S.user.chips - amount);
+    S.user.balanceVersion = Number(S.user.balanceVersion || 1) + 1;
+
     const currentRound = Math.floor(r.lap / 10);
     const curMult = mult(r.lap);
     const betId = `bet_${S.user.id}_${r.id}_r${currentRound}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -1190,7 +1491,6 @@
       ts: Date.now()
     };
 
-    // Update persistent Cashbox (Caixa de Fichas)
     ensureAccountIntegrity(S.user);
     S.user.cashbox.totalBet = r2(S.user.cashbox.totalBet + amount);
     S.user.cashbox.betHistory.unshift({
@@ -1214,11 +1514,10 @@
       `${r.circuit.name} · Rodada ${currentRound + 1} (${vm(curMult)})`,
       -amount
     );
-    saveCurrentUser(true);
+    saveCurrentUser(true, true);
 
-    // Apply to room & broadcast
-    applyPlaceBetToRoom(betObj, S.user.chips);
-    if (isRoomHost()) {
+    applyPlaceBetToRoom(betObj, S.user.chips, S.user.balanceVersion);
+    if (isAuthorizedCreator()) {
       MP.broadcastState(S.room);
     } else {
       MP.sendAction({
@@ -1226,6 +1525,7 @@
         playerId: S.user.id,
         bet: betObj,
         playerChips: S.user.chips,
+        balanceVersion: S.user.balanceVersion,
         ts: Date.now()
       });
     }
@@ -1234,14 +1534,16 @@
     refreshUI();
   }
 
-  function applyPlaceBetToRoom(betObj, updatedChips) {
+  function applyPlaceBetToRoom(betObj, updatedChips, balanceVersion) {
     if (!S.room || !S.room.race || !betObj) return;
     const r = S.room.race;
-    if (r.bets.some(b => b.id === betObj.id)) return; // Prevent duplicate bet
+    if (r.done || r.running || !r.bettingOpen) return;
+    if (r.bets.some(b => b.id === betObj.id)) return;
     r.bets.push(betObj);
     const pl = S.room.players.find(p => p.id === betObj.pid);
     if (pl && typeof updatedChips === 'number') {
       pl.chips = r2(updatedChips);
+      if (balanceVersion) pl.balanceVersion = balanceVersion;
     }
   }
 
@@ -1265,11 +1567,10 @@
       return toast('Esta aposta já foi cancelada.');
     }
 
-    // Refund immediately to user balance
     bet.cancelled = true;
     S.user.chips = r2(S.user.chips + bet.amount);
+    S.user.balanceVersion = Number(S.user.balanceVersion || 1) + 1;
 
-    // Update Cashbox & History
     ensureAccountIntegrity(S.user);
     S.user.cashbox.totalBet = r2(Math.max(0, S.user.cashbox.totalBet - bet.amount));
     const histEntry = S.user.cashbox.betHistory.find(h => h.id === betId);
@@ -1283,10 +1584,10 @@
       `Estorno imediato · ${r.circuit.name}`,
       +bet.amount
     );
-    saveCurrentUser(true);
+    saveCurrentUser(true, true);
 
-    applyCancelBetToRoom(betId, S.user.id, S.user.chips);
-    if (isRoomHost()) {
+    applyCancelBetToRoom(betId, S.user.id, S.user.chips, S.user.balanceVersion);
+    if (isAuthorizedCreator()) {
       MP.broadcastState(S.room);
     } else {
       MP.sendAction({
@@ -1294,6 +1595,7 @@
         playerId: S.user.id,
         betId,
         playerChips: S.user.chips,
+        balanceVersion: S.user.balanceVersion,
         ts: Date.now()
       });
     }
@@ -1302,9 +1604,10 @@
     refreshUI();
   }
 
-  function applyCancelBetToRoom(betId, playerId, updatedChips) {
+  function applyCancelBetToRoom(betId, playerId, updatedChips, balanceVersion) {
     if (!S.room || !S.room.race) return;
     const r = S.room.race;
+    if (r.done || r.running || !r.bettingOpen) return;
     const bet = r.bets.find(b => b.id === betId && b.pid === playerId);
     if (bet && !bet.locked) {
       bet.cancelled = true;
@@ -1313,6 +1616,7 @@
     const pl = S.room.players.find(p => p.id === playerId);
     if (pl && typeof updatedChips === 'number') {
       pl.chips = r2(updatedChips);
+      if (balanceVersion) pl.balanceVersion = balanceVersion;
     }
   }
 
@@ -1324,13 +1628,8 @@
     const w = r.order[0];
     const dt = new Date().toLocaleDateString('pt-BR');
 
-    r.events.unshift({
-      l: r.total,
-      t: `🏁 BANDEIRA QUADRICULADA! ${dv(w).name} (${w}) vence o GP de ${r.circuit.name}!`,
-      k: 'g'
-    });
+    pushEvent(r, r.total, `🏁 BANDEIRA QUADRICULADA! ${dv(w).name} (${w}) vence o GP de ${r.circuit.name}!`, 'g');
 
-    // Compute authoritative results for every active bet
     const summaryRes = [];
     r.bets.forEach(b => {
       if (b.cancelled) return;
@@ -1349,7 +1648,6 @@
       });
     });
 
-    // Update Championship standings
     const PTS = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1];
     r.order.filter(i => r.drv[i] && r.drv[i].st === 'run').slice(0, 10).forEach((id, i) => {
       S.champ.d[id] = (S.champ.d[id] || 0) + PTS[i];
@@ -1367,7 +1665,6 @@
     });
     saveGlobalHistory();
 
-    // Settle host's own bets
     settleMyBetsForFinishedRace(r);
   }
 
@@ -1380,7 +1677,7 @@
 
     r.bets.forEach(b => {
       if (b.cancelled || b.pid !== S.user.id) return;
-      if (S.user.settledBets[b.id]) return; // Already settled! Zero duplication!
+      if (S.user.settledBets[b.id]) return;
 
       const outcome = r.res && r.res[b.id]
         ? r.res[b.id]
@@ -1396,6 +1693,7 @@
 
       if (outcome.ret > 0) {
         S.user.chips = r2(S.user.chips + outcome.ret);
+        S.user.balanceVersion = Number(S.user.balanceVersion || 1) + 1;
       }
 
       if (outcome.net > 0) {
@@ -1434,7 +1732,7 @@
     });
 
     if (anySettled) {
-      saveCurrentUser(true);
+      saveCurrentUser(true, true);
       syncMyPlayerInRoom();
       if (totalNetThisRace > 0) {
         toast(`🏆 Parabéns! Você lucrou +${fmt(totalNetThisRace)} fichas nesta corrida!`, 'gold');
@@ -1443,10 +1741,17 @@
   }
 
   /* =====================================================================
-   * 5. INTERFACE & VIEWS
+   * 6. INTERFACE & VIEWS
    * ===================================================================== */
   function go(viewName) {
+    if (viewName === 'setup' && S.room && !isAuthorizedCreator()) {
+      toast('Apenas o jogador autorizado (Criador da Sala) pode acessar a criação e configuração de corridas.');
+      return;
+    }
     S.view = viewName;
+    if (viewName === 'admin' && S.admin.token) {
+      fetchAdminPlayers(true);
+    }
     render();
     window.scrollTo(0, 0);
   }
@@ -1465,14 +1770,22 @@
     const u = S.user;
     const av = avObj(u.avatarId);
     const R = S.room;
+    const amCreator = isAuthorizedCreator();
+
     const navItems = [
       ['home', 'Início'],
-      ['room', 'Sala Multiplayer'],
-      ['setup', 'Circuito & Grid'],
+      ['room', 'Sala Multiplayer']
+    ];
+    // Only show "Criar Corrida / Circuito" tab to the single authorized creator (or when no room exists yet)
+    if (!R || amCreator) {
+      navItems.push(['setup', 'Circuito & Grid']);
+    }
+    navItems.push(
       ['race', 'Simulador 3D & Apostas'],
       ['wallet', 'Caixa de Fichas'],
-      ['rank', 'Ranking']
-    ];
+      ['rank', 'Ranking'],
+      ['admin', S.admin.authenticated ? '🛡️ Admin (LN)' : '🔒 Admin']
+    );
 
     return `<header class="top-header">
       <div class="header-left">
@@ -1482,8 +1795,8 @@
         </nav>
       </div>
       <div class="header-right">
-        ${R ? `<div class="room-badge mono" onclick="F1App.go('room')" title="Sala Multiplayer Ativa (${getOnlinePlayers().length} online)">
-          <span class="dot"></span>SALA ${esc(R.code)} · ${getOnlinePlayers().length}👤
+        ${R ? `<div class="room-badge mono" id="header-room-badge" onclick="F1App.go('room')" title="Sala Multiplayer Ativa">
+          <span class="dot"></span>SALA ${esc(R.code)} · <span id="header-room-online-count">${getOnlinePlayers().length}</span>👤
         </div>` : ''}
         <div class="top-balance-hud" id="top-balance-hud" onclick="F1App.go('wallet')" style="cursor:pointer" title="Abrir Caixa de Fichas">
           <div class="bal-icon">🪙</div>
@@ -1492,7 +1805,7 @@
             <span class="bal-value mono" id="header-balance-val">${fmt(u.chips)}</span>
           </div>
         </div>
-        <button class="profile-pill" onclick="F1App.openProfileModal()" title="Perfil do Jogador (Salvo Automaticamente)">
+        <button class="profile-pill" onclick="F1App.openProfileModal()" title="Perfil do Jogador">
           <span class="av" style="background:${av.color};width:28px;height:28px;font-size:14px">${av.icon}</span>
           <b id="header-profile-name">${esc(u.name)}</b>
           <span class="mut" style="font-size:11px">⚙️</span>
@@ -1512,7 +1825,7 @@
           <h2>Perfil & Conta do Jogador</h2>
           <button class="btn ghost sm" onclick="F1App.closeProfileModal()">✕</button>
         </div>
-        <p class="mut" style="font-size:13px;margin-top:0">Suas informações, avatar, saldo e Caixa de Fichas ficam salvos automaticamente neste navegador.</p>
+        <p class="mut" style="font-size:13px;margin-top:0">Suas informações, avatar, saldo (inicial: 100 fichas) e Caixa de Fichas ficam salvos automaticamente.</p>
         <div style="margin-bottom:12px">
           <small class="mut">Nome de Login</small>
           <input id="prof-name-in" maxlength="18" value="${esc(S.profileDraftName)}" placeholder="Seu nome ou apelido" onkeydown="if(event.key==='Enter')F1App.saveProfileFromModal()">
@@ -1531,7 +1844,7 @@
           <button class="btn ok" onclick="F1App.saveProfileFromModal()">💾 Salvar Perfil</button>
         </div>
         <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
-        <h3>Contas Salvas neste Dispositivo (Teste Multiplayer Local)</h3>
+        <h3>Contas Cadastradas neste Dispositivo</h3>
         <div style="display:flex;flex-direction:column;gap:6px;max-height:150px;overflow-y:auto;margin-top:8px">
           ${accounts.map(acc => {
             const av = avObj(acc.avatarId);
@@ -1547,7 +1860,7 @@
           }).join('')}
         </div>
         <div class="row" style="margin-top:10px">
-          <button class="btn ghost sm" style="width:100%" onclick="F1App.switchAccount('NEW')">➕ Criar Nova Conta Secundária (Para Jogar em 2 Abas)</button>
+          <button class="btn ghost sm" style="width:100%" onclick="F1App.switchAccount('NEW')">➕ Criar Nova Conta Secundária (Saldo Inicial: 100 🪙)</button>
         </div>
       </div>
     </div>`;
@@ -1559,7 +1872,7 @@
     return `<div class="hero">
       <div class="chip" style="margin-bottom:14px;border-color:var(--red)">🏎️ SIMULADOR 3D EM TEMPO REAL · MULTIPLAYER SINCRONIZADO</div>
       <h1>F1 <span>BETTING</span><br>SIMULATOR 3D</h1>
-      <p>Crie sua sala, convide seus amigos por código ou link, acompanhe a corrida em um circuito 3D realista e aposte suas fichas virtuais em tempo real.</p>
+      <p>Crie sua sala, convide seus amigos por código ou link, acompanhe a corrida em 10 circuitos 3D exclusivos e aposte suas fichas virtuais em tempo real.</p>
 
       <div class="card gold-edge" style="max-width:580px;margin:0 auto 22px;text-align:left">
         <div class="row" style="justify-content:space-between">
@@ -1592,19 +1905,65 @@
 
       <div class="grid g3" style="text-align:left;margin-top:28px">
         <div class="card">
-          <h3>🌐 Multiplayer Real-Time</h3>
-          Salas sincronizadas via servidor, WebRTC P2P e multicanal. Todos os jogadores assistem à mesma corrida e resultados.
+          <h3>🌐 Controle & Multiplayer</h3>
+          Apenas o jogador autorizado (Criador da Sala) configura e inicia as corridas, enquanto todos apostam e assistem sincronizados.
         </div>
         <div class="card cyan-edge">
-          <h3>🏎️ Simulador 3D Realista</h3>
-          10 circuitos famosos com traçados fiéis, monopostos F1 3D detalhados, voltas de 30 segundos e câmera de perseguição.
+          <h3>🏎️ 10 Circuitos 3D Exclusivos</h3>
+          Cada autódromo possui traçado, cores de zebras, vegetação e monumentos 3D próprios (Roda-gigante de Suzuka, Porto de Mônaco, Alpes, etc.).
         </div>
         <div class="card gold-edge">
-          <h3>🪙 Caixa de Fichas & Apostas</h3>
-          Apostas de até 10.000 fichas, cancelamento durante janela aberta, novas rodadas a cada 10 voltas e histórico persistente.
+          <h3>🛡️ Painel Administrativo</h3>
+          Gestão completa de saldos autenticada no servidor para consultar, adicionar, remover ou definir fichas de qualquer jogador.
         </div>
       </div>
     </div>`;
+  }
+
+  function renderRoomPlayersListHTML(R) {
+    const creatorId = R.creatorId || R.hostId;
+    return R.players.map(p => {
+      const isMe = p.id === S.user.id;
+      const isCreator = p.id === creatorId;
+      const av = avObj(p.avatarId);
+      return `<div class="pl">
+        <span class="av" style="background:${p.color || av.color}">${p.avatarIcon || av.icon}</span>
+        <div>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <b>${esc(p.name)}</b>
+            ${isMe ? '<span class="chip" style="padding:1px 7px;font-size:10px;border-color:var(--gold);color:var(--gold)">VOCÊ</span>' : ''}
+            ${isCreator ? '<span class="chip" style="padding:1px 7px;font-size:10px;border-color:var(--ok);color:var(--ok)">👑 CRIADOR AUTORIZADO</span>' : '<span class="chip mut" style="padding:1px 7px;font-size:10px">PARTICIPANTE</span>'}
+          </div>
+          <small class="mut" style="display:flex;align-items:center;gap:5px;margin-top:2px">
+            <span class="status-dot ${p.online !== false ? 'online' : 'offline'}"></span>
+            ${p.online !== false ? 'Conectado em tempo real' : 'Desconectado (aguardando retorno)'}
+          </small>
+        </div>
+        <span class="bal mono">${fmt(p.chips)} 🪙</span>
+      </div>`;
+    }).join('');
+  }
+
+  function renderRoomActionButtonsHTML(R) {
+    const onlinePlayers = getOnlinePlayers(R);
+    const canProceed = onlinePlayers.length >= MIN_PLAYERS_TO_START;
+    const amCreator = isAuthorizedCreator();
+    const creatorName = (R.players.find(p => p.id === (R.creatorId || R.hostId)) || {}).name || 'Líder';
+
+    if (R.race && !R.race.done) {
+      return `<button class="btn ok" onclick="F1App.go('race')">🏎️ Ir para Corrida em Andamento →</button>`;
+    }
+
+    if (!amCreator) {
+      return `<div class="bet-summary-box" style="width:100%;margin:0;text-align:center">
+        <b style="color:var(--gold)">⏳ Aguardando ${esc(creatorName)} (Criador Autorizado) configurar e abrir a corrida...</b>
+        <small class="mut" style="display:block;margin-top:3px">Somente o jogador autorizado possui a opção de criar corridas neste lobby. Assim que a corrida for aberta, você será levado automaticamente para apostar e assistir!</small>
+      </div>`;
+    }
+
+    return `<button class="btn" id="room-go-setup-btn" onclick="F1App.go('setup')" ${!canProceed ? 'disabled title="Conecte pelo menos 2 jogadores para configurar e iniciar a corrida"' : ''}>
+      ${canProceed ? '🏁 Criar Corrida & Escolher Circuito →' : `Aguardando 2º Jogador (${onlinePlayers.length}/2)...`}
+    </button>`;
   }
 
   function renderRoomView() {
@@ -1613,16 +1972,18 @@
 
     const onlinePlayers = getOnlinePlayers(R);
     const canProceed = onlinePlayers.length >= MIN_PLAYERS_TO_START;
+    const amCreator = isAuthorizedCreator();
+    const creatorName = (R.players.find(p => p.id === (R.creatorId || R.hostId)) || {}).name || 'Host';
     const inviteUrl = `${location.origin}${location.pathname}?room=${encodeURIComponent(R.code)}`;
     const friendTestUrl = `${location.origin}${location.pathname}?room=${encodeURIComponent(R.code)}&newplayer=1`;
 
     return `<div class="grid g2">
       <div class="card gold-edge">
         <div class="row" style="justify-content:space-between">
-          <h2>Sala Multiplayer</h2>
+          <h2>Lobby da Sala Multiplayer</h2>
           <span class="chip mono" style="color:var(--ok)">● SINCRONIZAÇÃO ATIVA</span>
         </div>
-        <p class="mut" style="margin:4px 0 10px">Compartilhe o código ou o link de convite com seu amigo para entrarem na mesma corrida:</p>
+        <p class="mut" style="margin:4px 0 10px">Compartilhe o código ou o link de convite com seu amigo para participarem da mesma corrida:</p>
         <div class="code-box mono" id="room-code-display">${esc(R.code)}</div>
         <div class="row" style="margin-top:12px">
           <button class="btn" onclick="F1App.copyRoomCode()">📋 Copiar Código</button>
@@ -1631,54 +1992,32 @@
         </div>
         <div class="bet-summary-box" style="margin-top:14px">
           <div class="row" style="justify-content:space-between">
-            <span>Status para iniciar corrida:</span>
-            <b style="color:var(--${canProceed ? 'ok' : 'red2'})">
-              ${canProceed ? `✓ ${onlinePlayers.length} jogadores conectados (Pronto!)` : `⏳ Aguardando amigos (${onlinePlayers.length}/${MIN_PLAYERS_TO_START} conectados)`}
+            <span>Status do Lobby:</span>
+            <b id="room-lobby-status-text" style="color:var(--${canProceed ? 'ok' : 'red2'})">
+              ${canProceed ? `✓ ${onlinePlayers.length} jogadores conectados (Pronto!)` : `⏳ Aguardando jogadores (${onlinePlayers.length}/${MIN_PLAYERS_TO_START} conectados)`}
             </b>
           </div>
           <small class="mut" style="display:block;margin-top:4px">
-            Regra: A corrida só pode ser iniciada quando houver pelo menos <b>${MIN_PLAYERS_TO_START} jogadores conectados</b> na sala.
+            Permissão de Criação: <b style="color:var(--gold)">${esc(creatorName)}</b> ${amCreator ? '(Você possui autorização para criar corridas)' : '(Participante — você pode apostar e acompanhar)'}
           </small>
         </div>
         <div class="row" style="margin-top:12px;justify-content:space-between">
           <button class="btn ghost sm" onclick="F1App.leaveRoom()">🚪 Sair da Sala</button>
-          <small class="mut">Líder da sala: <b>${esc((R.players.find(p => p.id === R.hostId) || {}).name || 'Host')}</b></small>
+          <small class="mut">Criador Autorizado: <b id="room-creator-name">${esc(creatorName)}</b></small>
         </div>
       </div>
 
       <div class="card">
         <div class="row" style="justify-content:space-between">
-          <h2>Jogadores na Sala (${onlinePlayers.length} online / ${R.players.length} total)</h2>
+          <h2 id="room-players-heading">Jogadores na Sala (${onlinePlayers.length} online / ${R.players.length} total)</h2>
           <button class="btn ghost sm" onclick="F1App.openProfileModal()">⚙️ Meu Perfil</button>
         </div>
-        <div style="margin-top:10px">
-          ${R.players.map(p => {
-            const isMe = p.id === S.user.id;
-            const av = avObj(p.avatarId);
-            return `<div class="pl">
-              <span class="av" style="background:${p.color || av.color}">${p.avatarIcon || av.icon}</span>
-              <div>
-                <div style="display:flex;align-items:center;gap:6px">
-                  <b>${esc(p.name)}</b>
-                  ${isMe ? '<span class="chip" style="padding:1px 7px;font-size:10px;border-color:var(--gold);color:var(--gold)">VOCÊ</span>' : ''}
-                  ${p.id === R.hostId ? '<span class="chip" style="padding:1px 7px;font-size:10px">👑 HOST</span>' : ''}
-                </div>
-                <small class="mut" style="display:flex;align-items:center;gap:5px;margin-top:2px">
-                  <span class="status-dot ${p.online !== false ? 'online' : 'offline'}"></span>
-                  ${p.online !== false ? 'Conectado em tempo real' : 'Desconectado (aguardando retorno)'}
-                </small>
-              </div>
-              <span class="bal mono">${fmt(p.chips)} 🪙</span>
-            </div>`;
-          }).join('')}
+        <div id="room-players-list" style="margin-top:10px">
+          ${renderRoomPlayersListHTML(R)}
         </div>
 
-        <div class="row" style="margin-top:18px;justify-content:flex-end">
-          ${R.race && !R.race.done
-            ? `<button class="btn ok" onclick="F1App.go('race')">🏎️ Ir para Corrida em Andamento →</button>`
-            : `<button class="btn" onclick="F1App.go('setup')" ${!canProceed ? 'disabled title="Conecte pelo menos 2 jogadores para configurar e iniciar a corrida"' : ''}>
-                ${canProceed ? 'Escolher Circuito & Configurar Corrida →' : `Aguardando 2º Jogador (${onlinePlayers.length}/2)...`}
-              </button>`}
+        <div class="row" id="room-action-footer" style="margin-top:18px;justify-content:flex-end">
+          ${renderRoomActionButtonsHTML(R)}
         </div>
       </div>
     </div>`;
@@ -1688,6 +2027,15 @@
     const R = S.room;
     if (!R) return renderNoRoomCard();
 
+    if (!isAuthorizedCreator()) {
+      const creatorName = (R.players.find(p => p.id === (R.creatorId || R.hostId)) || {}).name || 'Criador da Sala';
+      return `<div class="card">
+        <h2>🔒 Criação de Corridas Restrita</h2>
+        <p class="mut">Somente o jogador autorizado (<b>${esc(creatorName)}</b>) tem permissão para criar e configurar corridas nesta sala.</p>
+        <button class="btn" onclick="F1App.go('room')">← Voltar ao Lobby da Sala</button>
+      </div>`;
+    }
+
     const curCircuit = CIRCUITS.find(c => c.id === R.circuitId) || CIRCUITS[0];
     const onlineCount = getOnlinePlayers(R).length;
     const lapsVal = Math.max(MIN_RACE_LAPS, Math.min(MAX_RACE_LAPS, +(R.laps || curCircuit.laps)));
@@ -1696,14 +2044,14 @@
     return `<div>
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <div>
-          <h2>Seleção de Circuito Real (${CIRCUITS.length} Pistas)</h2>
-          <p class="mut" style="margin:0;font-size:13px">Escolha o traçado oficial para a simulação 3D. Cada volta dura aproximadamente 30 segundos.</p>
+          <h2>Seleção de Circuito Real (${CIRCUITS.length} Pistas com Ambientação 3D Própria)</h2>
+          <p class="mut" style="margin:0;font-size:13px">Você é o Criador Autorizado da sala. Escolha o circuito e configure a corrida.</p>
         </div>
-        <span class="chip mono">Jogadores Conectados: <b style="color:var(--${onlineCount >= 2 ? 'ok' : 'red2'})">${onlineCount}/2 mín.</b></span>
+        <span class="chip mono" id="setup-online-chip">Jogadores Conectados: <b style="color:var(--${onlineCount >= 2 ? 'ok' : 'red2'})">${onlineCount}/2 mín.</b></span>
       </div>
 
-      <div class="grid g4">
-        ${CIRCUITS.map(c => `<div class="circuit-card ${R.circuitId === c.id ? 'on' : ''}" onclick="F1App.selectCircuit('${c.id}')">
+      <div class="grid g4" id="setup-circuits-grid">
+        ${CIRCUITS.map(c => `<div class="circuit-card ${R.circuitId === c.id ? 'on' : ''}" data-cid="${c.id}" onclick="F1App.selectCircuit('${c.id}')">
           <div class="row" style="justify-content:space-between">
             <b>${c.flag} ${esc(c.name)}</b>
             <span class="chip mono" style="padding:2px 7px;font-size:10.5px">${c.km} km</span>
@@ -1723,36 +2071,36 @@
             </div>
             <div>
               <small class="mut">Condição Climática</small>
-              <select onchange="F1App.updateWeather(this.value)">
+              <select id="setup-wx-select" onchange="F1App.updateWeather(this.value)">
                 ${[['auto', '🌦️ Dinâmico / Automático'], ['dry', '☀️ Pista Seca'], ['rain', '🌧️ Chuva']].map(o => `<option value="${o[0]}" ${(R.wxMode || 'auto') === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}
               </select>
             </div>
           </div>
           <div class="bet-summary-box" style="margin-top:12px">
             <div>⏱️ <b>Duração por volta:</b> ~30 segundos (movimentação 3D contínua e sincronizada)</div>
-            <div>🔔 <b>Rodadas extras de apostas:</b> A cada 10 voltas concluídas</div>
-            <div>🎲 <b>Seed da corrida:</b> Gerada automaticamente de forma aleatória e única pelo sistema</div>
-            <div>🔒 <b>Voltas fixas:</b> Definidas antes da largada (não é possível adicionar ou remover voltas após o início)</div>
+            <div>🔔 <b>Rodadas de apostas:</b> Pré-largada e a cada 10 voltas (encerramento definitivo por rodada)</div>
+            <div>🎲 <b>Seed da corrida:</b> Gerada automaticamente de forma única pelo sistema</div>
+            <div>👑 <b>Controle exclusivo:</b> Somente você (Criador Autorizado) pode iniciar a corrida</div>
           </div>
         </div>
 
         <div class="card">
           <div class="row" style="justify-content:space-between">
-            <h2>Pilotos & Equipes no Grid (${grid.length}/20)</h2>
+            <h2 id="setup-grid-count-heading">Pilotos & Equipes no Grid (${grid.length}/${DRIVERS.length})</h2>
             <div class="row no-flex">
-              <button class="btn ghost sm" onclick="F1App.selectAllDrivers(true)">Todos (20)</button>
+              <button class="btn ghost sm" onclick="F1App.selectAllDrivers(true)">Todos (${DRIVERS.length})</button>
               <button class="btn ghost sm" onclick="F1App.selectAllDrivers(false)">Top 10</button>
             </div>
           </div>
-          <div class="grid g2" style="max-height:215px;overflow-y:auto;margin-top:8px;gap:7px">
+          <div class="grid g2" id="setup-drivers-grid" style="max-height:240px;overflow-y:auto;margin-top:8px;gap:7px">
             ${DRIVERS.map(d => {
               const t = TEAMS[d.team];
               const isOn = grid.includes(d.id);
-              return `<div class="opt ${isOn ? 'on' : ''}" style="padding:7px 10px" onclick="F1App.toggleDriver('${d.id}')">
+              return `<div class="opt ${isOn ? 'on' : ''}" data-did="${d.id}" style="padding:7px 10px" onclick="F1App.toggleDriver('${d.id}')">
                 <div class="dr">
                   <span class="tm" style="background:${t.color};height:22px"></span>
                   <div>
-                    <b>${d.id}</b> <span style="font-size:12.5px">${esc(d.name)}</span>
+                    <b>${d.id}</b> <span style="font-size:12.5px">${esc(d.name)} ${d.flag || ''}</span>
                     <small>${esc(t.name)}</small>
                   </div>
                 </div>
@@ -1764,7 +2112,7 @@
 
       <div class="row" style="margin-top:18px;justify-content:space-between">
         <button class="btn ghost" onclick="F1App.go('room')">← Voltar à Sala</button>
-        <button class="btn ok" style="padding:13px 24px;font-size:14px" onclick="F1App.prepareRace()" ${onlineCount < MIN_PLAYERS_TO_START ? 'disabled' : ''}>
+        <button class="btn ok" id="setup-prepare-btn" style="padding:13px 24px;font-size:14px" onclick="F1App.prepareRace()" ${onlineCount < MIN_PLAYERS_TO_START ? 'disabled' : ''}>
           🏁 Preparar Grid & Abrir Janela de Apostas (${lapsVal} Voltas)
         </button>
       </div>
@@ -1772,12 +2120,36 @@
   }
 
   /**
-   * Betting Panel:
-   * - NO driver positions in the betting selection table!
-   * - Clear highlight on selected driver
-   * - Shows bet value, round multiplier, and payout rules
-   * - Max bet 10.000 fichas
+   * Betting Driver Cards HTML:
+   * Organized strictly according to the CURRENT RACE CLASSIFICATION (from 1st to last place)!
    */
+  function renderBetDriverCardsHTML(r) {
+    const orderedDrivers = (r.order && r.order.length ? r.order : r.start).slice();
+    if (!orderedDrivers.includes(S.selectedBetDriver)) {
+      S.selectedBetDriver = orderedDrivers[0];
+    }
+
+    return orderedDrivers.map((id, idx) => {
+      const d = dv(id);
+      const t = TEAMS[d.team];
+      const drvState = r.drv ? r.drv[id] : null;
+      const isDnf = drvState && drvState.st === 'dnf';
+      const posNum = idx + 1;
+      const isSel = S.selectedBetDriver === id;
+
+      return `<div class="bet-driver-card ${isSel ? 'selected' : ''}" data-driver="${id}" style="${isDnf ? 'opacity:0.45' : ''}" onclick="F1App.selectBetDriver('${id}')">
+        <span class="bet-pos-badge mono ${posNum <= 3 ? 'podium-' + posNum : ''}">${isDnf ? 'OUT' : posNum + 'º'}</span>
+        <span class="tm" style="background:${t.color};height:28px"></span>
+        <div style="min-width:0;flex:1">
+          <div style="font-weight:900;font-size:13px">${id} ${d.flag || ''} <span class="mut" style="font-size:11px">#${d.num}</span></div>
+          <div style="font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.name)}</div>
+          <small class="mut" style="font-size:10px">${esc(t.name)}</small>
+        </div>
+        ${isSel ? '<span class="sel-check">★</span>' : ''}
+      </div>`;
+    }).join('');
+  }
+
   function renderBettingPanel(r) {
     if (r.done) return '';
 
@@ -1795,47 +2167,34 @@
         <p class="mut" style="margin:6px 0 0;font-size:13px">
           ${r.running
             ? (hasMoreWindows
-                ? `Corrida em andamento! Uma nova rodada de apostas abrirá automaticamente ao completar a <b>Volta ${nextWindowLap}</b>.`
+                ? `Corrida em andamento! Uma nova rodada de apostas abrirá ao completar a <b>Volta ${nextWindowLap}</b>.`
                 : `Corrida no trecho final! As apostas estão bloqueadas até a bandeira quadriculada.`)
-            : `As apostas desta rodada foram encerradas e confirmadas para a largada.`}
+            : `O período de apostas desta rodada foi encerrado definitivamente e não pode ser reaberto.`}
         </p>
       </div>`;
     }
 
-    // Drivers sorted alphabetically by ID (NO position info shown in the betting table!)
-    const sortedDrivers = r.start.slice().sort();
-    if (!sortedDrivers.includes(S.selectedBetDriver)) {
-      S.selectedBetDriver = sortedDrivers[0];
+    const orderedDrivers = (r.order && r.order.length ? r.order : r.start).slice();
+    if (!orderedDrivers.includes(S.selectedBetDriver)) {
+      S.selectedBetDriver = orderedDrivers[0];
     }
     const selDrv = dv(S.selectedBetDriver);
     const selTeam = TEAMS[selDrv.team];
-    const amt = Math.min(MAX_BET_AMOUNT, Math.max(1, Math.floor(+S.betAmountInput || 100)));
+    const selPos = orderedDrivers.indexOf(S.selectedBetDriver) + 1;
+    const amt = Math.min(MAX_BET_AMOUNT, Math.max(1, Math.floor(+S.betAmountInput || 20)));
 
     return `<div class="card gold-edge" id="betting-form-card">
       <div class="row" style="justify-content:space-between">
-        <h3>🪙 Fazer Aposta · Rodada ${roundNum} (${r.lap === 0 ? 'Pré-Largada' : 'Após Volta ' + r.lap})</h3>
+        <h3>🪙 Fazer Aposta · Rodada ${roundNum} (${r.lap === 0 ? 'Grid de Largada' : 'Após Volta ' + r.lap})</h3>
         <span class="chip mono" style="border-color:var(--gold);color:var(--gold)">Multiplicador ${vm(curMult)}</span>
       </div>
 
       <small class="mut" style="display:block;margin-top:4px">
-        1. Selecione o corredor abaixo (clique para destacar):
+        1. Escolha o corredor (organizados pela classificação atual da corrida, do 1º ao último colocado):
       </small>
 
       <div class="bet-driver-grid" id="bet-driver-table">
-        ${sortedDrivers.map(id => {
-          const d = dv(id);
-          const t = TEAMS[d.team];
-          const isSel = S.selectedBetDriver === id;
-          return `<div class="bet-driver-card ${isSel ? 'selected' : ''}" data-driver="${id}" onclick="F1App.selectBetDriver('${id}')">
-            <span class="tm" style="background:${t.color};height:28px"></span>
-            <div style="min-width:0">
-              <div style="font-weight:900;font-size:13px">${id} <span class="mut" style="font-size:11px">#${d.num}</span></div>
-              <div style="font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.name)}</div>
-              <small class="mut" style="font-size:10px">${esc(t.id)}</small>
-            </div>
-            ${isSel ? '<span class="sel-check">★</span>' : ''}
-          </div>`;
-        }).join('')}
+        ${renderBetDriverCardsHTML(r)}
       </div>
 
       <div class="bet-summary-box" id="selected-bet-preview">
@@ -1843,7 +2202,7 @@
           <div class="dr">
             <span class="tm" style="background:${selTeam.color};height:24px"></span>
             <div>
-              <small class="mut">CORREDOR SELECIONADO</small>
+              <small class="mut">CORREDOR SELECIONADO (${selPos}º COLOCADO)</small>
               <div style="font-weight:900;color:var(--gold)">${selDrv.id} · ${esc(selDrv.name)} (${esc(selTeam.name)})</div>
             </div>
           </div>
@@ -1854,31 +2213,31 @@
       <div>
         <div class="row" style="justify-content:space-between;margin-bottom:4px">
           <small class="mut">2. Valor da Aposta (Máx: ${fmt(MAX_BET_AMOUNT)} fichas)</small>
-          <small class="mono" style="color:var(--gold)">Saldo: ${fmt(S.user.chips)} 🪙</small>
+          <small class="mono" style="color:var(--gold)">Saldo: <span id="bet-panel-balance">${fmt(S.user.chips)}</span> 🪙</small>
         </div>
         <div class="quick-chips">
-          ${[100, 500, 1000, 2500, 5000, 10000].map(v => `<button type="button" class="quick-chip mono" onclick="F1App.setBetAmount(${v})">${v === 10000 ? '10.000 (MÁX)' : fmt(v)}</button>`).join('')}
+          ${[10, 25, 50, 100, 500, 1000].map(v => `<button type="button" class="quick-chip mono" onclick="F1App.setBetAmount(${v})">${fmt(v)}</button>`).join('')}
         </div>
         <div class="row" style="margin-top:6px">
-          <input id="bet-amount-input" type="number" min="1" max="${MAX_BET_AMOUNT}" step="10" value="${amt}" oninput="F1App.onBetAmountInput(this.value)">
+          <input id="bet-amount-input" type="number" min="1" max="${MAX_BET_AMOUNT}" step="5" value="${amt}" oninput="F1App.onBetAmountInput(this.value)">
           <button class="btn gold" id="confirm-bet-btn" onclick="F1App.placeBet()">✓ Confirmar Aposta</button>
         </div>
       </div>
 
       <div class="bet-summary-box" id="bet-calc-details" style="margin-top:10px;margin-bottom:0">
-        ${renderBetCalculationDetails(amt, curMult, selDrv)}
+        ${renderBetCalculationDetails(amt, curMult, selDrv, selPos)}
       </div>
     </div>`;
   }
 
-  function renderBetCalculationDetails(amount, curMult, selDrv) {
+  function renderBetCalculationDetails(amount, curMult, selDrv, selPos) {
     const a = Math.max(0, Math.floor(+amount || 0));
     const win1 = r2(a * 3.0 * curMult);
     const win2 = r2(a * 2.0 * curMult);
     const win3 = r2(a * 1.5 * curMult);
     return `<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px">
-      <span>Valor a debitar: <b class="mono" style="color:var(--gold)">${fmt(a)} 🪙</b></span>
-      <span>Corredor: <b>${selDrv.id}</b></span>
+      <span>Valor: <b class="mono" style="color:var(--gold)">${fmt(a)} 🪙</b></span>
+      <span>Corredor: <b>${selPos ? selPos + 'º · ' : ''}${selDrv.id}</b></span>
       <span>Mult: <b>${vm(curMult)}</b></span>
     </div>
     <div class="mut" style="font-size:11.5px;margin-top:5px">
@@ -1911,8 +2270,8 @@
             </span>
           </div>
           <small class="mut">
-            ${b.lap ? 'Volta ' + b.lap : 'Pré-Largada'} · ${vm(b.mult)}
-            ${res ? ` · Final: ${res.isDnf ? 'DNF' : res.fin + 'º'} · Retorno: ${fmt(res.ret)}` : (b.locked ? ' · 🔒 Confirmada' : ' · 🟢 Janela Aberta')}
+            ${b.lap ? 'Volta ' + b.lap : 'Pré-Largada'} (${b.startPos}º) · ${vm(b.mult)}
+            ${res ? ` · Final: ${res.isDnf ? 'DNF' : res.fin + 'º'} · Retorno: ${fmt(res.ret)}` : (b.locked || !r.bettingOpen ? ' · 🔒 Bloqueada' : ' · 🟢 Janela Aberta')}
           </small>
         </div>
         <div style="text-align:right;display:flex;align-items:center;gap:8px">
@@ -1927,7 +2286,6 @@
 
   function renderClassificationTower(r) {
     const lead = r.drv[r.order[0]];
-    let prev = null;
     return `<div style="overflow-x:auto">
       <table class="tower mono">
         <thead>
@@ -1952,7 +2310,6 @@
               : i === 0
                 ? '<b style="color:var(--gold)">LÍDER</b>'
                 : `+${Math.max(0.1, d.t - lead.t).toFixed(1)}s`;
-            if (run) prev = d;
 
             return `<tr class="${isSel ? 'row-selected' : ''}" style="${run ? '' : 'opacity:0.45'}" onclick="F1App.highlightDriver('${id}')" title="Clique para destacar ${esc(drv.name)} no circuito 3D">
               <td class="pos">${String(i + 1).padStart(2, '0')}</td>
@@ -1960,7 +2317,7 @@
                 <div class="dr">
                   <span class="tm" style="background:${t.color};height:22px"></span>
                   <div>
-                    <b>${id}</b> <span class="mut" style="font-size:11.5px">${esc(drv.name.split(' ').pop())}</span>
+                    <b>${id}</b> <span class="mut" style="font-size:11.5px">${drv.flag || ''} ${esc(drv.name.split(' ').pop())}</span>
                     ${isSel ? '<span style="color:var(--gold);font-size:11px;margin-left:4px">★</span>' : ''}
                   </div>
                 </div>
@@ -2008,19 +2365,24 @@
     </div>`;
   }
 
+  /**
+   * Race Controls Bar:
+   * - Only the authorized creator can close the betting window or start/resume the race.
+   * - Once betting window is closed (`!r.bettingOpen`), there is NO button or option to reopen it!
+   */
   function renderRaceControlsBar(r) {
     const onlineCount = getOnlinePlayers().length;
-    const amHost = isRoomHost();
+    const amCreator = isAuthorizedCreator();
     const hasEnoughPlayers = onlineCount >= MIN_PLAYERS_TO_START;
     const hasValidLaps = r.total >= MIN_RACE_LAPS;
     const windowClosed = !r.bettingOpen;
 
-    if (!amHost) {
+    if (!amCreator) {
       return `<div class="card" style="margin-top:12px;padding:12px 16px">
         <div class="row" style="justify-content:space-between">
           <span>Status da Sessão Multiplayer:</span>
           <b style="color:var(--gold)">
-            ${r.running ? '🟢 Corrida em andamento (Sincronizada em Tempo Real)' : r.bettingOpen ? '🪙 Janela de apostas aberta — Faça suas apostas!' : '🚦 Apostas encerradas — Aguardando o líder iniciar a largada'}
+            ${r.running ? '🟢 Corrida em andamento (Sincronizada em Tempo Real)' : r.bettingOpen ? '🪙 Janela de apostas aberta — Faça suas apostas!' : '🔒 Apostas encerradas — Aguardando o criador iniciar a largada'}
           </b>
         </div>
       </div>`;
@@ -2029,8 +2391,8 @@
     return `<div class="card" style="margin-top:12px;padding:14px 16px">
       <div class="row" style="justify-content:space-between;margin-bottom:10px">
         <div>
-          <h3 style="margin:0;color:var(--tx)">Painel de Controle da Corrida (Líder da Sala)</h3>
-          <small class="mut">Validações obrigatórias antes da largada:</small>
+          <h3 style="margin:0;color:var(--tx)">Painel de Controle da Corrida (Criador Autorizado)</h3>
+          <small class="mut">O encerramento das apostas é definitivo para a rodada atual:</small>
         </div>
         <div class="row no-flex" style="gap:6px">
           <span class="chip" style="border-color:var(--${hasEnoughPlayers ? 'ok' : 'red2'});color:var(--${hasEnoughPlayers ? 'ok' : 'red2'})">
@@ -2040,7 +2402,7 @@
             ${hasValidLaps ? '✓' : '✗'} ${r.total} Voltas (Mín. 5)
           </span>
           <span class="chip" style="border-color:var(--${windowClosed ? 'ok' : 'gold'});color:var(--${windowClosed ? 'ok' : 'gold'})">
-            ${windowClosed ? '✓ Apostas Encerradas' : '⏳ Apostas Abertas'}
+            ${windowClosed ? '🔒 Apostas Encerradas' : '🟢 Apostas Abertas'}
           </span>
         </div>
       </div>
@@ -2049,10 +2411,9 @@
         ${r.running
           ? `<button class="btn ghost" onclick="F1App.pauseRace()">⏸ Pausar Simulação</button>`
           : r.bettingOpen
-            ? `<button class="btn gold" id="close-betting-btn" onclick="F1App.toggleBettingWindow(false)">🔒 1. Encerrar Janela de Apostas</button>
-               <button class="btn" id="start-race-btn" disabled title="Encerre a janela de apostas primeiro antes de iniciar a largada">🚦 2. ${!r.started ? 'Autorizar Largada' : 'Retomar Corrida'}</button>`
-            : `<button class="btn ghost" onclick="F1App.toggleBettingWindow(true)">🔓 Reabrir Apostas</button>
-               <button class="btn ok" id="start-race-btn" onclick="F1App.startOrResumeRace()" ${(!hasEnoughPlayers || !hasValidLaps) ? 'disabled' : ''}>
+            ? `<button class="btn gold" id="close-betting-btn" onclick="F1App.closeBettingWindow()">🔒 1. Encerrar Apostas Definitivamente</button>
+               <button class="btn" id="start-race-btn" disabled title="Encerre o período de apostas primeiro antes de iniciar a largada">🚦 2. ${!r.started ? 'Autorizar Largada' : 'Retomar Corrida'}</button>`
+            : `<button class="btn ok" id="start-race-btn" onclick="F1App.startOrResumeRace()" ${(!hasEnoughPlayers || !hasValidLaps) ? 'disabled' : ''}>
                  🚦 ${!r.started ? 'Autorizar Largada (Iniciar Corrida 3D)' : `Retomar Corrida (Volta ${r.lap + 1})`}
                </button>`
         }
@@ -2065,10 +2426,11 @@
     if (!R) return renderNoRoomCard();
     const r = R.race;
     if (!r) {
+      const amCreator = isAuthorizedCreator();
       return `<div class="card">
         <h2>Simulador de Corridas 3D</h2>
-        <p class="mut">Nenhuma corrida preparada ainda nesta sala. Configure o circuito e as voltas para abrir o grid.</p>
-        <button class="btn" onclick="F1App.go('setup')">Configurar Corrida →</button>
+        <p class="mut">${amCreator ? 'Nenhuma corrida preparada ainda nesta sala. Configure o circuito e as voltas para abrir o grid.' : 'Aguardando o criador autorizado da sala configurar e iniciar a próxima corrida.'}</p>
+        ${amCreator ? `<button class="btn" onclick="F1App.go('setup')">Configurar Corrida →</button>` : `<button class="btn ghost" onclick="F1App.go('room')">← Voltar ao Lobby</button>`}
       </div>`;
     }
 
@@ -2080,15 +2442,20 @@
     const remSec = Math.max(0, Math.ceil(((1 - (r.lapProgress || 0)) * (r.lapDurationMs || LAP_DURATION_MS)) / 1000));
     const camMode = SIM3D.cameraMode || 'panorama';
 
+    // Reset cache signatures on fresh race view render
+    S._lastEventsSig = getEventsSignature(r);
+    S._lastTowerSig = '';
+    S._lastBetsSig = '';
+    S._lastBetDriverOrderSig = (r.order || []).join(',');
+
     return `<div class="race-workspace">
-      <!-- LEFT / MAIN HERO COLUMN: 3D RACE SIMULATOR -->
       <div>
         <div class="sim3d-stage-card">
           <div class="sim3d-topbar">
             <div class="sim3d-title-group">
               <div>
                 <div style="font-size:11px;font-weight:800;color:var(--red2);letter-spacing:1.2px;text-transform:uppercase">
-                  ${r.running ? '<span class="live"></span>SIMULAÇÃO 3D AO VIVO' : r.bettingOpen ? '🪙 JANELA DE APOSTAS ABERTA' : '🚦 PRONTO PARA A LARGADA'}
+                  ${r.running ? '<span class="live"></span>SIMULAÇÃO 3D AO VIVO' : r.bettingOpen ? '🪙 JANELA DE APOSTAS ABERTA' : '🚦 APOSTAS ENCERRADAS · PRONTO PARA LARGADA'}
                 </div>
                 <h2 style="margin:0;font-size:22px">${r.circuit.flag || '🏁'} ${esc(r.circuit.name)} <span class="mut" style="font-size:13px;font-weight:600">· ${r.circuit.km} km</span></h2>
               </div>
@@ -2113,7 +2480,6 @@
             <b id="race-progress-bar" style="width:${totalPct.toFixed(1)}%"></b>
           </div>
 
-          <!-- 3D WEBGL CIRCUIT & CARS VIEWPORT -->
           <div class="sim3d-viewport">
             <div id="sim3d-mount" style="width:100%;height:100%"></div>
 
@@ -2126,7 +2492,7 @@
                   <button class="cam-btn ${camMode === 'top' ? 'on' : ''}" onclick="F1App.setCameraMode('top')">🛰️ Aérea</button>
                 </div>
                 <div class="chip mono" style="background:rgba(10,12,18,0.85)">
-                  👥 ${getOnlinePlayers().length} Jogadores Sincronizados
+                  👥 <span id="race-sync-players-count">${getOnlinePlayers().length}</span> Jogadores Sincronizados
                 </div>
               </div>
 
@@ -2136,7 +2502,6 @@
             </div>
           </div>
 
-          <!-- DRIVER HIGHLIGHT BAR DURING RACE -->
           <div class="driver-selector-strip" id="driver-highlight-strip">
             <small class="mut" style="white-space:nowrap;font-weight:800;margin-right:4px">DESTACAR CORREDOR:</small>
             <button class="drv-pill ${!S.highlightedDriver ? 'on' : ''}" onclick="F1App.highlightDriver(null)">Todos</button>
@@ -2151,13 +2516,12 @@
           </div>
         </div>
 
-        ${renderRaceControlsBar(r)}
+        <div id="race-controls-bar-wrap">${renderRaceControlsBar(r)}</div>
 
-        <!-- BOTTOM ROW UNDER 3D STAGE: ACTIVE BETS & RACE EVENTS -->
         <div class="grid g2" style="margin-top:14px">
           <div class="card">
             <div class="row" style="justify-content:space-between">
-              <h3>Apostas Registradas (${(r.bets || []).filter(b => !b.cancelled).length})</h3>
+              <h3 id="race-bets-heading">Apostas Registradas (${(r.bets || []).filter(b => !b.cancelled).length})</h3>
               <small class="mut">${r.bettingOpen && !r.running ? 'Cancelamento liberado' : 'Apostas bloqueadas'}</small>
             </div>
             <div id="race-bets-list" style="max-height:260px;overflow-y:auto;margin-top:6px">
@@ -2174,7 +2538,6 @@
         </div>
       </div>
 
-      <!-- RIGHT COLUMN: BETTING TABLE & LIVE CLASSIFICATION TOWER -->
       <div class="grid" style="gap:14px">
         <div id="race-betting-panel">${renderBettingPanel(r)}</div>
 
@@ -2197,6 +2560,7 @@
     const wTeam = TEAMS[wDrv.team];
     const ov = Object.entries(r.drv).sort((a, b) => b[1].ov - a[1].ov);
     const totOv = ov.reduce((s, x) => s + x[1].ov, 0);
+    const amCreator = isAuthorizedCreator();
 
     return `<div>
       <div class="card gold-edge">
@@ -2207,7 +2571,7 @@
             <small class="mut">Equipe ${esc(wTeam.name)} · ${r.total} voltas concluídas</small>
           </div>
           <div class="row no-flex">
-            <button class="btn ok" onclick="F1App.startNewRaceSetup()">🏎️ Configurar Nova Corrida</button>
+            ${amCreator ? `<button class="btn ok" onclick="F1App.startNewRaceSetup()">🏎️ Configurar Nova Corrida</button>` : `<span class="chip">Aguardando o criador iniciar nova corrida</span>`}
             <button class="btn ghost" onclick="F1App.go('wallet')">🪙 Ver Caixa de Fichas</button>
           </div>
         </div>
@@ -2233,7 +2597,7 @@
   }
 
   /**
-   * 6. CAIXA DE FICHAS (PERSISTENT FINANCIAL DASHBOARD)
+   * 7. CAIXA DE FICHAS (PERSISTENT FINANCIAL DASHBOARD)
    */
   function renderWalletView() {
     const u = S.user;
@@ -2250,7 +2614,7 @@
       <div class="row" style="justify-content:space-between;margin-bottom:14px">
         <div>
           <h2>🪙 Caixa de Fichas & Resultados Financeiros</h2>
-          <p class="mut" style="margin:0;font-size:13px">Registro persistente de todas as suas apostas, ganhos, perdas e movimentações.</p>
+          <p class="mut" style="margin:0;font-size:13px">Saldo inicial padrão: 100 fichas. Registro persistente de todas as suas apostas, ganhos e perdas.</p>
         </div>
         <div class="dr no-flex">
           <span class="av" style="background:${av.color}">${av.icon}</span>
@@ -2281,18 +2645,6 @@
           <h3>Total de Fichas Perdidas</h3>
           <div class="stat mono bad">-${fmt(cb.totalLost)} 🪙</div>
           <small class="mut">Lucro/Prejuízo Líquido: <b class="${cb.netProfit >= 0 ? 'ok' : 'bad'}">${cb.netProfit >= 0 ? '+' : ''}${fmt(cb.netProfit)} 🪙</b></small>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:14px">
-        <div class="row" style="justify-content:space-between">
-          <div>
-            <h3>Balanço Acumulado (Lucro / Prejuízo)</h3>
-            <div class="stat mono ${cb.netProfit >= 0 ? 'ok' : 'bad'}">
-              ${cb.netProfit >= 0 ? '+' : ''}${fmt(cb.netProfit)} 🪙
-            </div>
-          </div>
-          ${u.chips < 1000 ? `<button class="btn ghost sm" onclick="F1App.reloadFreeChips()">🎁 Recarregar +10.000 Fichas Virtuais</button>` : ''}
         </div>
       </div>
 
@@ -2336,6 +2688,128 @@
               </div>`;
             }).join('') : '<div class="slot">Nenhuma movimentação financeira registrada.</div>'}
           </div>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  /**
+   * 8. PAINEL ADMINISTRATIVO (AUTHENTICATED VIEW)
+   */
+  function renderAdminView() {
+    if (!S.admin.authenticated || !S.admin.token) {
+      return `<div style="max-width:440px;margin:36px auto">
+        <div class="card gold-edge">
+          <div class="row" style="justify-content:space-between;margin-bottom:8px">
+            <h2>🔒 Painel Administrativo</h2>
+            <span class="chip mono">Acesso Restrito</span>
+          </div>
+          <p class="mut" style="font-size:13px;margin-top:0">
+            Autenticação validada no servidor para gerenciamento de jogadores e saldos.
+          </p>
+          <form onsubmit="F1App.adminLogin(event)">
+            <div style="margin-bottom:12px">
+              <small class="mut">Login do Administrador</small>
+              <input id="admin-login-input" placeholder="Login" autocomplete="username" required>
+            </div>
+            <div style="margin-bottom:16px">
+              <small class="mut">Senha</small>
+              <input id="admin-pass-input" type="password" placeholder="••••••" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn gold" style="width:100%;padding:12px">🛡️ Entrar no Painel Administrativo</button>
+          </form>
+        </div>
+      </div>`;
+    }
+
+    const q = (S.admin.searchQuery || '').trim().toLowerCase();
+    const allPlayers = S.admin.players || [];
+    const filtered = q
+      ? allPlayers.filter(p => (p.name || '').toLowerCase().includes(q) || (p.id || '').toLowerCase().includes(q))
+      : allPlayers;
+    const totalChipsInCirculation = r2(allPlayers.reduce((sum, p) => sum + (+p.chips || 0), 0));
+
+    return `<div>
+      <div class="row" style="justify-content:space-between;margin-bottom:16px">
+        <div>
+          <span class="chip" style="border-color:var(--gold);color:var(--gold);margin-bottom:6px">🛡️ ADMINISTRADOR AUTENTICADO: ${esc(S.admin.loginName || 'LN')}</span>
+          <h2>Painel Administrativo · Gestão de Jogadores e Saldos</h2>
+          <p class="mut" style="margin:0;font-size:13px">Consulte, adicione, remova ou defina manualmente o saldo de qualquer jogador cadastrado no servidor.</p>
+        </div>
+        <div class="row no-flex">
+          <button class="btn ghost sm" onclick="F1App.refreshAdminPlayers()">🔄 Atualizar Lista</button>
+          <button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.adminLogout()">🚪 Sair do Admin</button>
+        </div>
+      </div>
+
+      <div class="grid g3" style="margin-bottom:16px">
+        <div class="card gold-edge">
+          <h3>Jogadores Cadastrados</h3>
+          <div class="stat mono">${allPlayers.length}</div>
+          <small class="mut">Contas sincronizadas com o servidor</small>
+        </div>
+        <div class="card ok-edge">
+          <h3>Total de Fichas em Circulação</h3>
+          <div class="stat mono gold-tx">${fmt(totalChipsInCirculation)} 🪙</div>
+          <small class="mut">Soma dos saldos de todos os jogadores</small>
+        </div>
+        <div class="card cyan-edge">
+          <h3>Saldo Inicial Padrão</h3>
+          <div class="stat mono">${fmt(INITIAL_CHIPS)} 🪙</div>
+          <small class="mut">Aplicado automaticamente a novos jogadores</small>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:14px">
+          <h3>Jogadores Cadastrados & Controle de Saldo (${filtered.length})</h3>
+          <div style="max-width:300px;width:100%">
+            <input id="admin-search-in" placeholder="🔍 Filtrar jogador por nome ou ID..." value="${esc(S.admin.searchQuery)}" oninput="F1App.onAdminSearch(this.value)">
+          </div>
+        </div>
+
+        <div style="overflow-x:auto">
+          <table class="tower" id="admin-players-table">
+            <thead>
+              <tr>
+                <th>JOGADOR</th>
+                <th>ID DA CONTA</th>
+                <th>SALDO ATUAL</th>
+                <th>VALOR (FICHAS)</th>
+                <th style="text-align:right">AÇÕES ADMINISTRATIVAS</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.length ? filtered.map(p => {
+                const av = avObj(p.avatarId);
+                const isMe = S.user && p.id === S.user.id;
+                return `<tr>
+                  <td>
+                    <div class="dr">
+                      <span class="av" style="background:${av.color};width:30px;height:30px;font-size:14px">${av.icon}</span>
+                      <div>
+                        <b>${esc(p.name)}</b>
+                        ${isMe ? '<span class="chip" style="padding:0 6px;font-size:10px;color:var(--gold)">VOCÊ</span>' : ''}
+                        <small class="mut" style="display:block">Vitórias: ${p.wins || 0}</small>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="mono mut" style="font-size:12px">${esc(p.id)}</td>
+                  <td class="mono" style="font-size:15px;font-weight:900;color:var(--gold)">${fmt(p.chips)} 🪙</td>
+                  <td style="width:150px">
+                    <input id="adm-amt-${esc(p.id)}" type="number" min="0" step="10" value="100" style="padding:6px 10px;font-size:13px" class="mono">
+                  </td>
+                  <td style="text-align:right">
+                    <div class="row no-flex" style="justify-content:flex-end;gap:6px">
+                      <button class="btn ok sm" onclick="F1App.adminModifyBalance('${esc(p.id)}', 'add')" title="Adicionar valor ao saldo do jogador">➕ Adicionar</button>
+                      <button class="btn sm" onclick="F1App.adminModifyBalance('${esc(p.id)}', 'remove')" title="Remover valor do saldo do jogador">➖ Remover</button>
+                      <button class="btn gold sm" onclick="F1App.adminModifyBalance('${esc(p.id)}', 'set')" title="Definir manualmente o saldo exato do jogador">✏️ Definir Saldo</button>
+                    </div>
+                  </td>
+                </tr>`;
+              }).join('') : `<tr><td colspan="5"><div class="slot">Nenhum jogador encontrado.</div></td></tr>`}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>`;
@@ -2399,6 +2873,12 @@
     return (r.events || []).slice(0, 18).map(e => `<div class="ev">${ICO[e.k] || '•'} <b>V${e.l}</b> ${esc(e.t)}</div>`).join('');
   }
 
+  function getEventsSignature(r) {
+    if (!r || !Array.isArray(r.events) || r.events.length === 0) return 'empty';
+    const top = r.events[0];
+    return `${r.events.length}_${top.id || ''}_${top.l}_${top.t}`;
+  }
+
   function wxBadge(r) {
     return `${['☀️ Pista Seca', '🌦️ Chuva Leve', '🌧️ Chuva Forte'][r.ws || 0]} · ${Math.round((r.w || 0) * 100)}% molhada${r.sc && r.sc.type ? ` · <b style="color:var(--gold)">🚨 ${r.sc.type === 'SC' ? 'SAFETY CAR' : 'VSC'}</b>` : ''}`;
   }
@@ -2437,6 +2917,7 @@
     else if (S.view === 'race') mainContent = renderRaceView();
     else if (S.view === 'wallet') mainContent = renderWalletView();
     else if (S.view === 'rank') mainContent = renderRankView();
+    else if (S.view === 'admin') mainContent = renderAdminView();
 
     $('#app').innerHTML = `${renderHeader()}<main>${mainContent}</main>${renderProfileModal()}${renderSpectatorOverlay()}`;
 
@@ -2451,7 +2932,70 @@
     }
   }
 
-  // Targeted DOM update during live race ticks so we never destroy the 3D WebGL canvas or typing inputs!
+  /**
+   * Surgical, zero-flicker DOM updates for Header, Room Lobby, and Setup views.
+   * Never replaces `#app.innerHTML` when already inside the view!
+   */
+  function updateHeaderAndRoomDOM() {
+    const balanceEl = $('#header-balance-val');
+    if (balanceEl && S.user) balanceEl.textContent = fmt(S.user.chips);
+
+    const betBalEl = $('#bet-panel-balance');
+    if (betBalEl && S.user) betBalEl.textContent = fmt(S.user.chips);
+
+    if (S.room) {
+      const onlineCount = getOnlinePlayers(S.room).length;
+      const hdrOnline = $('#header-room-online-count');
+      if (hdrOnline) hdrOnline.textContent = String(onlineCount);
+
+      if (S.view === 'room') {
+        const R = S.room;
+        const canProceed = onlineCount >= MIN_PLAYERS_TO_START;
+        const statusTxt = $('#room-lobby-status-text');
+        if (statusTxt) {
+          statusTxt.style.color = `var(--${canProceed ? 'ok' : 'red2'})`;
+          statusTxt.textContent = canProceed
+            ? `✓ ${onlineCount} jogadores conectados (Pronto!)`
+            : `⏳ Aguardando jogadores (${onlineCount}/${MIN_PLAYERS_TO_START} conectados)`;
+        }
+        const headingEl = $('#room-players-heading');
+        if (headingEl) {
+          headingEl.textContent = `Jogadores na Sala (${onlineCount} online / ${R.players.length} total)`;
+        }
+        const pListEl = $('#room-players-list');
+        if (pListEl) {
+          const newHtml = renderRoomPlayersListHTML(R);
+          if (S._lastRoomPlayersSig !== newHtml) {
+            S._lastRoomPlayersSig = newHtml;
+            pListEl.innerHTML = newHtml;
+          }
+        }
+        const footerEl = $('#room-action-footer');
+        if (footerEl) {
+          const newFooter = renderRoomActionButtonsHTML(R);
+          if (footerEl.innerHTML !== newFooter) {
+            footerEl.innerHTML = newFooter;
+          }
+        }
+      } else if (S.view === 'setup') {
+        const onlineChip = $('#setup-online-chip');
+        if (onlineChip) {
+          onlineChip.innerHTML = `Jogadores Conectados: <b style="color:var(--${onlineCount >= 2 ? 'ok' : 'red2'})">${onlineCount}/2 mín.</b>`;
+        }
+        const prepBtn = $('#setup-prepare-btn');
+        if (prepBtn) {
+          prepBtn.disabled = onlineCount < MIN_PLAYERS_TO_START;
+        }
+      }
+    }
+  }
+
+  /**
+   * Targeted DOM update during live race ticks:
+   * - Never touches `#race-events-list` unless a new event was actually added (`S._lastEventsSig` check)!
+   * - Never touches `#race-tower-wrap` unless classification / gaps actually changed!
+   * - Keeps betting driver list sorted by current classification when betting window is open!
+   */
   function updateLiveHUDOnly() {
     const balanceEl = $('#header-balance-val');
     if (balanceEl && S.user) balanceEl.textContent = fmt(S.user.chips);
@@ -2473,35 +3017,98 @@
     }
 
     const wxEl = $('#race-wx-badge');
-    if (wxEl) wxEl.innerHTML = wxBadge(r);
+    if (wxEl) {
+      const newWx = wxBadge(r);
+      if (wxEl.innerHTML !== newWx) wxEl.innerHTML = newWx;
+    }
 
+    const syncCountEl = $('#race-sync-players-count');
+    if (syncCountEl) syncCountEl.textContent = String(getOnlinePlayers().length);
+
+    // Only update Classification Tower DOM if its content actually changed
     const towerEl = $('#race-tower-wrap');
-    if (towerEl) towerEl.innerHTML = renderClassificationTower(r);
+    if (towerEl) {
+      const newTowerHtml = renderClassificationTower(r);
+      if (S._lastTowerSig !== newTowerHtml) {
+        S._lastTowerSig = newTowerHtml;
+        towerEl.innerHTML = newTowerHtml;
+      }
+    }
 
+    // Only update Events List DOM when a new event actually occurred (eliminates 10Hz event flickering!)
     const evEl = $('#race-events-list');
-    if (evEl) evEl.innerHTML = renderEventsList(r);
+    if (evEl) {
+      const evSig = getEventsSignature(r);
+      if (S._lastEventsSig !== evSig) {
+        S._lastEventsSig = evSig;
+        evEl.innerHTML = renderEventsList(r);
+      }
+    }
+
+    // If betting panel is open and classification order changed, keep betting cards sorted 1st -> Last
+    const betTableEl = $('#bet-driver-table');
+    if (betTableEl && r.bettingOpen && !r.running) {
+      const orderSig = (r.order || []).join(',') + '|' + S.selectedBetDriver;
+      if (S._lastBetDriverOrderSig !== orderSig) {
+        S._lastBetDriverOrderSig = orderSig;
+        betTableEl.innerHTML = renderBetDriverCardsHTML(r);
+      }
+    }
 
     const selHud = $('#selected-driver-hud');
-    if (selHud) selHud.innerHTML = renderSelectedDriverTelemetryHUD(r);
+    if (selHud && S.highlightedDriver) {
+      selHud.innerHTML = renderSelectedDriverTelemetryHUD(r);
+    }
   }
 
   function refreshUI() {
-    const balanceEl = $('#header-balance-val');
-    if (balanceEl && S.user) balanceEl.textContent = fmt(S.user.chips);
+    updateHeaderAndRoomDOM();
 
-    // If on race view and 3D canvas is mounted, update side panels without unmounting WebGL canvas!
-    if (S.view === 'race' && S.room && S.room.race && !S.room.race.done && $('#sim3d-mount')) {
-      updateLiveHUDOnly();
-      const betsEl = $('#race-bets-list');
-      if (betsEl) betsEl.innerHTML = renderBetsList(S.room.race);
-      // Only re-render full race view if bettingOpen or running state transitioned
-      const hasBetForm = !!$('#betting-form-card');
-      const shouldHaveBetForm = S.room.race.bettingOpen && !S.room.race.running;
-      if (hasBetForm !== shouldHaveBetForm) {
+    if (S.view === 'room' || S.view === 'setup') {
+      // If a race just started while in room, switch to race view
+      if (S.room && S.room.race && !S.room.race.done && S.view === 'room') {
         render();
       }
       return;
     }
+
+    if (S.view === 'race' && S.room && S.room.race && !S.room.race.done && $('#sim3d-mount')) {
+      updateLiveHUDOnly();
+      const r = S.room.race;
+
+      const betsEl = $('#race-bets-list');
+      if (betsEl) {
+        const newBetsHtml = renderBetsList(r);
+        if (S._lastBetsSig !== newBetsHtml) {
+          S._lastBetsSig = newBetsHtml;
+          betsEl.innerHTML = newBetsHtml;
+        }
+      }
+      const betsHeading = $('#race-bets-heading');
+      if (betsHeading) {
+        betsHeading.textContent = `Apostas Registradas (${(r.bets || []).filter(b => !b.cancelled).length})`;
+      }
+
+      const controlsWrap = $('#race-controls-bar-wrap');
+      if (controlsWrap) {
+        const newCtrlHtml = renderRaceControlsBar(r);
+        if (controlsWrap.innerHTML !== newCtrlHtml) {
+          controlsWrap.innerHTML = newCtrlHtml;
+        }
+      }
+
+      // Check if betting form open/closed state changed -> update only `#race-betting-panel` without touching 3D canvas!
+      const hasBetForm = !!$('#betting-form-card');
+      const shouldHaveBetForm = r.bettingOpen && !r.running;
+      if (hasBetForm !== shouldHaveBetForm) {
+        const betPanelWrap = $('#race-betting-panel');
+        if (betPanelWrap) {
+          betPanelWrap.innerHTML = renderBettingPanel(r);
+        }
+      }
+      return;
+    }
+
     render();
   }
 
@@ -2511,7 +3118,11 @@
       const selHud = $('#selected-driver-hud');
       if (selHud) selHud.innerHTML = renderSelectedDriverTelemetryHUD(S.room.race);
       const towerEl = $('#race-tower-wrap');
-      if (towerEl) towerEl.innerHTML = renderClassificationTower(S.room.race);
+      if (towerEl) {
+        const newTowerHtml = renderClassificationTower(S.room.race);
+        S._lastTowerSig = newTowerHtml;
+        towerEl.innerHTML = newTowerHtml;
+      }
       const strip = $('#driver-highlight-strip');
       if (strip) {
         strip.querySelectorAll('.drv-pill').forEach(btn => {
@@ -2523,7 +3134,7 @@
   }
 
   /* =====================================================================
-   * 7. PUBLIC API & EVENT HANDLERS
+   * 9. PUBLIC API & EVENT HANDLERS
    * ===================================================================== */
   window.F1App = {
     go,
@@ -2531,11 +3142,24 @@
     joinRoom,
     leaveRoom,
     prepareRace,
-    toggleBettingWindow,
+    closeBettingWindow,
     startOrResumeRace,
     pauseRace,
     placeBet,
     cancelBet,
+    adminLogin,
+    adminLogout,
+    adminModifyBalance,
+    refreshAdminPlayers: () => fetchAdminPlayers(false),
+    onAdminSearch(val) {
+      S.admin.searchQuery = val || '';
+      render();
+      const searchIn = $('#admin-search-in');
+      if (searchIn) {
+        searchIn.focus();
+        searchIn.setSelectionRange(searchIn.value.length, searchIn.value.length);
+      }
+    },
     getRaceState: () => (S.room ? S.room.race : null),
     getState: () => S,
 
@@ -2550,8 +3174,12 @@
       render();
     },
     selectDraftAvatar(avId) {
+      const nameIn = $('#prof-name-in');
+      if (nameIn) S.profileDraftName = nameIn.value;
       S.profileDraftAvatar = avId;
-      render();
+      document.querySelectorAll('.avatar-choice').forEach(el => {
+        el.classList.toggle('on', el.getAttribute('onclick').includes(`'${avId}'`));
+      });
     },
     saveProfileFromModal() {
       const nameIn = $('#prof-name-in');
@@ -2575,7 +3203,7 @@
     },
 
     selectCircuit(cid) {
-      if (!S.room) return;
+      if (!S.room || !isAuthorizedCreator()) return;
       if (S.room.race && S.room.race.started && !S.room.race.done) {
         return toast('Não é possível alterar o circuito com uma corrida em andamento.');
       }
@@ -2583,24 +3211,31 @@
       S.room.circuitId = c.id;
       if (!S.room.laps || S.room.laps < MIN_RACE_LAPS) S.room.laps = c.laps;
       this._syncConfig();
-      render();
+      // Surgical DOM update on setup screen (no full page flash!)
+      document.querySelectorAll('#setup-circuits-grid .circuit-card').forEach(el => {
+        el.classList.toggle('on', el.getAttribute('data-cid') === c.id);
+      });
     },
     updateLaps(val) {
-      if (!S.room) return;
+      if (!S.room || !isAuthorizedCreator()) return;
       if (S.room.race && S.room.race.started && !S.room.race.done) {
         return toast('A quantidade de voltas não pode ser alterada após o início da corrida!');
       }
       const n = Math.max(MIN_RACE_LAPS, Math.min(MAX_RACE_LAPS, Math.floor(+val || MIN_RACE_LAPS)));
       S.room.laps = n;
+      const prepBtn = $('#setup-prepare-btn');
+      if (prepBtn) {
+        prepBtn.textContent = `🏁 Preparar Grid & Abrir Janela de Apostas (${n} Voltas)`;
+      }
       this._syncConfig();
     },
     updateWeather(wx) {
-      if (!S.room) return;
+      if (!S.room || !isAuthorizedCreator()) return;
       S.room.wxMode = wx;
       this._syncConfig();
     },
     toggleDriver(id) {
-      if (!S.room) return;
+      if (!S.room || !isAuthorizedCreator()) return;
       const g = S.room.grid || [];
       const idx = g.indexOf(id);
       if (idx >= 0) {
@@ -2610,35 +3245,30 @@
         g.push(id);
       }
       this._syncConfig();
-      render();
+      // Surgical DOM toggle on setup screen (no flicker!)
+      const cardEl = document.querySelector(`#setup-drivers-grid .opt[data-did="${id}"]`);
+      if (cardEl) cardEl.classList.toggle('on', g.includes(id));
+      const hEl = $('#setup-grid-count-heading');
+      if (hEl) hEl.textContent = `Pilotos & Equipes no Grid (${g.length}/${DRIVERS.length})`;
     },
     selectAllDrivers(all) {
-      if (!S.room) return;
+      if (!S.room || !isAuthorizedCreator()) return;
       S.room.grid = all ? DRIVERS.map(d => d.id) : DRIVERS.slice(0, 10).map(d => d.id);
       this._syncConfig();
-      render();
+      document.querySelectorAll('#setup-drivers-grid .opt').forEach(el => {
+        const did = el.getAttribute('data-did');
+        el.classList.toggle('on', S.room.grid.includes(did));
+      });
+      const hEl = $('#setup-grid-count-heading');
+      if (hEl) hEl.textContent = `Pilotos & Equipes no Grid (${S.room.grid.length}/${DRIVERS.length})`;
     },
     _syncConfig() {
-      if (!S.room) return;
-      if (isRoomHost()) {
-        MP.broadcastState(S.room);
-      } else {
-        MP.sendAction({
-          type: 'UPDATE_CONFIG',
-          playerId: S.user.id,
-          config: {
-            circuitId: S.room.circuitId,
-            laps: S.room.laps,
-            wxMode: S.room.wxMode,
-            grid: S.room.grid
-          }
-        });
-      }
+      if (!S.room || !isAuthorizedCreator()) return;
+      MP.broadcastState(S.room);
     },
 
     selectBetDriver(driverId) {
       S.selectedBetDriver = driverId;
-      // Also visually highlight the chosen car on the 3D circuit!
       this.highlightDriver(driverId);
       const table = $('#bet-driver-table');
       if (table) {
@@ -2652,13 +3282,14 @@
         const selDrv = dv(driverId);
         const selTeam = TEAMS[selDrv.team];
         const curMult = mult(r.lap);
+        const selPos = posOf(r, driverId);
         const prev = $('#selected-bet-preview');
         if (prev) {
           prev.innerHTML = `<div class="row" style="justify-content:space-between">
             <div class="dr">
               <span class="tm" style="background:${selTeam.color};height:24px"></span>
               <div>
-                <small class="mut">CORREDOR SELECIONADO</small>
+                <small class="mut">CORREDOR SELECIONADO (${selPos}º COLOCADO)</small>
                 <div style="font-weight:900;color:var(--gold)">${selDrv.id} · ${esc(selDrv.name)} (${esc(selTeam.name)})</div>
               </div>
             </div>
@@ -2667,7 +3298,7 @@
         }
         const calc = $('#bet-calc-details');
         if (calc) {
-          calc.innerHTML = renderBetCalculationDetails(S.betAmountInput, curMult, selDrv);
+          calc.innerHTML = renderBetCalculationDetails(S.betAmountInput, curMult, selDrv, selPos);
         }
       }
     },
@@ -2682,7 +3313,12 @@
       const r = S.room ? S.room.race : null;
       const calc = $('#bet-calc-details');
       if (r && calc) {
-        calc.innerHTML = renderBetCalculationDetails(S.betAmountInput, mult(r.lap), dv(S.selectedBetDriver));
+        calc.innerHTML = renderBetCalculationDetails(
+          S.betAmountInput,
+          mult(r.lap),
+          dv(S.selectedBetDriver),
+          posOf(r, S.selectedBetDriver)
+        );
       }
     },
 
@@ -2697,19 +3333,11 @@
       });
     },
     startNewRaceSetup() {
-      if (!S.room) return;
+      if (!S.room || !isAuthorizedCreator()) return;
       stopHostRaceLoop();
       S.room.race = null;
-      if (isRoomHost()) MP.broadcastState(S.room);
+      MP.broadcastState(S.room);
       go('setup');
-    },
-    reloadFreeChips() {
-      S.user.chips = r2(S.user.chips + 10000);
-      recordFinancialTx('tx_bonus_' + Date.now(), 'RACE_WIN', 'Recarga de Fichas Virtuais', 'Bônus de demonstração (+10.000 🪙)', 10000);
-      saveCurrentUser(true);
-      syncMyPlayerInRoom();
-      toast('+10.000 fichas virtuais adicionadas ao seu saldo!', 'gold');
-      render();
     },
     toggleSpectator(on) {
       S.spectator = !!on;
@@ -2745,10 +3373,11 @@
     const cached = MP._loadLocalRoomState(savedRoom);
     if (cached) {
       S.room = cached;
-      upsertPlayerInRoom(S.room, makePlayerEntry(S.user, S.room.hostId === S.user.id));
-      MP.connectRoom(savedRoom, S.user.id, S.room.hostId === S.user.id, S.room);
+      if (!S.room.creatorId) S.room.creatorId = S.room.hostId;
+      upsertPlayerInRoom(S.room, makePlayerEntry(S.user, isAuthorizedCreator()));
+      MP.connectRoom(savedRoom, S.user.id, isAuthorizedCreator(), S.room);
       startPresenceLoop();
-      if (S.room.race && S.room.race.running && isRoomHost()) {
+      if (S.room.race && S.room.race.running && isAuthorizedCreator()) {
         startHostRaceLoop();
       }
       S.view = S.room.race && !S.room.race.done ? 'race' : 'room';

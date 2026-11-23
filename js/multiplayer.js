@@ -35,6 +35,7 @@
       this.onStateUpdate = null;   // (state, source) => void
       this.onActionReceived = null; // (action) => void
       this.onConnectionStatus = null; // (statusObj) => void
+      this.onServerMeUpdate = null; // (meRecord) => void
 
       this._initLocalTransports();
       this._checkBackend();
@@ -342,6 +343,9 @@
             if (res.ok) {
               const data = await res.json();
               if (data && data.ok) {
+                if (data.me && typeof this.onServerMeUpdate === 'function') {
+                  this.onServerMeUpdate(data.me);
+                }
                 if (Array.isArray(data.actions)) {
                   for (const act of data.actions) {
                     this._handleEnvelope({ type: 'ACTION', code: this.roomCode, action: act, senderId: act.playerId }, 'api');
