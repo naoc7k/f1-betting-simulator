@@ -1,0 +1,11 @@
+{
+  "name": "f1-betting-simulator",
+  "version": "2.0.0",
+  "description": "Simulador 3D de corridas de F1 com multiplayer em tempo real e sistema de apostas virtuais",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "serve:py": "python server.py"
+  },
+  "license": "MIT"
+}
