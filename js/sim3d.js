@@ -74,6 +74,9 @@
       this.animatedProps = []; // e.g. Ferris wheel, wind turbines
       this.carMeshes = new Map();
       this.labelEls = new Map();
+      this.visualGapMap = new Map();
+      this.visualGapSecMap = new Map();
+      this.currentRaceId = null;
 
       this.cameraMode = 'panorama';
       this.orbitAngle = 0.45;
@@ -146,21 +149,27 @@
     }
 
     _initRenderer() {
-      const w = this.canvasWrap.clientWidth || 860;
-      const h = this.canvasWrap.clientHeight || 500;
+      const rect = this.container ? this.container.getBoundingClientRect() : null;
+      const maxMobileW = Math.max(260, (window.innerWidth || 360) - 24);
+      const isMobile = window.innerWidth <= 768 || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+      const rawW = (rect && rect.width) || this.canvasWrap.clientWidth || (isMobile ? maxMobileW : 860);
+      const w = isMobile ? Math.min(rawW, maxMobileW) : rawW;
+      const h = (rect && rect.height) || this.canvasWrap.clientHeight || (isMobile ? 275 : 500);
 
       if (typeof THREE !== 'undefined') {
         try {
           this.scene = new THREE.Scene();
           this.camera = new THREE.PerspectiveCamera(42, w / h, 1, 1400);
 
-          const isMobile = window.innerWidth <= 768 || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
           this.renderer = new THREE.WebGLRenderer({
             antialias: !isMobile, // Desativa MSAA pesado em mobile para ganho imediato de 60 FPS
             alpha: false,
             powerPreference: 'high-performance'
           });
-          this.renderer.setSize(w, h);
+          this.renderer.setSize(w, h, false);
+          this.renderer.domElement.style.width = '100%';
+          this.renderer.domElement.style.height = '100%';
+          this.renderer.domElement.style.display = 'block';
           this.renderer.setPixelRatio(isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 2));
           this.renderer.shadowMap.enabled = !isMobile; // Desativa sombras em tempo real no mobile para rodar liso
           if (!isMobile) {
@@ -217,13 +226,17 @@
 
     handleResize() {
       if (!this.canvasWrap) return;
-      const w = this.canvasWrap.clientWidth || 860;
-      const h = this.canvasWrap.clientHeight || 500;
+      const isMobile = window.innerWidth <= 768 || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+      const maxMobileW = Math.max(260, (window.innerWidth || 360) - 20);
+      const rawW = this.canvasWrap.clientWidth || (isMobile ? maxMobileW : 860);
+      const w = isMobile ? Math.min(rawW, maxMobileW) : rawW;
+      const h = this.canvasWrap.clientHeight || (isMobile ? 275 : 500);
       if (!this.useFallback25D && this.renderer && this.camera) {
-        this.camera.aspect = w / h;
+        this.camera.aspect = Math.max(0.5, w / Math.max(1, h));
         this.camera.updateProjectionMatrix();
-        this.renderer.setSize(w, h);
-        const isMobile = window.innerWidth <= 768 || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+        this.renderer.setSize(w, h, false);
+        this.renderer.domElement.style.width = '100%';
+        this.renderer.domElement.style.height = '100%';
         this.renderer.setPixelRatio(isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 2));
       } else if (this.fallbackCanvas) {
         this.fallbackCanvas.width = w;
@@ -1291,13 +1304,21 @@
       this.animFrame = requestAnimationFrame(tick);
     }
 
-    _getDriverVisualProgress(race, id, rankIndex, nowMs) {
+    _getDriverVisualProgress(race, id, rankIndex, nowMs, dt = 0.016) {
       const d = race.drv && race.drv[id];
       if (!d) return { progress: 0, lateral: 0, speedRatio: 0 };
+
+      if (this.currentRaceId !== race.id) {
+        this.currentRaceId = race.id;
+        this.visualGapMap.clear();
+        this.visualGapSecMap.clear();
+      }
 
       if (!race.started || (race.lap === 0 && !race.running)) {
         const gridBack = -0.012 - rankIndex * 0.011;
         const gridSide = (rankIndex % 2 === 0 ? -1 : 1) * 1.35;
+        this.visualGapMap.set(id, rankIndex * 0.014);
+        this.visualGapSecMap.set(id, 0);
         return { progress: gridBack, lateral: gridSide, speedRatio: 0 };
       }
 
@@ -1310,28 +1331,43 @@
       }
 
       let baseLapProg = race.lapProgress || 0;
-      if (race.running && race.lastTickTs) {
-        const elapsedSinceTick = Math.max(0, Math.min(2000, Date.now() - race.lastTickTs));
+      const tickRef = race._localTickTs || race.lastTickTs;
+      if (race.running && tickRef) {
+        const elapsedSinceTick = Math.max(0, Math.min(1200, Date.now() - tickRef));
         const lapDur = race.lapDurationMs || 30000;
         baseLapProg = Math.min(0.999, baseLapProg + elapsedSinceTick / lapDur);
       }
 
       const leadId = race.order[0];
       const leadDrv = race.drv[leadId];
-      const gapSeconds = leadDrv ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : rankIndex * 0.8;
-      const gapFraction = Math.min(0.88, gapSeconds * 0.012 + rankIndex * 0.014);
+      const targetGapSec = leadDrv ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : rankIndex * 0.8;
+      const targetGap = Math.min(0.88, targetGapSec * 0.012 + rankIndex * 0.014);
 
-      const prevRank = d.prevRank !== undefined ? d.prevRank : rankIndex;
-      const prevGapFraction = Math.min(0.88, (d.prevGapSec !== undefined ? d.prevGapSec : gapSeconds) * 0.012 + prevRank * 0.014);
-      const interpGap = prevGapFraction + (gapFraction - prevGapFraction) * baseLapProg;
+      let curGap = targetGap;
+      let curGapSec = targetGapSec;
+      if (race.running && this.visualGapMap.has(id)) {
+        const prevGap = this.visualGapMap.get(id);
+        const prevSec = this.visualGapSecMap.has(id) ? this.visualGapSecMap.get(id) : targetGapSec;
+        const alpha = Math.min(1, Math.max(0.05, (dt || 0.016) * 6.5));
+        curGap = prevGap + (targetGap - prevGap) * alpha;
+        curGapSec = prevSec + (targetGapSec - prevSec) * alpha;
+        if (Math.abs(targetGap - curGap) < 0.0002) {
+          curGap = targetGap;
+          curGapSec = targetGapSec;
+        }
+      }
+      this.visualGapMap.set(id, curGap);
+      this.visualGapSecMap.set(id, curGapSec);
 
-      const totalCompletedLaps = Math.max(0, race.lap - (race.running ? 1 : 0));
-      const rawProgress = totalCompletedLaps + baseLapProg - interpGap;
+      const isMidLap = race.started && !race.done && !race.bettingOpen;
+      const totalCompletedLaps = Math.max(0, (Number(race.lap) || 0) - (isMidLap ? 1 : 0));
+      const rawProgress = totalCompletedLaps + baseLapProg - curGap;
 
       let lateral = Math.sin(rawProgress * Math.PI * 4 + rankIndex * 1.7) * 0.65;
-      if (prevRank !== rankIndex && race.running) {
-        const overtakeWeave = Math.sin(baseLapProg * Math.PI) * (rankIndex < prevRank ? -1.45 : 1.45);
-        lateral += overtakeWeave;
+      const gapDiff = targetGap - curGap;
+      if (Math.abs(gapDiff) > 0.0015 && race.running) {
+        const passDir = gapDiff < 0 ? -1.45 : 1.45;
+        lateral += passDir * Math.min(1, Math.abs(gapDiff) * 45);
       }
       if (d.pitLap === race.lap && baseLapProg < 0.22) {
         lateral = -2.4;
@@ -1344,6 +1380,64 @@
         lateral,
         speedRatio: race.running ? (race.sc && race.sc.type ? 0.55 : 1.0) : 0
       };
+    }
+
+    /**
+     * Returns the live visual standings synchronized 1:1 with the 3D cars on the map.
+     * Ensures the Live Classification Table and the 3D Map update at the exact same moment!
+     */
+    getVisualStandings(race) {
+      if (!race || !Array.isArray(race.order)) {
+        return { order: [], rankMap: new Map(), gapSecMap: new Map() };
+      }
+      const leadId = race.order[0];
+      const leadDrv = race.drv && race.drv[leadId];
+
+      if (!race.running || this.visualGapMap.size === 0 || this.currentRaceId !== race.id) {
+        const rankMap = new Map();
+        const gapSecMap = new Map();
+        race.order.forEach((id, idx) => {
+          rankMap.set(id, idx + 1);
+          const d = race.drv && race.drv[id];
+          const gSec = (d && leadDrv) ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : idx * 0.8;
+          gapSecMap.set(id, gSec);
+        });
+        return { order: race.order.slice(), rankMap, gapSecMap };
+      }
+
+      const running = [];
+      const nonRunning = [];
+      race.order.forEach((id, idx) => {
+        const d = race.drv && race.drv[id];
+        if (d && d.st === 'run') {
+          const fallbackGap = Math.min(0.88, Math.max(0, (d.t || 0) - (leadDrv ? leadDrv.t || 0 : 0)) * 0.012 + idx * 0.014);
+          const vGap = this.visualGapMap.has(id) ? this.visualGapMap.get(id) : fallbackGap;
+          running.push({ id, vGap, authIdx: idx });
+        } else {
+          nonRunning.push(id);
+        }
+      });
+
+      running.sort((a, b) => (a.vGap - b.vGap) || (a.authIdx - b.authIdx));
+      const visualOrder = running.map(x => x.id).concat(nonRunning);
+      const rankMap = new Map();
+      const gapSecMap = new Map();
+      const leaderVisualSec = running.length && this.visualGapSecMap.has(running[0].id)
+        ? this.visualGapSecMap.get(running[0].id)
+        : 0;
+
+      visualOrder.forEach((id, idx) => {
+        rankMap.set(id, idx + 1);
+        const d = race.drv && race.drv[id];
+        if (this.visualGapSecMap.has(id)) {
+          gapSecMap.set(id, Math.max(0, this.visualGapSecMap.get(id) - leaderVisualSec));
+        } else {
+          const gSec = (d && leadDrv) ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : idx * 0.8;
+          gapSecMap.set(id, gSec);
+        }
+      });
+
+      return { order: visualOrder, rankMap, gapSecMap };
     }
 
     _renderFrame(nowMs, dt) {
@@ -1365,8 +1459,13 @@
 
       if (!this.renderer || !this.scene || !this.camera) return;
 
-      const w = this.canvasWrap.clientWidth || 860;
-      const h = this.canvasWrap.clientHeight || 500;
+      const cw = this.canvasWrap.clientWidth;
+      const ch = this.canvasWrap.clientHeight;
+      if (cw > 0 && ch > 0 && this.renderer.domElement && (Math.abs(this.renderer.domElement.width - cw) > 2 || Math.abs(this.renderer.domElement.height - ch) > 2)) {
+        this.handleResize();
+      }
+      const w = cw || 340;
+      const h = ch || 275;
 
       // Animate circuit landmark props (Suzuka Ferris wheel, Silverstone turbines, etc.)
       for (const prop of this.animatedProps) {
@@ -1398,7 +1497,7 @@
         const drvState = race.drv ? race.drv[id] : null;
         if (!entry || !drvState) return;
 
-        const vis = this._getDriverVisualProgress(race, id, idx, nowMs);
+        const vis = this._getDriverVisualProgress(race, id, idx, nowMs, dt);
         const sample = window.F1Tracks.sampleTrack(race.circuit.id, vis.progress, vis.lateral);
 
         entry.group.position.set(sample.x, Math.max(0.06, sample.y + 0.06), sample.z);
@@ -1454,20 +1553,27 @@
         if (this.cameraMode === 'heli' && !this.isDragging) {
           this.orbitAngle += dt * 0.14;
         }
-        const cx = Math.sin(this.orbitAngle) * Math.cos(this.orbitPitch) * this.orbitDist;
-        const cy = Math.sin(this.orbitPitch) * this.orbitDist;
-        const cz = Math.cos(this.orbitAngle) * Math.cos(this.orbitPitch) * this.orbitDist;
+        // Auto-adjust distance for narrow mobile aspect ratios so the entire 3D circuit fits centered on screen
+        const aspect = Math.max(0.6, w / Math.max(1, h));
+        const mobileZoomOut = aspect < 1.45 ? Math.min(1.48, 1.42 / aspect) : 1.0;
+        const effDist = this.orbitDist * mobileZoomOut;
+        const cx = Math.sin(this.orbitAngle) * Math.cos(this.orbitPitch) * effDist;
+        const cy = Math.sin(this.orbitPitch) * effDist;
+        const cz = Math.cos(this.orbitAngle) * Math.cos(this.orbitPitch) * effDist;
         this.camera.position.set(cx, Math.max(15, cy), cz);
         this.camera.lookAt(0, 0, 0);
       }
 
       this.renderer.render(this.scene, this.camera);
 
+      const liveStandings = this.getVisualStandings(race);
+
       race.order.forEach((id, idx) => {
         const entry = this.carMeshes.get(id);
         const labelEl = this.labelEls.get(id);
         const drvState = race.drv ? race.drv[id] : null;
         if (!entry || !labelEl || !drvState) return;
+        const visPos = liveStandings.rankMap.get(id) || (idx + 1);
 
         const worldPos = entry.group.position.clone();
         worldPos.y += (this.selectedDriver === id ? 3.5 : 2.1);
@@ -1485,10 +1591,10 @@
         labelEl.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
         labelEl.classList.toggle('selected', this.selectedDriver === id);
         labelEl.classList.toggle('is-dnf', drvState.st === 'dnf');
-        labelEl.style.zIndex = this.selectedDriver === id ? '30' : String(25 - idx);
+        labelEl.style.zIndex = this.selectedDriver === id ? '30' : String(Math.max(1, 26 - visPos));
 
         const posSpan = labelEl.querySelector('.c-pos');
-        if (posSpan) posSpan.textContent = drvState.st === 'dnf' ? 'OUT' : String(idx + 1);
+        if (posSpan) posSpan.textContent = drvState.st === 'dnf' ? 'OUT' : String(visPos);
       });
     }
 
@@ -1531,7 +1637,7 @@
       ctx.stroke();
 
       race.order.forEach((id, idx) => {
-        const vis = this._getDriverVisualProgress(race, id, idx, nowMs);
+        const vis = this._getDriverVisualProgress(race, id, idx, nowMs, dt);
         const sample = window.F1Tracks.sampleTrack(race.circuit.id, vis.progress, vis.lateral);
         const s = project(sample.x, sample.y, sample.z);
         const drv = window.F1Tracks.DRIVERS.find(d => d.id === id);

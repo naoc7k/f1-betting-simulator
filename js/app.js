@@ -1649,6 +1649,9 @@
 
     S.room = newState;
     S.room.awaitingHostState = false;
+    if (S.room.race) {
+      S.room.race._localTickTs = Date.now();
+    }
     if (!S.room.creatorId) S.room.creatorId = S.room.hostId;
     MP._saveLocalRoomState(S.room);
 
@@ -2305,14 +2308,17 @@
       const now = Date.now();
       const dt = Math.max(0, Math.min(1000, now - (r.lastTickTs || now)));
       r.lastTickTs = now;
+      r._localTickTs = now;
 
       const lapDur = r.lapDurationMs || LAP_DURATION_MS;
       r.lapProgress = (r.lapProgress || 0) + dt / lapDur;
 
-      if (r.lapProgress >= 0.35 && r.lapProgress - dt / lapDur < 0.35) {
+      if (r.lapProgress >= 0.28 && r.lapProgress - dt / lapDur < 0.28) {
         triggerMidLapAction(r, 1);
-      } else if (r.lapProgress >= 0.70 && r.lapProgress - dt / lapDur < 0.70) {
+      } else if (r.lapProgress >= 0.58 && r.lapProgress - dt / lapDur < 0.58) {
         triggerMidLapAction(r, 2);
+      } else if (r.lapProgress >= 0.82 && r.lapProgress - dt / lapDur < 0.82) {
+        triggerMidLapAction(r, 3);
       }
 
       if (r.lapProgress >= 1.0) {
@@ -3832,7 +3838,11 @@
   }
 
   function renderClassificationTower(r) {
-    const lead = r.drv[r.order[0]];
+    const liveStandings = (SIM3D && typeof SIM3D.getVisualStandings === 'function')
+      ? SIM3D.getVisualStandings(r)
+      : { order: r.order || [], gapSecMap: new Map() };
+    const displayOrder = (liveStandings.order && liveStandings.order.length) ? liveStandings.order : r.order;
+    const lead = r.drv[displayOrder[0]];
     return `<div style="overflow-x:auto">
       <table class="tower mono">
         <thead>
@@ -3845,18 +3855,21 @@
           </tr>
         </thead>
         <tbody>
-          ${r.order.map((id, i) => {
+          ${displayOrder.map((id, i) => {
             const d = r.drv[id];
             const drv = dv(id);
             const t = TEAMS[drv.team];
             const run = d.st === 'run';
             const dl = d.gp - (i + 1);
             const isSel = S.highlightedDriver === id;
+            const liveGapSec = liveStandings.gapSecMap && liveStandings.gapSecMap.has(id)
+              ? liveStandings.gapSecMap.get(id)
+              : (lead ? Math.max(0.1, d.t - lead.t) : i * 0.8);
             const gap = !run
               ? `<span class="bad">${esc(d.why || 'OUT')}</span>`
               : i === 0
                 ? '<b style="color:var(--gold)">LÍDER</b>'
-                : `+${Math.max(0.1, d.t - lead.t).toFixed(1)}s`;
+                : `+${Math.max(0.1, liveGapSec).toFixed(1)}s`;
 
             return `<tr class="${isSel ? 'row-selected' : ''}" style="${run ? '' : 'opacity:0.45'}" onclick="F1App.highlightDriver('${id}')" title="Clique para destacar ${esc(drv.name)} no circuito 3D">
               <td class="pos">${String(i + 1).padStart(2, '0')}</td>
@@ -3999,7 +4012,7 @@
     S._lastBetDriverOrderSig = (r.order || []).join(',');
 
     return `<div class="race-workspace">
-      <div>
+      <div class="race-col-main">
         <div class="sim3d-stage-card">
           <div class="sim3d-topbar">
             <div class="sim3d-title-group">
@@ -4068,7 +4081,7 @@
 
         <div id="race-controls-bar-wrap">${renderRaceControlsBar(r)}</div>
 
-        <div class="grid g2" style="margin-top:14px">
+        <div class="grid g2 race-feed-grid" style="margin-top:14px">
           <div class="card">
             <div class="row" style="justify-content:space-between">
               <h3 id="race-bets-heading">Apostas Registradas (${(r.bets || []).filter(b => !b.cancelled).length})</h3>
@@ -4088,7 +4101,7 @@
         </div>
       </div>
 
-      <div class="grid" style="gap:14px">
+      <div class="grid race-col-side" style="gap:14px">
         <div id="race-betting-panel">${renderBettingPanel(r)}</div>
 
         <div class="card" id="race-classification-card">
