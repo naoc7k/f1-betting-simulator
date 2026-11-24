@@ -639,7 +639,9 @@
     if (S.user && S.user.id === playerId) {
       S.user.chips = target.chips;
       S.user.balanceVersion = target.balanceVersion;
-      saveLocalUser(S.user);
+      saveCurrentUser(true, false);
+      const balanceEl = $('#header-balance-val');
+      if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
     }
 
     if (S.room && Array.isArray(S.room.players)) {
@@ -647,9 +649,17 @@
       if (rp) {
         rp.chips = target.chips;
         rp.balanceVersion = target.balanceVersion;
-        if (MP.isHost && typeof MP.broadcastRoomState === 'function') {
-          MP.broadcastRoomState(S.room);
-        }
+      }
+      if (isAuthorizedCreator()) {
+        MP.broadcastState(S.room);
+      } else {
+        MP.sendAction({
+          type: 'ADMIN_BALANCE_SYNC',
+          targetPlayerId: playerId,
+          chips: target.chips,
+          balanceVersion: target.balanceVersion,
+          ts: Date.now()
+        });
       }
     }
 
@@ -943,11 +953,15 @@
       if (meInRoom) {
         meInRoom.online = true;
         meInRoom.lastSeen = Date.now();
-        // Sync server-updated balance if balanceVersion increased
-        if (Number(meInRoom.balanceVersion || 1) > Number(S.user.balanceVersion || 1)) {
+        // Sync server-updated balance if balanceVersion increased or balance is out of sync
+        const inVer = Number(meInRoom.balanceVersion || 1);
+        const myVer = Number(S.user.balanceVersion || 1);
+        if (inVer > myVer || (inVer === myVer && Math.abs(meInRoom.chips - S.user.chips) > 0.01)) {
           S.user.chips = r2(meInRoom.chips);
-          S.user.balanceVersion = Number(meInRoom.balanceVersion);
+          S.user.balanceVersion = Math.max(inVer, myVer);
           saveCurrentUser(true, false);
+          const balanceEl = $('#header-balance-val');
+          if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
         }
       } else {
         const myEntry = makePlayerEntry(S.user, false);
@@ -1053,6 +1067,31 @@
 
     if (act.type === 'PLACE_BET' && act.bet) {
       applyPlaceBetToRoom(act.bet, act.playerChips, act.balanceVersion);
+      if (isAuthorizedCreator()) MP.broadcastState(S.room);
+      refreshUI();
+      return;
+    }
+
+    if (act.type === 'ADMIN_BALANCE_SYNC' && act.targetPlayerId) {
+      const pl = S.room.players.find(p => p.id === act.targetPlayerId);
+      if (pl && typeof act.chips === 'number') {
+        const inVer = Number(act.balanceVersion || 1);
+        const exVer = Number(pl.balanceVersion || 1);
+        if (inVer >= exVer) {
+          pl.chips = r2(act.chips);
+          pl.balanceVersion = inVer;
+        }
+      }
+      if (S.user && S.user.id === act.targetPlayerId && typeof act.chips === 'number') {
+        const inVer = Number(act.balanceVersion || 1);
+        const myVer = Number(S.user.balanceVersion || 1);
+        if (inVer >= myVer) {
+          S.user.chips = r2(act.chips);
+          S.user.balanceVersion = inVer;
+          saveCurrentUser(true, false);
+          toast(`🪙 Seu saldo foi atualizado pelo Administrador: ${fmt(S.user.chips)} fichas!`, 'gold');
+        }
+      }
       if (isAuthorizedCreator()) MP.broadcastState(S.room);
       refreshUI();
       return;
@@ -1600,6 +1639,28 @@
     if (amount > MAX_BET_AMOUNT) {
       return toast(`Limite máximo excedido! O valor máximo por aposta é de ${fmt(MAX_BET_AMOUNT)} fichas.`);
     }
+
+    // Always ensure fresh balance from account map before checking
+    const freshMap = loadAccountsMap();
+    if (freshMap[S.user.id] && typeof freshMap[S.user.id].chips === 'number') {
+      if (freshMap[S.user.id].chips !== S.user.chips && (freshMap[S.user.id].balanceVersion || 1) >= (S.user.balanceVersion || 1)) {
+        S.user.chips = r2(freshMap[S.user.id].chips);
+        S.user.balanceVersion = freshMap[S.user.id].balanceVersion || S.user.balanceVersion;
+      }
+    }
+    // Also check if room player has newer chips from admin
+    if (S.room && Array.isArray(S.room.players)) {
+      const meInRoom = S.room.players.find(p => p.id === S.user.id);
+      if (meInRoom && typeof meInRoom.chips === 'number') {
+        const roomVer = Number(meInRoom.balanceVersion || 1);
+        const myVer = Number(S.user.balanceVersion || 1);
+        if (roomVer > myVer || (roomVer === myVer && meInRoom.chips > S.user.chips)) {
+          S.user.chips = r2(meInRoom.chips);
+          S.user.balanceVersion = roomVer;
+        }
+      }
+    }
+
     if (amount > S.user.chips) {
       return toast(`Saldo insuficiente! Seu saldo atual é de ${fmt(S.user.chips)} fichas.`);
     }
@@ -1669,6 +1730,9 @@
     }
 
     toast(`Aposta de ${fmt(amount)} fichas confirmada em ${driverId}!`, 'ok');
+    const balanceEl = $('#header-balance-val');
+    if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
+    updateHeaderAndRoomDOM();
     refreshUI();
   }
 
@@ -1739,6 +1803,9 @@
     }
 
     toast(`Aposta cancelada! +${fmt(bet.amount)} fichas estornadas ao seu saldo.`, 'gold');
+    const balanceEl = $('#header-balance-val');
+    if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
+    updateHeaderAndRoomDOM();
     refreshUI();
   }
 
@@ -1872,6 +1939,9 @@
     if (anySettled) {
       saveCurrentUser(true, true);
       syncMyPlayerInRoom();
+      const balanceEl = $('#header-balance-val');
+      if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
+      updateHeaderAndRoomDOM();
       if (totalNetThisRace > 0) {
         toast(`🏆 Parabéns! Você lucrou +${fmt(totalNetThisRace)} fichas nesta corrida!`, 'gold');
       }
@@ -3025,25 +3095,107 @@
     if (!S.spectator) return '';
     const r = S.room ? S.room.race : null;
     const R = S.room;
+    const camMode = SIM3D.cameraMode || 'panorama';
+    const totalPct = r ? Math.min(100, ((Math.max(0, r.lap - (r.running ? 1 : 0)) + (r.lapProgress || 0)) / r.total) * 100) : 0;
+    const remSec = r ? Math.max(0, Math.ceil(((1 - (r.lapProgress || 0)) * (r.lapDurationMs || LAP_DURATION_MS)) / 1000)) : 0;
+
     return `<div class="spec">
       <div class="top">
-        <div class="big"><span class="live"></span>F1 BETTING SIMULATOR 3D · TRANSMISSÃO</div>
-        <div class="row no-flex">
-          <span class="chip mono">SALA ${R ? esc(R.code) : '—'}</span>
-          <button class="btn ghost" onclick="F1App.toggleSpectator(false)">Sair (Esc)</button>
+        <div class="big"><span class="live"></span>F1 BROADCAST · MODO ESPECTADOR AO VIVO</div>
+        <div class="row no-flex" style="gap:10px">
+          <span class="chip mono" style="background:var(--card)">SALA ${R ? esc(R.code) : '—'}</span>
+          <button class="btn ghost sm" onclick="F1App.toggleSpectator(false)">✕ Fechar (Esc)</button>
         </div>
       </div>
-      ${r ? `<div class="row" style="justify-content:space-between;margin-bottom:10px">
-        <div class="big">${esc(r.circuit.name)}</div>
-        <div class="big mono">VOLTA ${r.lap}/${r.total}</div>
-      </div>
-      <div class="grid g2">
-        <div class="card"><h3>Classificação Ao Vivo</h3>${renderClassificationTower(r)}</div>
-        <div class="grid">
-          <div class="card"><h3>Apostas Registradas</h3>${renderBetsList(r)}</div>
-          <div class="card"><h3>Acontecimentos</h3>${renderEventsList(r)}</div>
+
+      ${r ? `
+      <div class="sim3d-stage-card" style="margin-bottom:14px">
+        <div class="sim3d-topbar">
+          <div class="sim3d-title-group">
+            <div>
+              <div style="font-size:11px;font-weight:800;color:var(--red2);letter-spacing:1.2px;text-transform:uppercase">
+                ${r.running ? '<span class="live"></span>TRANSMISSÃO 3D EM TEMPO REAL' : '🚦 AGUARDANDO LARGADA'}
+              </div>
+              <h2 style="margin:0;font-size:22px">${r.circuit.flag || '🏁'} ${esc(r.circuit.name)} <span class="mut" style="font-size:13px;font-weight:600">· ${r.circuit.km} km</span></h2>
+            </div>
+            <span class="chip" id="spec-race-wx-badge">${wxBadge(r)}</span>
+          </div>
+
+          <div class="row no-flex" style="gap:12px">
+            <div style="text-align:right">
+              <small class="mut" style="display:block;font-size:10.5px">TEMPO DA VOLTA (~30s)</small>
+              <b class="mono" id="spec-lap-timer-label" style="font-size:13.5px;color:var(--cyan)">
+                ${r.running ? `Próxima volta em 0:${String(remSec).padStart(2, '0')}` : 'Aguardando largada'}
+              </b>
+            </div>
+            <div class="sim3d-lap-counter mono">
+              <span class="lap-num" id="spec-race-lap-num">${r.lap}</span>
+              <span class="lap-tot">/ ${r.total} VOLTAS</span>
+            </div>
+          </div>
         </div>
-      </div>` : '<div class="card"><h2>Aguardando início da corrida...</h2></div>'}
+
+        <div class="bar" style="border-radius:0;border:0;height:6px">
+          <b id="spec-race-progress-bar" style="width:${totalPct.toFixed(1)}%"></b>
+        </div>
+
+        <div class="sim3d-viewport" style="height:clamp(400px, 55vh, 620px)">
+          <div id="sim3d-mount-spec" style="width:100%;height:100%"></div>
+
+          <div class="sim3d-hud-overlay">
+            <div class="sim3d-hud-top">
+              <div class="cam-toolbar">
+                <button class="cam-btn ${camMode === 'panorama' ? 'on' : ''}" onclick="F1App.setCameraMode('panorama')">🏟️ Panorâmica 3D</button>
+                <button class="cam-btn ${camMode === 'chase' ? 'on' : ''}" onclick="F1App.setCameraMode('chase')">🏎️ Perseguição</button>
+                <button class="cam-btn ${camMode === 'heli' ? 'on' : ''}" onclick="F1App.setCameraMode('heli')">🚁 Helicóptero</button>
+                <button class="cam-btn ${camMode === 'top' ? 'on' : ''}" onclick="F1App.setCameraMode('top')">🛰️ Aérea</button>
+              </div>
+              <div class="chip mono" style="background:rgba(10,12,18,0.85)">
+                👥 <span id="spec-race-sync-players-count">${getOnlinePlayers().length}</span> Espectadores Conectados
+              </div>
+            </div>
+
+            <div class="sim3d-hud-bottom">
+              <div id="spec-selected-driver-hud">${renderSelectedDriverTelemetryHUD(r)}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="driver-selector-strip" id="spec-driver-highlight-strip">
+          <small class="mut" style="white-space:nowrap;font-weight:800;margin-right:4px">DESTACAR NA PISTA:</small>
+          <button class="drv-pill ${!S.highlightedDriver ? 'on' : ''}" onclick="F1App.highlightDriver(null)">Todos</button>
+          ${r.order.map(id => {
+            const t = TEAMS[dv(id).team];
+            const isOn = S.highlightedDriver === id;
+            return `<button class="drv-pill ${isOn ? 'on' : ''}" onclick="F1App.highlightDriver('${id}')">
+              <span style="width:4px;height:12px;background:${t.color};border-radius:2px;display:inline-block"></span>
+              <b>${id}</b>
+            </button>`;
+          }).join('')}
+        </div>
+      </div>
+
+      <div class="grid g2" style="align-items:start">
+        <div class="card">
+          <h3>Classificação Ao Vivo (Torre F1)</h3>
+          <div id="spec-tower-wrap">${renderClassificationTower(r)}</div>
+        </div>
+        <div class="grid" style="gap:14px">
+          <div class="card">
+            <h3>Acontecimentos da Corrida</h3>
+            <div id="spec-events-list" style="max-height:280px;overflow-y:auto;margin-top:6px">
+              ${renderEventsList(r)}
+            </div>
+          </div>
+          <div class="card">
+            <h3>Apostas Registradas na Sala</h3>
+            <div id="spec-bets-list" style="max-height:280px;overflow-y:auto;margin-top:6px">
+              ${renderBetsList(r)}
+            </div>
+          </div>
+        </div>
+      </div>
+      ` : '<div class="card" style="text-align:center;padding:40px"><h2>Aguardando configuração da corrida pelo Criador...</h2><p class="mut">Assim que o líder preparar a largada, a pista 3D e a transmissão aparecerão aqui.</p></div>'}
     </div>`;
   }
 
@@ -3074,7 +3226,15 @@
         appEl.innerHTML = `${renderHeader()}<main>${mainContent}</main>${renderProfileModal()}${renderSpectatorOverlay()}`;
       }
 
-      if (S.view === 'race' && S.room && S.room.race && !S.room.race.done) {
+      if (S.spectator && S.room && S.room.race && !S.room.race.done) {
+        const mountSpecEl = $('#sim3d-mount-spec');
+        if (mountSpecEl) {
+          SIM3D.mount(mountSpecEl, S.room.race, S.highlightedDriver, (drvId) => {
+            S.highlightedDriver = drvId;
+            updateDriverHighlightUI();
+          });
+        }
+      } else if (S.view === 'race' && S.room && S.room.race && !S.room.race.done) {
         const mountEl = $('#sim3d-mount');
         if (mountEl) {
           SIM3D.mount(mountEl, S.room.race, S.highlightedDriver, (drvId) => {
@@ -3224,6 +3384,58 @@
     if (selHud && S.highlightedDriver) {
       selHud.innerHTML = renderSelectedDriverTelemetryHUD(r);
     }
+
+    // Support Spectator Mode Live HUD Updates
+    if (S.spectator) {
+      const specLapEl = $('#spec-race-lap-num');
+      if (specLapEl) specLapEl.textContent = String(r.lap);
+
+      const specProgBar = $('#spec-race-progress-bar');
+      if (specProgBar) specProgBar.style.width = totalPct.toFixed(1) + '%';
+
+      const specTimerEl = $('#spec-lap-timer-label');
+      if (specTimerEl) {
+        specTimerEl.textContent = r.running ? `Próxima volta em 0:${String(remSec).padStart(2, '0')}` : 'Aguardando largada';
+      }
+
+      const specWxEl = $('#spec-race-wx-badge');
+      if (specWxEl) {
+        const newWx = wxBadge(r);
+        if (specWxEl.innerHTML !== newWx) specWxEl.innerHTML = newWx;
+      }
+
+      const specTowerEl = $('#spec-tower-wrap');
+      if (specTowerEl) {
+        const newTowerHtml = renderClassificationTower(r);
+        if (S._lastSpecTowerSig !== newTowerHtml) {
+          S._lastSpecTowerSig = newTowerHtml;
+          specTowerEl.innerHTML = newTowerHtml;
+        }
+      }
+
+      const specEvEl = $('#spec-events-list');
+      if (specEvEl) {
+        const evSig = getEventsSignature(r);
+        if (S._lastSpecEvSig !== evSig) {
+          S._lastSpecEvSig = evSig;
+          specEvEl.innerHTML = renderEventsList(r);
+        }
+      }
+
+      const specBetsEl = $('#spec-bets-list');
+      if (specBetsEl) {
+        const betsHtml = renderBetsList(r);
+        if (S._lastSpecBetsSig !== betsHtml) {
+          S._lastSpecBetsSig = betsHtml;
+          specBetsEl.innerHTML = betsHtml;
+        }
+      }
+
+      const specSelHud = $('#spec-selected-driver-hud');
+      if (specSelHud) {
+        specSelHud.innerHTML = renderSelectedDriverTelemetryHUD(r);
+      }
+    }
   }
 
   function refreshUI() {
@@ -3237,7 +3449,12 @@
       return;
     }
 
-    if (S.view === 'race' && S.room && S.room.race && !S.room.race.done && $('#sim3d-mount')) {
+    if (S.spectator && S.room && S.room.race && !S.room.race.done) {
+      updateLiveHUDOnly();
+      return;
+    }
+
+    if (S.view === 'race' && S.room && S.room.race && !S.room.race.done && ($('#sim3d-mount') || $('#sim3d-mount-spec'))) {
       updateLiveHUDOnly();
       const r = S.room.race;
 
