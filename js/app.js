@@ -3895,33 +3895,36 @@
   function renderSelectedDriverTelemetryHUD(r) {
     const selId = S.highlightedDriver;
     if (!selId || !r.drv[selId]) {
-      return `<div class="chip" style="background:rgba(10,12,18,0.82);backdrop-filter:blur(6px)">
-        💡 Clique em um carrinho ou piloto para destacá-lo na pista 3D
-      </div>`;
+      return '';
     }
     const d = r.drv[selId];
     const drv = dv(selId);
     const team = TEAMS[drv.team];
-    const pos = posOf(r, selId);
+    const liveStandings = (SIM3D && typeof SIM3D.getVisualStandings === 'function')
+      ? SIM3D.getVisualStandings(r)
+      : null;
+    const pos = (liveStandings && liveStandings.rankMap && liveStandings.rankMap.get(selId)) || posOf(r, selId);
     const lead = r.drv[r.order[0]];
-    const gap = d.st !== 'run' ? 'ABANDONOU' : pos === 1 ? 'LÍDER DA CORRIDA' : `+${Math.max(0.1, d.t - lead.t).toFixed(1)}s`;
+    const liveGapSec = (liveStandings && liveStandings.gapSecMap && liveStandings.gapSecMap.has(selId))
+      ? liveStandings.gapSecMap.get(selId)
+      : (lead ? Math.max(0.1, d.t - lead.t) : 0);
+    const gap = d.st !== 'run' ? 'ABANDONOU' : pos === 1 ? 'LÍDER' : `+${Math.max(0.1, liveGapSec).toFixed(1)}s`;
     const speedKmh = d.st !== 'run' || !r.running ? 0 : Math.round(285 + Math.sin(Date.now() * 0.004 + pos) * 32 - (r.sc.type ? 95 : 0));
 
     return `<div class="selected-driver-telemetry">
-      <span class="tm" style="background:${team.color};height:34px;width:6px"></span>
-      <div>
-        <div style="font-size:10px;color:var(--gold);font-weight:900;letter-spacing:1px">★ CORREDOR DESTACADO · P${pos}</div>
-        <div style="font-size:14.5px;font-weight:900">${drv.id} · ${esc(drv.name)} <span class="mut" style="font-size:12px">(${esc(team.name)})</span></div>
+      <span class="tm" style="background:${team.color};height:24px;width:5px"></span>
+      <div style="min-width:0;flex:1">
+        <div style="font-size:12.5px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+          <span style="color:var(--gold)">★ P${pos}</span> · ${drv.id} ${esc(drv.name)} <span class="mut" style="font-size:11px">(${esc(team.name)})</span>
+        </div>
       </div>
-      <div class="mono" style="font-size:12px">
-        <div>Pneu: <b style="color:var(--gold)">${d.tyre}</b> (${d.age}v)</div>
-        <div>Gap: <b>${gap}</b></div>
+      <div class="mono" style="font-size:11.5px;white-space:nowrap">
+        Pneu <b style="color:var(--gold)">${d.tyre}</b> · <b>${gap}</b> · <b style="color:var(--cyan)">${speedKmh} km/h</b>
       </div>
-      <div class="mono" style="font-size:13px;font-weight:900;color:var(--cyan)">
-        ${speedKmh} km/h
+      <div class="row no-flex" style="gap:5px">
+        <button class="btn ghost sm" style="padding:4px 8px;font-size:11px" onclick="F1App.setCameraMode('chase')" title="Focar Câmera 3D atrás deste carro">🎥 Seguir</button>
+        <button class="btn ghost sm" style="padding:4px 8px;font-size:11px" onclick="F1App.highlightDriver(null)" title="Remover destaque">✕</button>
       </div>
-      <button class="btn ghost sm" onclick="F1App.setCameraMode('chase')" title="Focar Câmera 3D atrás deste carro">🎥 Seguir</button>
-      <button class="btn ghost sm" onclick="F1App.highlightDriver(null)" title="Remover destaque">✕</button>
     </div>`;
   }
 
@@ -4017,8 +4020,8 @@
           <div class="sim3d-topbar">
             <div class="sim3d-title-group">
               <div>
-                <div style="font-size:11px;font-weight:800;color:var(--red2);letter-spacing:1.2px;text-transform:uppercase">
-                  ${r.running ? '<span class="live"></span>SIMULAÇÃO 3D AO VIVO' : r.bettingOpen ? '🪙 JANELA DE APOSTAS ABERTA' : '🚦 APOSTAS ENCERRADAS · PRONTO PARA LARGADA'}
+                <div id="race-live-status-label" style="font-size:11px;font-weight:800;color:var(--red2);letter-spacing:1.2px;text-transform:uppercase">
+                  ${r.running ? '<span class="live"></span>SIMULAÇÃO AO VIVO' : r.bettingOpen ? '🪙 JANELA DE APOSTAS ABERTA' : '🚦 APOSTAS ENCERRADAS · PRONTO PARA LARGADA'}
                 </div>
                 <h2 style="margin:0;font-size:22px">${r.circuit.flag || '🏁'} ${esc(r.circuit.name)} <span class="mut" style="font-size:13px;font-weight:600">· ${r.circuit.km} km</span></h2>
               </div>
@@ -4043,27 +4046,23 @@
             <b id="race-progress-bar" style="width:${totalPct.toFixed(1)}%"></b>
           </div>
 
-          <div class="sim3d-viewport">
-            <div id="sim3d-mount" style="width:100%;height:100%"></div>
-
-            <div class="sim3d-hud-overlay">
-              <div class="sim3d-hud-top">
-                <div class="cam-toolbar">
-                  <button class="cam-btn ${camMode === 'panorama' ? 'on' : ''}" onclick="F1App.setCameraMode('panorama')">🏟️ Panorâmica 3D</button>
-                  <button class="cam-btn ${camMode === 'chase' ? 'on' : ''}" onclick="F1App.setCameraMode('chase')">🏎️ Perseguição</button>
-                  <button class="cam-btn ${camMode === 'heli' ? 'on' : ''}" onclick="F1App.setCameraMode('heli')">🚁 Helicóptero</button>
-                  <button class="cam-btn ${camMode === 'top' ? 'on' : ''}" onclick="F1App.setCameraMode('top')">🛰️ Aérea</button>
-                </div>
-                <div class="chip mono" style="background:rgba(10,12,18,0.85)">
-                  👥 <span id="race-sync-players-count">${getOnlinePlayers().length}</span> Jogadores Sincronizados
-                </div>
-              </div>
-
-              <div class="sim3d-hud-bottom">
-                <div id="selected-driver-hud">${renderSelectedDriverTelemetryHUD(r)}</div>
-              </div>
+          <div class="sim3d-cam-bar">
+            <div class="cam-toolbar">
+              <button class="cam-btn ${camMode === 'panorama' ? 'on' : ''}" onclick="F1App.setCameraMode('panorama')">🏟️ Panorâmica</button>
+              <button class="cam-btn ${camMode === 'chase' ? 'on' : ''}" onclick="F1App.setCameraMode('chase')">🏎️ Perseguição</button>
+              <button class="cam-btn ${camMode === 'heli' ? 'on' : ''}" onclick="F1App.setCameraMode('heli')">🚁 Helicóptero</button>
+              <button class="cam-btn ${camMode === 'top' ? 'on' : ''}" onclick="F1App.setCameraMode('top')">🛰️ Aérea</button>
+            </div>
+            <div class="chip mono sim3d-sync-chip">
+              👥 <span id="race-sync-players-count">${getOnlinePlayers().length}</span> Jogadores Sincronizados
             </div>
           </div>
+
+          <div class="sim3d-viewport">
+            <div id="sim3d-mount" style="width:100%;height:100%"></div>
+          </div>
+
+          <div id="selected-driver-hud" class="sim3d-telemetry-bar">${renderSelectedDriverTelemetryHUD(r)}</div>
 
           <div class="driver-selector-strip" id="driver-highlight-strip">
             <small class="mut" style="white-space:nowrap;font-weight:800;margin-right:4px">DESTACAR CORREDOR:</small>
@@ -4568,27 +4567,23 @@
           <b id="spec-race-progress-bar" style="width:${totalPct.toFixed(1)}%"></b>
         </div>
 
-        <div class="sim3d-viewport" style="height:clamp(400px, 55vh, 620px)">
-          <div id="sim3d-mount-spec" style="width:100%;height:100%"></div>
-
-          <div class="sim3d-hud-overlay">
-            <div class="sim3d-hud-top">
-              <div class="cam-toolbar">
-                <button class="cam-btn ${camMode === 'panorama' ? 'on' : ''}" onclick="F1App.setCameraMode('panorama')">🏟️ Panorâmica 3D</button>
-                <button class="cam-btn ${camMode === 'chase' ? 'on' : ''}" onclick="F1App.setCameraMode('chase')">🏎️ Perseguição</button>
-                <button class="cam-btn ${camMode === 'heli' ? 'on' : ''}" onclick="F1App.setCameraMode('heli')">🚁 Helicóptero</button>
-                <button class="cam-btn ${camMode === 'top' ? 'on' : ''}" onclick="F1App.setCameraMode('top')">🛰️ Aérea</button>
-              </div>
-              <div class="chip mono" style="background:rgba(10,12,18,0.85)">
-                👥 <span id="spec-race-sync-players-count">${getOnlinePlayers().length}</span> Espectadores Conectados
-              </div>
-            </div>
-
-            <div class="sim3d-hud-bottom">
-              <div id="spec-selected-driver-hud">${renderSelectedDriverTelemetryHUD(r)}</div>
-            </div>
+        <div class="sim3d-cam-bar">
+          <div class="cam-toolbar">
+            <button class="cam-btn ${camMode === 'panorama' ? 'on' : ''}" onclick="F1App.setCameraMode('panorama')">🏟️ Panorâmica</button>
+            <button class="cam-btn ${camMode === 'chase' ? 'on' : ''}" onclick="F1App.setCameraMode('chase')">🏎️ Perseguição</button>
+            <button class="cam-btn ${camMode === 'heli' ? 'on' : ''}" onclick="F1App.setCameraMode('heli')">🚁 Helicóptero</button>
+            <button class="cam-btn ${camMode === 'top' ? 'on' : ''}" onclick="F1App.setCameraMode('top')">🛰️ Aérea</button>
+          </div>
+          <div class="chip mono sim3d-sync-chip">
+            👥 <span id="spec-race-sync-players-count">${getOnlinePlayers().length}</span> Jogadores Online
           </div>
         </div>
+
+        <div class="sim3d-viewport" style="height:clamp(400px, 55vh, 620px)">
+          <div id="sim3d-mount-spec" style="width:100%;height:100%"></div>
+        </div>
+
+        <div id="spec-selected-driver-hud" class="sim3d-telemetry-bar">${renderSelectedDriverTelemetryHUD(r)}</div>
 
         <div class="driver-selector-strip" id="spec-driver-highlight-strip">
           <small class="mut" style="white-space:nowrap;font-weight:800;margin-right:4px">DESTACAR NA PISTA:</small>
@@ -4760,6 +4755,16 @@
     const lapNumEl = $('#race-lap-num');
     if (lapNumEl) lapNumEl.textContent = String(r.lap);
 
+    const statusLblEl = $('#race-live-status-label');
+    if (statusLblEl) {
+      const newStatusHtml = r.running
+        ? '<span class="live"></span>SIMULAÇÃO AO VIVO'
+        : r.bettingOpen
+          ? '🪙 JANELA DE APOSTAS ABERTA'
+          : '🚦 APOSTAS ENCERRADAS · PRONTO PARA LARGADA';
+      if (statusLblEl.innerHTML !== newStatusHtml) statusLblEl.innerHTML = newStatusHtml;
+    }
+
     const totalPct = Math.min(100, ((Math.max(0, r.lap - (r.running ? 1 : 0)) + (r.lapProgress || 0)) / r.total) * 100);
     const progBar = $('#race-progress-bar');
     if (progBar) progBar.style.width = totalPct.toFixed(1) + '%';
@@ -4810,8 +4815,9 @@
     }
 
     const selHud = $('#selected-driver-hud');
-    if (selHud && S.highlightedDriver) {
-      selHud.innerHTML = renderSelectedDriverTelemetryHUD(r);
+    if (selHud) {
+      const newHud = renderSelectedDriverTelemetryHUD(r);
+      if (selHud.innerHTML !== newHud) selHud.innerHTML = newHud;
     }
 
     // Support Spectator Mode Live HUD Updates

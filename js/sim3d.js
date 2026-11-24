@@ -1567,19 +1567,45 @@
       this.renderer.render(this.scene, this.camera);
 
       const liveStandings = this.getVisualStandings(race);
+      const isMobile = w <= 560;
+      const minBoxX = isMobile ? 48 : 44;
+      const minBoxY = isMobile ? 22 : 20;
+      const placedBoxes = [];
 
-      race.order.forEach((id, idx) => {
+      // Prioritize highlighted driver first, then podium (P1..P3), then others in current visual order
+      const orderedForLabels = (liveStandings.order && liveStandings.order.length ? liveStandings.order : race.order).slice();
+      orderedForLabels.sort((a, b) => {
+        if (a === this.selectedDriver) return -1;
+        if (b === this.selectedDriver) return 1;
+        const ra = liveStandings.rankMap.get(a) || 99;
+        const rb = liveStandings.rankMap.get(b) || 99;
+        return ra - rb;
+      });
+
+      orderedForLabels.forEach((id) => {
         const entry = this.carMeshes.get(id);
         const labelEl = this.labelEls.get(id);
         const drvState = race.drv ? race.drv[id] : null;
         if (!entry || !labelEl || !drvState) return;
-        const visPos = liveStandings.rankMap.get(id) || (idx + 1);
+        const visPos = liveStandings.rankMap.get(id) || 1;
+        const isSel = (this.selectedDriver === id);
+
+        if (drvState.st === 'dnf' && !isSel) {
+          labelEl.style.display = 'none';
+          return;
+        }
+
+        // In chase camera mode or small mobile screen, avoid wall-of-text clutter by only showing selected + top 5 non-overlapping cars
+        if (!isSel && this.cameraMode === 'chase' && visPos > (isMobile ? 4 : 6)) {
+          labelEl.style.display = 'none';
+          return;
+        }
 
         const worldPos = entry.group.position.clone();
-        worldPos.y += (this.selectedDriver === id ? 3.5 : 2.1);
+        worldPos.y += (isSel ? 3.5 : 2.1);
         worldPos.project(this.camera);
 
-        if (worldPos.z > 1) {
+        if (worldPos.z > 1 || worldPos.z < -1) {
           labelEl.style.display = 'none';
           return;
         }
@@ -1587,11 +1613,34 @@
         const sx = (worldPos.x * 0.5 + 0.5) * w;
         const sy = (-(worldPos.y * 0.5) + 0.5) * h;
 
+        if (sx < 18 || sx > w - 18 || sy < 18 || sy > h - 10) {
+          labelEl.style.display = 'none';
+          return;
+        }
+
+        // Screen-space collision check so car tags never pile on top of each other over the track
+        if (!isSel) {
+          let overlaps = false;
+          for (let i = 0; i < placedBoxes.length; i++) {
+            const b = placedBoxes[i];
+            if (Math.abs(sx - b.x) < minBoxX && Math.abs(sy - b.y) < minBoxY) {
+              overlaps = true;
+              break;
+            }
+          }
+          if (overlaps) {
+            labelEl.style.display = 'none';
+            return;
+          }
+        }
+
+        placedBoxes.push({ x: sx, y: sy });
+
         labelEl.style.display = 'flex';
         labelEl.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
-        labelEl.classList.toggle('selected', this.selectedDriver === id);
+        labelEl.classList.toggle('selected', isSel);
         labelEl.classList.toggle('is-dnf', drvState.st === 'dnf');
-        labelEl.style.zIndex = this.selectedDriver === id ? '30' : String(Math.max(1, 26 - visPos));
+        labelEl.style.zIndex = isSel ? '30' : String(Math.max(1, 26 - visPos));
 
         const posSpan = labelEl.querySelector('.c-pos');
         if (posSpan) posSpan.textContent = drvState.st === 'dnf' ? 'OUT' : String(visPos);

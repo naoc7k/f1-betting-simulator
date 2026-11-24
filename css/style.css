@@ -789,16 +789,37 @@ input:focus, select:focus {
   color: #fff;
 }
 
+/* Camera & Track Controls Docked cleanly outside 3D Viewport (never covering the 3D map) */
+.sim3d-cam-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: rgba(11, 14, 21, 0.96);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.sim3d-telemetry-bar:empty {
+  display: none;
+}
+
+.sim3d-telemetry-bar {
+  padding: 6px 10px;
+  background: rgba(14, 17, 26, 0.98);
+  border-top: 1px solid rgba(255, 200, 61, 0.4);
+}
+
 .selected-driver-telemetry {
-  background: rgba(14, 17, 26, 0.92);
-  border: 1.5px solid var(--gold);
-  border-radius: 11px;
-  padding: 8px 14px;
+  background: rgba(255, 200, 61, 0.08);
+  border: 1px solid var(--gold);
+  border-radius: 9px;
+  padding: 6px 10px;
   display: flex;
   align-items: center;
-  gap: 14px;
-  backdrop-filter: blur(8px);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .driver-selector-strip {
