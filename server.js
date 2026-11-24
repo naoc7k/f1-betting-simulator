@@ -4,9 +4,14 @@
  *
  * Enforces:
  *  - Server-authoritative player balances, committed chips, and transaction history
- *  - 10% initial race balance exposure limit across Overtake and Placement modalities
- *  - Protection against client-side balance inflation / manipulation
- *  - Concurrency protection, duplicate bet rejection, and idempotent race settlement
+ *  - 50% initial race balance exposure limit across Overtake and Placement modalities
+ *  - Account control by IP + Machine Fingerprint (1 account per machine, shared-network friendly)
+ *  - Account ownership tokens preventing link-based account hijacking
+ *  - Nickname-based room invitation system
+ *  - Lobby kick/remove player by Creator or Admin with real-time sync
+ *  - Public active rooms directory & spectator read-only access (spectators never added as participants)
+ *  - Race continuity after mid-race player disconnection
+ *  - Configurable initial balance for new accounts + global account search & deletion by Admin
  */
 const http = require('http');
 const fs = require('fs');
@@ -18,16 +23,39 @@ const F1Finance = require('./js/finance.js');
 const PORT = process.env.PORT || 8080;
 const ROOT = __dirname;
 const PLAYERS_DB_PATH = path.join(ROOT, 'players_db.json');
+const SERVER_CONFIG_PATH = path.join(ROOT, 'server_config.json');
 
-const INITIAL_CHIPS = 100;
+const DEFAULT_INITIAL_CHIPS = 100;
 const ADMIN_LOGIN = 'LN';
 const ADMIN_PASS_HASH = crypto.createHash('sha256').update('jairo').digest('hex');
+
+/**
+ * Checks if a player nickname belongs to the protected/exempt accounts:
+ * LX, LXZADA (or similar variations like lx, lxz, lxzada) and naoc7k, N7K (or variations).
+ */
+function isProtectedAccountName(name) {
+  const raw = String(name || '').trim().toLowerCase();
+  if (!raw) return false;
+  const compact = raw.replace(/[\s_\-\.]/g, '');
+  if (compact === 'lx' || compact === 'lxz' || compact === 'lxzada') return true;
+  if (compact.includes('lxzada') || compact.startsWith('lxz') || /^lx[0-9_]*$/.test(raw)) return true;
+  if (compact === 'naoc7k' || compact === 'n7k' || compact === 'naoc') return true;
+  if (compact.includes('naoc7k') || compact.includes('n7k')) return true;
+  return false;
+}
 
 const ROOMS = new Map();
 const PLAYERS_DB = new Map();
 const ADMIN_TOKENS = new Map();
 const PROCESSED_BET_IDS = new Set();
 const PROCESSED_SETTLEMENTS = new Set();
+const INVITES = new Map(); // normalizedNickname or playerId -> Array of invite objects
+
+let SERVER_CONFIG = {
+  initialChips: DEFAULT_INITIAL_CHIPS,
+  updatedAt: Date.now() / 1000,
+  adminLogs: []
+};
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -44,14 +72,72 @@ function r2(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
 
+function getInitialChips() {
+  const val = Number(SERVER_CONFIG.initialChips);
+  return (!isNaN(val) && val >= 0) ? r2(val) : DEFAULT_INITIAL_CHIPS;
+}
+
+function loadServerConfig() {
+  try {
+    if (fs.existsSync(SERVER_CONFIG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(SERVER_CONFIG_PATH, 'utf-8'));
+      if (raw && typeof raw === 'object') {
+        if (typeof raw.initialChips === 'number' && !isNaN(raw.initialChips) && raw.initialChips >= 0) {
+          SERVER_CONFIG.initialChips = r2(raw.initialChips);
+        }
+        if (Array.isArray(raw.adminLogs)) {
+          SERVER_CONFIG.adminLogs = raw.adminLogs.slice(0, 200);
+        }
+      }
+    } else {
+      saveServerConfig();
+    }
+  } catch (e) {}
+}
+
+function saveServerConfig() {
+  try {
+    fs.writeFileSync(SERVER_CONFIG_PATH, JSON.stringify(SERVER_CONFIG, null, 2), 'utf-8');
+  } catch (e) {}
+}
+
+function appendAdminLog(action, detail, extra = {}) {
+  SERVER_CONFIG.adminLogs = Array.isArray(SERVER_CONFIG.adminLogs) ? SERVER_CONFIG.adminLogs : [];
+  const entry = Object.assign({
+    id: `alog_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+    action,
+    detail,
+    ts: Date.now() / 1000,
+    date: new Date().toLocaleString('pt-BR')
+  }, extra);
+  SERVER_CONFIG.adminLogs.unshift(entry);
+  if (SERVER_CONFIG.adminLogs.length > 200) SERVER_CONFIG.adminLogs.length = 200;
+  saveServerConfig();
+  return entry;
+}
+
+loadServerConfig();
+
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    return String(xff).split(',')[0].trim();
+  }
+  return String((req.socket && req.socket.remoteAddress) || '127.0.0.1').replace(/^::ffff:/, '');
+}
+
 function ensurePlayerFinancialFields(rec) {
   if (!rec) return null;
-  rec.chips = Math.max(0, r2(rec.chips !== undefined ? rec.chips : INITIAL_CHIPS));
+  const initVal = getInitialChips();
+  rec.chips = Math.max(0, r2(rec.chips !== undefined ? rec.chips : initVal));
   rec.committedChips = Math.max(0, r2(rec.committedChips || 0));
   rec.totalBalance = r2(rec.chips + rec.committedChips);
   rec.wins = Math.max(0, Number(rec.wins || 0));
   rec.losses = Math.max(0, Number(rec.losses || 0));
   rec.balanceVersion = Math.max(1, Number(rec.balanceVersion || 1));
+  rec.machineId = rec.machineId ? String(rec.machineId) : null;
+  rec.clientIp = rec.clientIp ? String(rec.clientIp) : null;
+  rec.authToken = rec.authToken ? String(rec.authToken) : null;
   rec.settledBets = rec.settledBets && typeof rec.settledBets === 'object' ? rec.settledBets : {};
   rec.raceExposures = rec.raceExposures && typeof rec.raceExposures === 'object' ? rec.raceExposures : {};
   if (!rec.cashbox || typeof rec.cashbox !== 'object') {
@@ -73,6 +159,13 @@ function ensurePlayerFinancialFields(rec) {
   return rec;
 }
 
+function sanitizePlayerForPublic(rec) {
+  if (!rec) return null;
+  const copy = Object.assign({}, rec);
+  delete copy.authToken;
+  return copy;
+}
+
 function loadPlayersDb() {
   try {
     if (fs.existsSync(PLAYERS_DB_PATH)) {
@@ -84,6 +177,35 @@ function loadPlayersDb() {
   } catch (e) {}
 }
 
+/**
+ * Purges/resets all accounts EXCEPT protected ones (LX, LXZADA, naoc7k, N7K and similar names).
+ */
+function purgeNonProtectedAccounts() {
+  const kept = [];
+  const removed = [];
+  for (const [id, rec] of Array.from(PLAYERS_DB.entries())) {
+    if (rec && isProtectedAccountName(rec.name)) {
+      kept.push({ id, name: rec.name, chips: rec.chips });
+    } else {
+      removed.push({ id, name: rec ? rec.name : id });
+      PLAYERS_DB.delete(id);
+    }
+  }
+  for (const rEntry of ROOMS.values()) {
+    const st = rEntry.state;
+    if (!st) continue;
+    if (Array.isArray(st.players)) {
+      st.players = st.players.filter(p => p && isProtectedAccountName(p.name));
+    }
+    if (st.race && Array.isArray(st.race.bets)) {
+      st.race.bets = st.race.bets.filter(b => PLAYERS_DB.has(b.pid));
+    }
+    ensureAuthorizedCreator(rEntry);
+  }
+  savePlayersDb();
+  return { kept, removed };
+}
+
 function savePlayersDb() {
   try {
     const obj = {};
@@ -93,6 +215,15 @@ function savePlayersDb() {
 }
 
 loadPlayersDb();
+if (!SERVER_CONFIG.v42PurgeApplied) {
+  const purgeRes = purgeNonProtectedAccounts();
+  SERVER_CONFIG.v42PurgeApplied = true;
+  appendAdminLog(
+    'GLOBAL_PURGE_SECONDARY_ACCOUNTS',
+    `Reset global de contas secundárias/bugadas concluído (Preservadas: ${purgeRes.kept.map(k => k.name).join(', ') || 'nenhuma'} | Removidas: ${purgeRes.removed.length})`
+  );
+  saveServerConfig();
+}
 
 function recordServerTx(rec, txId, type, title, detail, signedAmount) {
   ensurePlayerFinancialFields(rec);
@@ -127,31 +258,108 @@ function verifyAdminToken(token) {
 }
 
 /**
- * Registers or updates a player in PLAYERS_DB.
- * IMPORTANT SECURITY RULE (Section 8):
- * Once a player exists on the server, the client CANNOT arbitrarily increase or overwrite `chips`.
- * Only authoritative server operations (admin, bet placement, bet cancellation, race settlement) can change `chips`.
+ * Finds an existing account bound to the given machineId (or IP + machine composite).
+ * Considers shared networks and dynamic IPs (Requirement 1 & 10):
+ *  - If a machineId is provided, matches the account registered to that machineId.
+ *  - If no machineId is provided but forceSinglePerIp is requested, matches by IP.
  */
-function upsertPlayerRecord(pData, allowInitialSeed = true) {
+function findAccountForMachine(machineId, clientIp) {
+  if (machineId) {
+    for (const rec of PLAYERS_DB.values()) {
+      if (rec.machineId && rec.machineId === machineId) {
+        return rec;
+      }
+    }
+  }
+  if (!machineId && clientIp) {
+    for (const rec of PLAYERS_DB.values()) {
+      if (!rec.machineId && rec.clientIp && rec.clientIp === clientIp) {
+        return rec;
+      }
+    }
+  }
+  return null;
+}
+
+function findPlayerByNickname(nickname) {
+  const clean = String(nickname || '').trim().toLowerCase();
+  if (!clean) return null;
+  for (const rec of PLAYERS_DB.values()) {
+    if (String(rec.name || '').trim().toLowerCase() === clean || String(rec.id || '').toLowerCase() === clean) {
+      return rec;
+    }
+  }
+  return null;
+}
+
+/**
+ * Registers or updates a player in PLAYERS_DB.
+ * Enforces:
+ *  - 1 account per machine (returns existing account if machine already registered one)
+ *  - Configurable initialChips for newly created accounts
+ *  - Ownership authToken so another device entering via link cannot hijack an existing account
+ */
+function upsertPlayerRecord(pData, allowInitialSeed = true, clientMeta = {}) {
   if (!pData || !pData.id) return null;
-  const pid = String(pData.id);
+  let pid = String(pData.id);
   const now = Date.now() / 1000;
-  const existing = PLAYERS_DB.get(pid);
+  const machineId = String(clientMeta.machineId || pData.machineId || '').trim() || null;
+  const clientIp = String(clientMeta.clientIp || pData.clientIp || '').trim() || null;
+  const clientAuthToken = String(clientMeta.authToken || pData.authToken || '').trim() || null;
+
+  let existing = PLAYERS_DB.get(pid);
+
+  // Check if this machine already owns an account under a different ID (prevent duplicate account creation on same machine)
+  if (!existing && machineId) {
+    const boundAcc = findAccountForMachine(machineId, clientIp);
+    if (boundAcc) {
+      existing = boundAcc;
+      pid = boundAcc.id;
+    }
+  }
+
+  // Prevent account hijacking via shared links: if account exists and is bound to a different machineId and authToken mismatches
+  if (existing && existing.machineId && machineId && existing.machineId !== machineId) {
+    if (existing.authToken && clientAuthToken !== existing.authToken && !clientMeta.internalTrusted) {
+      // Redirect this visitor to their own machine's account or create a distinct account for their machine
+      const myOwnAcc = findAccountForMachine(machineId, clientIp);
+      if (myOwnAcc) {
+        existing = myOwnAcc;
+        pid = myOwnAcc.id;
+      } else {
+        existing = null;
+        pid = 'usr_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
+      }
+    }
+  }
+
   const clientVer = Number(pData.balanceVersion || 0);
+  const configuredInitChips = getInitialChips();
 
   if (!existing) {
-    let chipsVal = allowInitialSeed && pData.chips !== undefined ? r2(pData.chips) : INITIAL_CHIPS;
-    if (chipsVal === 25000 && Number(pData.wins || 0) === 0) chipsVal = INITIAL_CHIPS;
-    if (chipsVal < 0 || isNaN(chipsVal)) chipsVal = INITIAL_CHIPS;
+    let chipsVal = configuredInitChips;
+    // Only trust client initial seed if it matches an untouched migration or explicit test setup
+    if (allowInitialSeed && pData.chips !== undefined && clientMeta.preserveExplicitChips) {
+      chipsVal = r2(pData.chips);
+    }
+    if (chipsVal < 0 || isNaN(chipsVal)) chipsVal = configuredInitChips;
+
+    const newAuthToken = clientAuthToken || ('tok_' + crypto.randomBytes(16).toString('hex'));
+    let desiredName = String(pData.name || 'Piloto').trim().slice(0, 24) || 'Piloto';
+
     const rec = ensurePlayerFinancialFields({
       id: pid,
-      name: String(pData.name || 'Piloto').trim().slice(0, 24),
+      name: desiredName,
       avatarId: String(pData.avatarId || 'av1'),
       chips: chipsVal,
       committedChips: 0,
       wins: Number(pData.wins || 0),
       losses: Number(pData.losses || 0),
       balanceVersion: Math.max(1, clientVer),
+      machineId,
+      clientIp,
+      authToken: newAuthToken,
+      createdAt: now,
       updatedAt: now,
       lastAdminOp: null,
       settledBets: (pData.settledBets && typeof pData.settledBets === 'object') ? pData.settledBets : {},
@@ -163,8 +371,18 @@ function upsertPlayerRecord(pData, allowInitialSeed = true) {
   }
 
   ensurePlayerFinancialFields(existing);
-  existing.name = String(pData.name || existing.name).trim().slice(0, 24);
-  existing.avatarId = String(pData.avatarId || existing.avatarId || 'av1');
+  if (!existing.machineId && machineId) existing.machineId = machineId;
+  if (clientIp) existing.clientIp = clientIp;
+  if (!existing.authToken) {
+    existing.authToken = clientAuthToken || ('tok_' + crypto.randomBytes(16).toString('hex'));
+  }
+
+  // Only allow profile name/avatar edits if owner matches or internal call
+  const isOwner = !existing.machineId || !machineId || existing.machineId === machineId || (existing.authToken && clientAuthToken === existing.authToken) || clientMeta.internalTrusted;
+  if (isOwner) {
+    if (pData.name) existing.name = String(pData.name).trim().slice(0, 24);
+    if (pData.avatarId) existing.avatarId = String(pData.avatarId);
+  }
   existing.updatedAt = now;
   savePlayersDb();
   return existing;
@@ -173,11 +391,20 @@ function upsertPlayerRecord(pData, allowInitialSeed = true) {
 function ensureAuthorizedCreator(entry) {
   const st = entry.state;
   if (!st || !Array.isArray(st.players)) return;
+  // Filter out any accidental spectator entries from st.players
+  st.players = st.players.filter(p => p && !p.isSpectator);
+
   let creatorId = st.creatorId || st.hostId;
   const creatorInRoom = st.players.find(p => p.id === creatorId);
-  if (!creatorInRoom && st.players.length > 0) {
-    const firstOnline = st.players.find(p => p.online !== false) || st.players[0];
-    creatorId = firstOnline.id;
+  // Also reassign creator if current creator is offline during a race pause so remaining players can resume!
+  const creatorOnline = creatorInRoom && creatorInRoom.online !== false;
+  if ((!creatorInRoom || !creatorOnline) && st.players.length > 0) {
+    const firstOnline = st.players.find(p => p.online !== false);
+    if (firstOnline) {
+      creatorId = firstOnline.id;
+    } else if (!creatorInRoom) {
+      creatorId = st.players[0].id;
+    }
   }
   st.creatorId = creatorId;
   st.hostId = creatorId;
@@ -214,10 +441,11 @@ function recomputeCommittedChipsForPlayer(pid, roomState) {
 
 function syncRoomPlayerBalances(st) {
   if (!st || !Array.isArray(st.players)) return;
+  st.players = st.players.filter(p => p && !p.isSpectator);
   for (const p of st.players) {
     let rec = PLAYERS_DB.get(p.id);
     if (!rec) {
-      rec = upsertPlayerRecord(p, true);
+      rec = upsertPlayerRecord(p, true, { internalTrusted: true, preserveExplicitChips: true });
     }
     if (rec) {
       recomputeCommittedChipsForPlayer(p.id, st);
@@ -243,6 +471,125 @@ function cleanupPresence(entry) {
 }
 
 /**
+ * Remove (kick) a player from a room lobby/match by Creator or Admin (Requirement 2)
+ */
+function removePlayerFromRoom(code, targetPlayerId, requesterPid, isAdmin = false) {
+  const entry = ROOMS.get(String(code || '').toUpperCase());
+  if (!entry || !entry.state) {
+    return { ok: false, status: 404, error: 'Sala não encontrada.' };
+  }
+  const st = entry.state;
+  const creatorId = st.creatorId || st.hostId;
+  if (!isAdmin && requesterPid !== creatorId) {
+    return { ok: false, status: 403, error: 'Apenas o criador da sala ou o administrador pode remover jogadores do lobby.' };
+  }
+  const target = (st.players || []).find(p => p.id === targetPlayerId);
+  if (!target) {
+    return { ok: false, status: 404, error: 'Jogador não está nesta sala.' };
+  }
+  if (targetPlayerId === creatorId && !isAdmin) {
+    return { ok: false, status: 400, error: 'O criador não pode remover a si mesmo.' };
+  }
+
+  st.players = st.players.filter(p => p.id !== targetPlayerId);
+  entry.heartbeats.delete(targetPlayerId);
+  st.kickedPlayerIds = Array.isArray(st.kickedPlayerIds) ? st.kickedPlayerIds : [];
+  if (!st.kickedPlayerIds.includes(targetPlayerId)) {
+    st.kickedPlayerIds.push(targetPlayerId);
+  }
+
+  ensureAuthorizedCreator(entry);
+  entry.updatedAt = Date.now() / 1000;
+  entry.actions.push({
+    id: `act_kick_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+    type: 'KICK_PLAYER',
+    playerId: requesterPid || 'ADMIN',
+    targetPlayerId,
+    targetPlayerName: target.name,
+    ts: Date.now()
+  });
+
+  return {
+    ok: true,
+    status: 200,
+    removedPlayer: target,
+    state: st
+  };
+}
+
+/**
+ * Permanently deletes a player account created by mistake (Requirement 9).
+ * Does NOT ban or block the IP/machine from creating a new clean account afterwards.
+ * Cleans up active rooms, cancels/voids active unsettled bets, and logs the administrative action.
+ */
+function deletePlayerAccountAdmin(targetIdOrNickname) {
+  const clean = String(targetIdOrNickname || '').trim();
+  if (!clean) return { ok: false, status: 400, error: 'Informe o ID ou nickname da conta.' };
+
+  let rec = PLAYERS_DB.get(clean) || findPlayerByNickname(clean);
+  if (!rec) {
+    return { ok: false, status: 404, error: 'Conta não encontrada.' };
+  }
+
+  const deletedId = rec.id;
+  const deletedName = rec.name;
+  const deletedChips = rec.chips;
+
+  // Clean up references in all active rooms so there are no orphan records or financial inconsistencies
+  for (const rEntry of ROOMS.values()) {
+    const st = rEntry.state;
+    if (!st) continue;
+    if (Array.isArray(st.players)) {
+      st.players = st.players.filter(p => p.id !== deletedId);
+    }
+    rEntry.heartbeats.delete(deletedId);
+    if (st.race) {
+      if (Array.isArray(st.race.bets)) {
+        st.race.bets = st.race.bets.filter(b => b.pid !== deletedId);
+      }
+      if (st.race.exposures && st.race.exposures[deletedId]) {
+        delete st.race.exposures[deletedId];
+      }
+      if (st.race.res) {
+        for (const [bId, rVal] of Object.entries(st.race.res)) {
+          if (rVal && rVal.pid === deletedId) delete st.race.res[bId];
+        }
+      }
+    }
+    ensureAuthorizedCreator(rEntry);
+    rEntry.updatedAt = Date.now() / 1000;
+  }
+
+  // Clean up any pending invites for this user
+  INVITES.delete(deletedId.toLowerCase());
+  INVITES.delete(String(deletedName || '').trim().toLowerCase());
+
+  // Delete from PLAYERS_DB (clearing machineId binding as well so no block/ban is imposed)
+  PLAYERS_DB.delete(deletedId);
+  savePlayersDb();
+
+  const logEntry = appendAdminLog(
+    'DELETE_ACCOUNT',
+    `Conta excluída pelo Admin: ${deletedName} (${deletedId}) · Saldo era ${deletedChips.toFixed(2)} fichas`,
+    {
+      targetPlayerId: deletedId,
+      targetName: deletedName,
+      deletedPlayerId: deletedId,
+      deletedPlayerName: deletedName,
+      deletedChips
+    }
+  );
+
+  return {
+    ok: true,
+    status: 200,
+    deletedPlayerId: deletedId,
+    deletedPlayer: { id: deletedId, name: deletedName, chips: deletedChips },
+    logEntry
+  };
+}
+
+/**
  * Authoritative Bet Placement on Server
  */
 function processServerPlaceBet(roomState, rawBet, fallbackPid) {
@@ -256,18 +603,16 @@ function processServerPlaceBet(roomState, rawBet, fallbackPid) {
   let playerRec = PLAYERS_DB.get(pid);
   if (!playerRec) {
     const roomPl = (roomState.players || []).find(x => x.id === pid);
-    playerRec = upsertPlayerRecord(roomPl || { id: pid, name: rawBet.playerName || 'Piloto', chips: INITIAL_CHIPS }, true);
+    playerRec = upsertPlayerRecord(roomPl || { id: pid, name: rawBet.playerName || 'Piloto', chips: getInitialChips() }, true, { internalTrusted: true, preserveExplicitChips: true });
   }
   ensurePlayerFinancialFields(playerRec);
 
   const betId = String((rawBet && rawBet.id) || `bet_${pid}_${race.id}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`);
 
-  // Duplicate ticket protection
   if (PROCESSED_BET_IDS.has(betId) || (Array.isArray(race.bets) && race.bets.some(b => b.id === betId))) {
     return { ok: false, status: 409, code: 'DUPLICATE_BET', error: 'Este bilhete já foi processado.' };
   }
 
-  // Restore persisted exposure record for this player & race if already locked in PLAYERS_DB
   race.exposures = race.exposures || {};
   if (playerRec.raceExposures && playerRec.raceExposures[race.id] && !race.exposures[pid]) {
     race.exposures[pid] = playerRec.raceExposures[race.id];
@@ -294,14 +639,12 @@ function processServerPlaceBet(roomState, rawBet, fallbackPid) {
       code: validation.code,
       error: validation.error,
       exposure: validation.exposure,
-      player: playerRec
+      player: sanitizePlayerForPublic(playerRec)
     };
   }
 
-  // Persist locked exposure on player record so refreshing/reopening tabs can never reset it
   playerRec.raceExposures[race.id] = race.exposures[pid];
 
-  // Immediately deduct stake from available balance
   const stake = validation.stake;
   if (playerRec.chips < stake) {
     return { ok: false, status: 400, code: 'INSUFFICIENT_BALANCE', error: 'Saldo insuficiente.' };
@@ -353,7 +696,6 @@ function processServerPlaceBet(roomState, rawBet, fallbackPid) {
   race.bets = Array.isArray(race.bets) ? race.bets : [];
   race.bets.push(confirmedBet);
 
-  // Update player cashbox & transaction ledger
   playerRec.cashbox.totalBet = r2(playerRec.cashbox.totalBet + stake);
   playerRec.cashbox.betHistory.unshift({
     id: betId,
@@ -394,12 +736,12 @@ function processServerPlaceBet(roomState, rawBet, fallbackPid) {
     status: 200,
     bet: confirmedBet,
     exposure: updatedExposure,
-    player: playerRec
+    player: sanitizePlayerForPublic(playerRec)
   };
 }
 
 /**
- * Authoritative Bet Cancellation on Server (while betting window is open and not locked)
+ * Authoritative Bet Cancellation on Server
  */
 function processServerCancelBet(roomState, betId, pid) {
   if (!roomState || !roomState.race) {
@@ -450,12 +792,12 @@ function processServerCancelBet(roomState, betId, pid) {
     status: 200,
     betId,
     exposure: updatedExposure,
-    player: playerRec
+    player: sanitizePlayerForPublic(playerRec)
   };
 }
 
 /**
- * Authoritative & Idempotent Race Settlement on Server (Section 11 & Section 9)
+ * Authoritative & Idempotent Race Settlement on Server
  */
 function processServerSettleRace(roomState) {
   if (!roomState || !roomState.race) {
@@ -466,7 +808,6 @@ function processServerSettleRace(roomState) {
     return { ok: false, status: 400, error: 'A corrida ainda não possui resultado final para liquidação.' };
   }
 
-  // Do not settle without a reliable final order unless race was cancelled before start
   if (!race.cancelled && (!Array.isArray(race.order) || race.order.length === 0)) {
     return { ok: false, status: 400, error: 'Resultado final inválido ou ausente.' };
   }
@@ -494,7 +835,6 @@ function processServerSettleRace(roomState) {
     if (!playerRec) continue;
     ensurePlayerFinancialFields(playerRec);
 
-    // Strictly idempotent per ticket: never pay or settle the same ticket twice!
     if (PROCESSED_SETTLEMENTS.has(ticketSettlementKey) || playerRec.settledBets[b.id]) {
       continue;
     }
@@ -520,7 +860,6 @@ function processServerSettleRace(roomState) {
     const hEntry = playerRec.cashbox.betHistory.find(h => h.id === b.id);
 
     if (outcome.voided || outcome.status === 'VOID') {
-      // VOID refund: stake returned once, no win/loss increment, totalBet adjusted
       playerRec.cashbox.totalBet = r2(Math.max(0, playerRec.cashbox.totalBet - b.amount));
       if (hEntry) {
         hEntry.status = 'void';
@@ -597,6 +936,50 @@ function processServerSettleRace(roomState) {
   };
 }
 
+/**
+ * Lists all active rooms for Spectator Mode (Requirement 3)
+ */
+function listActiveRoomsForSpectator() {
+  const list = [];
+  for (const [code, entry] of ROOMS.entries()) {
+    cleanupPresence(entry);
+    const st = entry.state;
+    if (!st) continue;
+    const onlinePlayers = (st.players || []).filter(p => p.online !== false && !p.isSpectator);
+    const r = st.race;
+    let status = 'LOBBY';
+    if (r) {
+      if (r.done || r.cancelled) status = 'FINISHED';
+      else if (r.running) status = 'IN_PROGRESS';
+      else if (r.started) status = 'PAUSED_BETTING';
+      else status = 'PRE_RACE_BETTING';
+    }
+    const creator = (st.players || []).find(p => p.id === (st.creatorId || st.hostId));
+    list.push({
+      code,
+      creatorId: st.creatorId || st.hostId,
+      creatorName: creator ? creator.name : 'Host',
+      circuitId: (r && r.circuit && r.circuit.id) || st.circuitId || 'int',
+      circuitName: (r && r.circuit && r.circuit.name) || st.circuitId || 'Interlagos',
+      circuitFlag: (r && r.circuit && r.circuit.flag) || '🏁',
+      playersCount: (st.players || []).length,
+      onlineCount: onlinePlayers.length,
+      totalPlayers: (st.players || []).length,
+      onlinePlayers: onlinePlayers.length,
+      players: (st.players || []).map(p => ({ id: p.id, name: p.name, avatarIcon: p.avatarIcon, color: p.color, online: p.online !== false })),
+      hasRace: !!r,
+      status,
+      raceStatus: status,
+      inProgress: !!(r && !r.done && !r.cancelled),
+      running: !!(r && r.running),
+      lap: r ? r.lap : 0,
+      totalLaps: r ? r.total : (st.laps || 15),
+      updatedAt: entry.updatedAt
+    });
+  }
+  return list.sort((a, b) => (b.inProgress - a.inProgress) || ((b.updatedAt || 0) - (a.updatedAt || 0)));
+}
+
 function sendJson(res, status, data) {
   const body = Buffer.from(JSON.stringify(data), 'utf-8');
   res.writeHead(status, {
@@ -604,8 +987,8 @@ function sendJson(res, status, data) {
     'Content-Length': body.length,
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token'
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token, X-Machine-Id, X-Auth-Token'
   });
   res.end(body);
 }
@@ -623,43 +1006,280 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') return sendJson(res, 200, { ok: true });
   const parsed = url.parse(req.url, true);
   const pathname = parsed.pathname;
+  const clientIp = getClientIp(req);
+  const headerMachineId = req.headers['x-machine-id'] ? String(req.headers['x-machine-id']).trim() : '';
+  const headerAuthToken = req.headers['x-auth-token'] ? String(req.headers['x-auth-token']).trim() : '';
 
   if (pathname === '/api/health') {
-    return sendJson(res, 200, { ok: true, server: 'node', modelVersion: F1Finance.MODEL_VERSION, ts: Date.now() / 1000 });
+    return sendJson(res, 200, {
+      ok: true,
+      server: 'node',
+      modelVersion: F1Finance.MODEL_VERSION,
+      initialChips: getInitialChips(),
+      exposureRate: F1Finance.EXPOSURE_RATE,
+      ts: Date.now() / 1000
+    });
   }
 
+  // Public list of active lobbies & ongoing matches for Spectator Mode (Requirement 3)
+  if (pathname === '/api/rooms' && req.method === 'GET') {
+    return sendJson(res, 200, { ok: true, rooms: listActiveRoomsForSpectator() });
+  }
+
+  // Public player lookup by nickname for invitations (Requirement 1 & 8)
+  if (pathname === '/api/players/search' && req.method === 'GET') {
+    const q = String(parsed.query.q || '').trim().toLowerCase();
+    const all = Array.from(PLAYERS_DB.values())
+      .filter(p => !q || String(p.name || '').toLowerCase().includes(q) || String(p.id || '').toLowerCase().includes(q))
+      .slice(0, 30)
+      .map(p => ({ id: p.id, name: p.name, avatarId: p.avatarId, wins: p.wins || 0, chips: p.chips }));
+    return sendJson(res, 200, { ok: true, players: all });
+  }
+
+  // Poll pending invitations for a player by ID or Nickname (Requirement 1)
+  if (pathname === '/api/invites' && req.method === 'GET') {
+    const pid = String(parsed.query.pid || parsed.query.playerId || '').trim().toLowerCase();
+    const name = String(parsed.query.name || parsed.query.nickname || '').trim().toLowerCase();
+    const now = Date.now();
+    const collected = [];
+    for (const key of [pid, name]) {
+      if (!key) continue;
+      const arr = INVITES.get(key) || [];
+      const valid = arr.filter(inv => (now - inv.ts) < 300000); // 5 min TTL
+      INVITES.set(key, valid);
+      for (const inv of valid) {
+        if (!collected.some(x => x.id === inv.id)) collected.push(inv);
+      }
+    }
+    return sendJson(res, 200, { ok: true, invites: collected });
+  }
+
+  // Admin: Get all registered players globally + server config (Requirement 7 & 8)
   if (pathname === '/api/admin/players' && req.method === 'GET') {
     const token = getAdminToken(req, null, parsed.query);
     if (!verifyAdminToken(token)) return sendJson(res, 401, { ok: false, error: 'UNAUTHORIZED_ADMIN' });
-    const list = Array.from(PLAYERS_DB.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-    return sendJson(res, 200, { ok: true, players: list });
+    const q = String(parsed.query.q || '').trim().toLowerCase();
+    let list = Array.from(PLAYERS_DB.values())
+      .map(p => sanitizePlayerForPublic(ensurePlayerFinancialFields(p)))
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    if (q) {
+      list = list.filter(p => String(p.name || '').toLowerCase().includes(q) || String(p.id || '').toLowerCase().includes(q));
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      players: list,
+      initialChips: getInitialChips(),
+      adminLogs: (SERVER_CONFIG.adminLogs || []).slice(0, 50)
+    });
+  }
+
+  if (pathname === '/api/admin/config' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      initialChips: getInitialChips(),
+      exposureRate: F1Finance.EXPOSURE_RATE
+    });
   }
 
   if (pathname.startsWith('/api/player/') && req.method === 'GET') {
     const pid = pathname.split('/')[3];
     const rec = PLAYERS_DB.get(pid);
     if (!rec) return sendJson(res, 404, { ok: false, error: 'PLAYER_NOT_FOUND' });
-    return sendJson(res, 200, { ok: true, player: ensurePlayerFinancialFields(rec) });
+    return sendJson(res, 200, { ok: true, player: sanitizePlayerForPublic(ensurePlayerFinancialFields(rec)) });
   }
 
-  if (req.method === 'POST' && (pathname.startsWith('/api/admin/') || pathname === '/api/player/sync')) {
+  if (req.method === 'POST' && (
+    pathname.startsWith('/api/admin/') ||
+    pathname === '/api/player/sync' ||
+    pathname === '/api/account/init' ||
+    pathname === '/api/account/delete_self' ||
+    pathname === '/api/invites/send' ||
+    pathname === '/api/invites/dismiss'
+  )) {
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
       let payload = {};
       try { payload = JSON.parse(body || '{}'); } catch (e) {}
 
+      // Self-service account deletion/reset by the player themselves
+      if (pathname === '/api/account/delete_self') {
+        const machineId = String(payload.machineId || headerMachineId || '').trim() || null;
+        const authToken = String(payload.authToken || headerAuthToken || '').trim() || null;
+        const requestedId = String(payload.playerId || '').trim();
+
+        let targetRec = requestedId ? PLAYERS_DB.get(requestedId) : null;
+        if (!targetRec && machineId) {
+          targetRec = findAccountForMachine(machineId, clientIp);
+        }
+
+        if (!targetRec) {
+          return sendJson(res, 200, {
+            ok: true,
+            deleted: false,
+            initialChips: getInitialChips(),
+            message: 'Perfil local resetado com sucesso.'
+          });
+        }
+
+        // Verify ownership by machineId or authToken so a user can only delete their own profile
+        const isOwner = (!targetRec.machineId && !targetRec.authToken) ||
+          (machineId && targetRec.machineId === machineId) ||
+          (authToken && targetRec.authToken === authToken) ||
+          (targetRec.clientIp && targetRec.clientIp === clientIp);
+
+        if (!isOwner) {
+          return sendJson(res, 403, {
+            ok: false,
+            error: 'Você só pode excluir o perfil vinculado ao seu próprio dispositivo.'
+          });
+        }
+
+        const delRes = deletePlayerAccountAdmin(targetRec.id);
+        return sendJson(res, 200, {
+          ok: true,
+          deleted: true,
+          deletedPlayerId: targetRec.id,
+          deletedPlayer: delRes.deletedPlayer,
+          initialChips: getInitialChips()
+        });
+      }
+
+      // 1. Account initialization & IP/Machine control endpoint (Requirement 1)
+      if (pathname === '/api/account/init') {
+        const machineId = String(payload.machineId || headerMachineId || '').trim() || `ip_${clientIp}`;
+        const authToken = String(payload.authToken || headerAuthToken || '').trim() || null;
+        const requestedId = String((payload.player && payload.player.id) || payload.playerId || '').trim();
+        const createNewAttempt = !!payload.createNew;
+
+        const existingForMachine = findAccountForMachine(machineId, clientIp);
+
+        // If user explicitly tried to create a second account on the same machine, block duplicate creation
+        if (createNewAttempt && existingForMachine) {
+          return sendJson(res, 409, {
+            ok: false,
+            code: 'ACCOUNT_LIMIT_PER_MACHINE',
+            error: `Já existe uma conta registrada para este dispositivo (${existingForMachine.name}). Apenas uma conta por máquina é permitida.`,
+            player: existingForMachine
+          });
+        }
+
+        // If machine already has an account, return it (preventing link-based account sharing or duplicates)
+        if (existingForMachine) {
+          ensurePlayerFinancialFields(existingForMachine);
+          if (payload.player && payload.player.name && (!existingForMachine.authToken || existingForMachine.authToken === authToken)) {
+            existingForMachine.name = String(payload.player.name).trim().slice(0, 24) || existingForMachine.name;
+            if (payload.player.avatarId) existingForMachine.avatarId = String(payload.player.avatarId);
+            savePlayersDb();
+          }
+          return sendJson(res, 200, {
+            ok: true,
+            player: existingForMachine,
+            initialChips: getInitialChips(),
+            boundToMachine: true,
+            reusedBoundAccount: true
+          });
+        }
+
+        // Otherwise register new account bound to this machineId & IP with configured initialChips
+        const pIn = payload.player ? Object.assign({}, payload.player) : {
+          id: requestedId || ('usr_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex')),
+          name: payload.name || `Piloto ${PLAYERS_DB.size + 1}`,
+          avatarId: payload.avatarId || 'av1',
+          chips: getInitialChips()
+        };
+        // Never allow a new machine to hijack an existing playerId owned by another device
+        if (pIn.id && PLAYERS_DB.has(pIn.id)) {
+          const ownerRec = PLAYERS_DB.get(pIn.id);
+          if (ownerRec && ownerRec.machineId && ownerRec.machineId !== machineId && ownerRec.authToken !== authToken) {
+            pIn.id = 'usr_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
+          }
+        }
+        const created = upsertPlayerRecord(pIn, false, { machineId, clientIp, authToken });
+        return sendJson(res, 200, {
+          ok: true,
+          player: created,
+          initialChips: getInitialChips(),
+          boundToMachine: true,
+          reusedBoundAccount: false
+        });
+      }
+
+      // 2. Send Room Invitation by Nickname (Requirement 1)
+      if (pathname === '/api/invites/send') {
+        const roomCode = String(payload.roomCode || '').trim().toUpperCase();
+        const fromId = String(payload.fromId || payload.fromPlayerId || '').trim();
+        const senderRec = fromId ? PLAYERS_DB.get(fromId) : null;
+        const fromName = String(payload.fromName || (senderRec && senderRec.name) || 'Jogador').trim();
+        const targetNickname = String(payload.targetNickname || '').trim();
+
+        if (!roomCode || !ROOMS.has(roomCode)) {
+          return sendJson(res, 404, { ok: false, error: 'Sala não encontrada no servidor.' });
+        }
+        if (!targetNickname) {
+          return sendJson(res, 400, { ok: false, error: 'Digite o nickname do jogador que deseja convidar.' });
+        }
+
+        const targetRec = findPlayerByNickname(targetNickname);
+        const targetKey = targetRec ? targetRec.name.toLowerCase() : targetNickname.toLowerCase();
+        const invObj = {
+          id: `inv_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+          roomCode,
+          fromId,
+          fromPlayerId: fromId,
+          fromName,
+          targetNickname: targetRec ? targetRec.name : targetNickname,
+          targetPlayerId: targetRec ? targetRec.id : null,
+          toPlayerId: targetRec ? targetRec.id : null,
+          ts: Date.now()
+        };
+
+        const listByName = INVITES.get(targetKey) || [];
+        listByName.unshift(invObj);
+        INVITES.set(targetKey, listByName.slice(0, 20));
+
+        if (targetRec) {
+          const listById = INVITES.get(targetRec.id.toLowerCase()) || [];
+          listById.unshift(invObj);
+          INVITES.set(targetRec.id.toLowerCase(), listById.slice(0, 20));
+        }
+
+        return sendJson(res, 200, {
+          ok: true,
+          invite: invObj,
+          foundRegisteredPlayer: !!targetRec
+        });
+      }
+
+      if (pathname === '/api/invites/dismiss') {
+        const invId = String(payload.inviteId || '').trim();
+        for (const [k, arr] of INVITES.entries()) {
+          INVITES.set(k, arr.filter(x => x.id !== invId));
+        }
+        return sendJson(res, 200, { ok: true });
+      }
+
+      // 3. Admin Login
       if (pathname === '/api/admin/login') {
         const login = String(payload.login || '').trim();
         const pass = String(payload.password || '');
         const hash = crypto.createHash('sha256').update(pass).digest('hex');
-        if (login !== ADMIN_LOGIN || hash !== ADMIN_PASS_HASH) {
+        if (login.toUpperCase() !== ADMIN_LOGIN || hash !== ADMIN_PASS_HASH) {
           return sendJson(res, 401, { ok: false, error: 'Credenciais de administrador inválidas.' });
         }
         const token = crypto.randomBytes(24).toString('hex');
         ADMIN_TOKENS.set(token, Date.now() / 1000 + 86400);
-        const list = Array.from(PLAYERS_DB.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-        return sendJson(res, 200, { ok: true, token, admin: ADMIN_LOGIN, players: list });
+        const list = Array.from(PLAYERS_DB.values())
+          .map(p => sanitizePlayerForPublic(ensurePlayerFinancialFields(p)))
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        return sendJson(res, 200, {
+          ok: true,
+          token,
+          admin: ADMIN_LOGIN,
+          players: list,
+          initialChips: getInitialChips(),
+          adminLogs: (SERVER_CONFIG.adminLogs || []).slice(0, 50)
+        });
       }
 
       if (pathname === '/api/admin/logout') {
@@ -668,6 +1288,73 @@ const server = http.createServer((req, res) => {
         return sendJson(res, 200, { ok: true });
       }
 
+      // 4. Admin Initial Balance Configuration (Requirement 7)
+      if (pathname === '/api/admin/config') {
+        const token = getAdminToken(req, payload, parsed.query);
+        if (!verifyAdminToken(token)) return sendJson(res, 401, { ok: false, error: 'Acesso negado.' });
+        const newInit = r2(payload.initialChips);
+        if (isNaN(newInit) || newInit < 0) {
+          return sendJson(res, 400, { ok: false, error: 'Informe um saldo inicial válido (maior ou igual a zero).' });
+        }
+        const oldInit = getInitialChips();
+        SERVER_CONFIG.initialChips = newInit;
+        SERVER_CONFIG.updatedAt = Date.now() / 1000;
+        saveServerConfig();
+        const logEntry = appendAdminLog(
+          'UPDATE_INITIAL_CHIPS',
+          `Admin alterou o saldo inicial padrão de ${oldInit.toFixed(2)} para ${newInit.toFixed(2)} fichas`,
+          { oldInitialChips: oldInit, newInitialChips: newInit }
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          initialChips: newInit,
+          logEntry,
+          adminLogs: (SERVER_CONFIG.adminLogs || []).slice(0, 50)
+        });
+      }
+
+      // 5. Admin Delete Account (Requirement 9) or Purge Non-Protected Accounts
+      if (pathname === '/api/admin/purge_non_protected') {
+        const token = getAdminToken(req, payload, parsed.query);
+        if (!verifyAdminToken(token)) return sendJson(res, 401, { ok: false, error: 'Acesso negado.' });
+        const purgeRes = purgeNonProtectedAccounts();
+        const logEntry = appendAdminLog(
+          'PURGE_NON_PROTECTED',
+          `Admin resetou todas as contas exceto LX/LXZADA e naoc7k/N7K (Mantidas: ${purgeRes.kept.length}, Excluídas: ${purgeRes.removed.length})`
+        );
+        const list = Array.from(PLAYERS_DB.values())
+          .map(p => sanitizePlayerForPublic(ensurePlayerFinancialFields(p)))
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        return sendJson(res, 200, {
+          ok: true,
+          kept: purgeRes.kept,
+          removed: purgeRes.removed,
+          players: list,
+          logEntry,
+          adminLogs: (SERVER_CONFIG.adminLogs || []).slice(0, 50)
+        });
+      }
+
+      if (pathname === '/api/admin/delete_player') {
+        const token = getAdminToken(req, payload, parsed.query);
+        if (!verifyAdminToken(token)) return sendJson(res, 401, { ok: false, error: 'Acesso negado.' });
+        const target = payload.playerId || payload.nickname;
+        const delRes = deletePlayerAccountAdmin(target);
+        if (!delRes.ok) return sendJson(res, delRes.status || 400, delRes);
+        const list = Array.from(PLAYERS_DB.values())
+          .map(p => sanitizePlayerForPublic(ensurePlayerFinancialFields(p)))
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        return sendJson(res, 200, {
+          ok: true,
+          deletedPlayerId: delRes.deletedPlayerId,
+          deletedPlayer: delRes.deletedPlayer,
+          logEntry: delRes.logEntry,
+          players: list,
+          adminLogs: (SERVER_CONFIG.adminLogs || []).slice(0, 50)
+        });
+      }
+
+      // 6. Admin Balance Management
       if (pathname === '/api/admin/balance') {
         const token = getAdminToken(req, payload, parsed.query);
         if (!verifyAdminToken(token)) return sendJson(res, 401, { ok: false, error: 'Acesso negado.' });
@@ -675,7 +1362,7 @@ const server = http.createServer((req, res) => {
         const op = String(payload.operation || '').trim().toLowerCase();
         const amount = r2(payload.amount);
         if (amount < 0 || isNaN(amount)) return sendJson(res, 400, { ok: false, error: 'Valor inválido.' });
-        const rec = PLAYERS_DB.get(targetId);
+        const rec = PLAYERS_DB.get(targetId) || findPlayerByNickname(targetId);
         if (!rec) return sendJson(res, 404, { ok: false, error: 'Jogador não encontrado.' });
 
         ensurePlayerFinancialFields(rec);
@@ -710,27 +1397,39 @@ const server = http.createServer((req, res) => {
           ts: rec.updatedAt
         };
         recordServerTx(rec, 'tx_' + admId, newChips >= oldChips ? 'ADMIN_ADD' : 'ADMIN_REMOVE', 'Ajuste Administrativo', opLabel, r2(newChips - oldChips));
+        appendAdminLog('BALANCE_' + op.toUpperCase(), `${rec.name} (${rec.id}): ${opLabel} (${oldChips.toFixed(2)} -> ${newChips.toFixed(2)})`);
         savePlayersDb();
 
         for (const rEntry of ROOMS.values()) {
           if (rEntry.state && Array.isArray(rEntry.state.players)) {
-            const rp = rEntry.state.players.find(p => p.id === targetId);
+            const rp = rEntry.state.players.find(p => p.id === rec.id);
             if (rp) {
               rp.chips = newChips;
               rp.balanceVersion = rec.balanceVersion;
             }
           }
         }
-        const list = Array.from(PLAYERS_DB.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-        return sendJson(res, 200, { ok: true, player: rec, players: list });
+        const list = Array.from(PLAYERS_DB.values())
+          .map(p => sanitizePlayerForPublic(ensurePlayerFinancialFields(p)))
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        return sendJson(res, 200, {
+          ok: true,
+          player: sanitizePlayerForPublic(rec),
+          players: list,
+          adminLogs: (SERVER_CONFIG.adminLogs || []).slice(0, 50)
+        });
       }
 
       if (pathname === '/api/player/sync') {
         const pIn = payload.player || payload;
-        // Do NOT trust client balance inflation for existing accounts
-        const rec = upsertPlayerRecord(pIn, true);
+        const machineId = String(payload.machineId || pIn.machineId || headerMachineId || '').trim() || null;
+        const authToken = String(payload.authToken || pIn.authToken || headerAuthToken || '').trim() || null;
+
+        // If an account was deleted by admin and the client is trying to auto-sync the old local snapshot,
+        // only re-create if explicitly allowed or bind cleanly with current configured initialChips
+        const rec = upsertPlayerRecord(pIn, false, { machineId, clientIp, authToken });
         if (!rec) return sendJson(res, 400, { ok: false, error: 'INVALID_PLAYER' });
-        return sendJson(res, 200, { ok: true, player: rec });
+        return sendJson(res, 200, { ok: true, player: rec, initialChips: getInitialChips() });
       }
     });
     return;
@@ -746,19 +1445,24 @@ const server = http.createServer((req, res) => {
       const entry = ROOMS.get(code);
       if (!entry) return sendJson(res, 404, { ok: false, error: 'ROOM_NOT_FOUND' });
       const pid = parsed.query.pid;
-      if (pid) {
-        entry.heartbeats.set(pid, now);
+      const isSpectator = parsed.query.spectator === '1';
+
+      // Requirement 3: Do NOT register or heartbeat spectators as room participants!
+      if (pid && !isSpectator) {
         if (entry.state && Array.isArray(entry.state.players)) {
           const pl = entry.state.players.find(x => x.id === pid);
-          if (pl) pl.online = true;
+          if (pl) {
+            entry.heartbeats.set(pid, now);
+            pl.online = true;
+          }
         }
       }
       cleanupPresence(entry);
       const creatorId = entry.state.creatorId || entry.state.hostId;
-      const isHost = parsed.query.host === '1' && (!creatorId || pid === creatorId);
+      const isHost = !isSpectator && parsed.query.host === '1' && (!creatorId || pid === creatorId);
       const actions = isHost ? entry.actions.splice(0) : [];
-      const me = pid ? PLAYERS_DB.get(pid) : null;
-      return sendJson(res, 200, { ok: true, state: entry.state, actions, updatedAt: entry.updatedAt, me });
+      const me = pid ? sanitizePlayerForPublic(PLAYERS_DB.get(pid)) : null;
+      return sendJson(res, 200, { ok: true, spectator: isSpectator, state: entry.state, actions, updatedAt: entry.updatedAt, me });
     }
 
     if (req.method === 'POST') {
@@ -771,8 +1475,14 @@ const server = http.createServer((req, res) => {
         if (op === 'state') {
           let state = payload.state;
           if (!state) return sendJson(res, 400, { ok: false, error: 'INVALID_STATE' });
+          // Never allow spectators in state.players
+          if (Array.isArray(state.players)) {
+            state.players = state.players.filter(p => p && !p.isSpectator);
+          }
+
           let entry = ROOMS.get(code);
           if (entry && entry.state) {
+            cleanupPresence(entry);
             const creatorId = entry.state.creatorId || entry.state.hostId;
             if (creatorId && payload.pid && payload.pid !== creatorId) {
               return sendJson(res, 403, { ok: false, error: 'UNAUTHORIZED_NOT_CREATOR', state: entry.state });
@@ -783,7 +1493,6 @@ const server = http.createServer((req, res) => {
               if (!oldRace.bettingOpen && newRace.bettingOpen && Number(newRace.round || 0) === Number(oldRace.round || 0)) {
                 newRace.bettingOpen = false;
               }
-              // Preserve authoritative server-confirmed bets, oddsBook, and locked exposures!
               if (oldRace.exposures) {
                 newRace.exposures = Object.assign({}, newRace.exposures || {}, oldRace.exposures);
               }
@@ -794,7 +1503,6 @@ const server = http.createServer((req, res) => {
                 const oldBetMap = new Map(oldRace.bets.map(b => [b.id, b]));
                 const mergedBets = [];
                 for (const ob of oldRace.bets) {
-                  // Never allow incoming state to mutate frozen fields of an already confirmed bet!
                   mergedBets.push(ob);
                 }
                 for (const nb of (newRace.bets || [])) {
@@ -805,6 +1513,13 @@ const server = http.createServer((req, res) => {
                 newRace.bets = mergedBets;
               }
             }
+            // Preserve kickedPlayerIds list unless cleared by creator
+            if (Array.isArray(entry.state.kickedPlayerIds)) {
+              state.kickedPlayerIds = Array.from(new Set([...(state.kickedPlayerIds || []), ...entry.state.kickedPlayerIds]));
+              if (Array.isArray(state.players)) {
+                state.players = state.players.filter(p => !state.kickedPlayerIds.includes(p.id));
+              }
+            }
           } else {
             entry = { state, actions: [], updatedAt: now, heartbeats: new Map() };
             ROOMS.set(code, entry);
@@ -812,18 +1527,19 @@ const server = http.createServer((req, res) => {
 
           if (payload.pid) entry.heartbeats.set(payload.pid, now);
           for (const p of (state.players || [])) {
-            upsertPlayerRecord(p, true);
+            if (p.isSpectator) continue;
+            if (!PLAYERS_DB.has(p.id)) {
+              upsertPlayerRecord(p, true, { internalTrusted: true, preserveExplicitChips: true });
+            }
             if (!entry.heartbeats.has(p.id)) entry.heartbeats.set(p.id, now);
           }
 
-          // Ensure dynamic oddsBook exists on newly prepared pre-start race
           if (state.race && !state.race.oddsBook) {
             state.race.oddsBook = F1Finance.calculateRaceOdds(state.race);
           }
 
           entry.state = state;
 
-          // If race just finished or was cancelled, trigger authoritative idempotent server settlement
           if (state.race && (state.race.done || state.race.cancelled) && !state.race.settled) {
             processServerSettleRace(entry.state);
           }
@@ -832,6 +1548,16 @@ const server = http.createServer((req, res) => {
           cleanupPresence(entry);
           const actions = entry.actions.splice(0);
           return sendJson(res, 200, { ok: true, actions, state: entry.state });
+        }
+
+        // Kick / Remove player from lobby (Requirement 2)
+        if (op === 'kick') {
+          const token = getAdminToken(req, payload, parsed.query);
+          const isAdmin = verifyAdminToken(token);
+          const requesterId = payload.playerId || payload.requesterId;
+          const kickRes = removePlayerFromRoom(code, payload.targetPlayerId, requesterId, isAdmin);
+          if (!kickRes.ok) return sendJson(res, kickRes.status || 400, kickRes);
+          return sendJson(res, 200, kickRes);
         }
 
         if (op === 'bet') {
@@ -883,15 +1609,35 @@ const server = http.createServer((req, res) => {
           let entry = ROOMS.get(code);
           const action = payload.action || {};
           const pid = action.playerId || (action.player && action.player.id);
-          if (action.player) upsertPlayerRecord(action.player, true);
+
+          // Spectators cannot send participant actions or be added to players list (Requirement 3)
+          if (action.isSpectator || (action.player && action.player.isSpectator)) {
+            if (!entry) return sendJson(res, 404, { ok: false, error: 'ROOM_NOT_FOUND' });
+            return sendJson(res, 200, { ok: true, state: entry.state });
+          }
+
+          if (action.player && !PLAYERS_DB.has(action.player.id)) {
+            upsertPlayerRecord(action.player, true, { clientIp, machineId: headerMachineId });
+          }
           if (!entry) return sendJson(res, 404, { ok: false, error: 'ROOM_NOT_FOUND' });
-          if (pid) entry.heartbeats.set(pid, now);
           const st = entry.state;
+
           if (st && Array.isArray(st.players)) {
             if (action.type === 'JOIN_ROOM' && action.player) {
               const pl = action.player;
+              if (pl.isSpectator) {
+                return sendJson(res, 200, { ok: true, state: entry.state });
+              }
+              // Remove from kicked list if they are explicitly re-joining
+              if (Array.isArray(st.kickedPlayerIds)) {
+                st.kickedPlayerIds = st.kickedPlayerIds.filter(id => id !== pl.id);
+              }
               pl.online = true;
-              const rec = upsertPlayerRecord(pl, true);
+              entry.heartbeats.set(pl.id, now);
+              let rec = PLAYERS_DB.get(pl.id);
+              if (!rec) {
+                rec = upsertPlayerRecord(pl, true, { clientIp, machineId: headerMachineId });
+              }
               if (rec) {
                 pl.chips = rec.chips;
                 pl.balanceVersion = rec.balanceVersion;
@@ -903,7 +1649,14 @@ const server = http.createServer((req, res) => {
                 st.players.push(pl);
               }
               ensureAuthorizedCreator(entry);
+            } else if (action.type === 'KICK_PLAYER' && action.targetPlayerId) {
+              const token = getAdminToken(req, payload, parsed.query);
+              const isAdmin = verifyAdminToken(token);
+              const kickRes = removePlayerFromRoom(code, action.targetPlayerId, pid, isAdmin);
+              if (!kickRes.ok) return sendJson(res, kickRes.status || 400, kickRes);
+              return sendJson(res, 200, { ok: true, state: entry.state });
             } else if (action.type === 'PLACE_BET' && action.bet) {
+              if (pid) entry.heartbeats.set(pid, now);
               const resBet = processServerPlaceBet(st, action.bet, pid);
               if (!resBet.ok) {
                 return sendJson(res, resBet.status || 400, resBet);
@@ -912,6 +1665,7 @@ const server = http.createServer((req, res) => {
               action.playerChips = resBet.player.chips;
               action.balanceVersion = resBet.player.balanceVersion;
             } else if (action.type === 'CANCEL_BET' && action.betId) {
+              if (pid) entry.heartbeats.set(pid, now);
               const resCancel = processServerCancelBet(st, action.betId, pid);
               if (!resCancel.ok) {
                 return sendJson(res, resCancel.status || 400, resCancel);
@@ -922,15 +1676,21 @@ const server = http.createServer((req, res) => {
               entry.heartbeats.set(pid, 0);
               const ex = st.players.find(x => x.id === pid);
               if (ex) ex.online = false;
+              ensureAuthorizedCreator(entry);
             } else if (action.type === 'LEAVE_ROOM' && pid) {
               st.players = st.players.filter(x => x.id !== pid);
               entry.heartbeats.delete(pid);
               ensureAuthorizedCreator(entry);
+            } else if (pid) {
+              // Only update heartbeat if player is still in the room (not kicked)
+              if (st.players.some(x => x.id === pid)) {
+                entry.heartbeats.set(pid, now);
+              }
             }
           }
           entry.actions.push(action);
           cleanupPresence(entry);
-          const me = pid ? PLAYERS_DB.get(pid) : null;
+          const me = pid ? sanitizePlayerForPublic(PLAYERS_DB.get(pid)) : null;
           return sendJson(res, 200, { ok: true, state: entry.state, me });
         }
 
@@ -964,11 +1724,22 @@ module.exports = {
   server,
   ROOMS,
   PLAYERS_DB,
+  INVITES,
+  SERVER_CONFIG,
   PROCESSED_BET_IDS,
   PROCESSED_SETTLEMENTS,
+  getInitialChips,
   upsertPlayerRecord,
+  findAccountForMachine,
+  findPlayerByNickname,
+  removePlayerFromRoom,
+  deletePlayerAccountAdmin,
+  isProtectedAccountName,
+  purgeNonProtectedAccounts,
+  listActiveRoomsForSpectator,
   processServerPlaceBet,
   processServerCancelBet,
   processServerSettleRace,
-  savePlayersDb
+  savePlayersDb,
+  saveServerConfig
 };

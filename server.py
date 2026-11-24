@@ -5,9 +5,14 @@ Runs on port 8080 with zero external dependencies.
 
 Enforces:
  - Server-authoritative player balances, committed chips, and transaction history
- - 10% initial race balance exposure limit across Overtake and Placement modalities
- - Protection against client-side balance inflation / manipulation
- - Concurrency protection (STATE_LOCK), duplicate bet rejection, and idempotent race settlement
+ - 50% initial race balance exposure limit across Overtake and Placement modalities
+ - Account control by IP + Machine Fingerprint (1 account per machine, shared-network friendly)
+ - Account ownership tokens preventing link-based account hijacking
+ - Nickname-based room invitation system
+ - Lobby kick/remove player by Creator or Admin with real-time sync
+ - Public active rooms directory & spectator read-only access (spectators never added as participants)
+ - Race continuity after mid-race player disconnection
+ - Configurable initial balance for new accounts + global account search & deletion by Admin
 """
 import hashlib
 import hmac
@@ -24,15 +29,16 @@ from urllib.parse import urlparse, parse_qs
 PORT = int(os.environ.get("PORT", 8080))
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYERS_DB_PATH = os.path.join(ROOT_DIR, "players_db.json")
+SERVER_CONFIG_PATH = os.path.join(ROOT_DIR, "server_config.json")
 
-INITIAL_CHIPS = 100.0
-EXPOSURE_RATE = 0.10
+DEFAULT_INITIAL_CHIPS = 100.0
+EXPOSURE_RATE = 0.50
 OVERTAKE_FACTOR_F = 0.20
 MAX_OVERTAKE_RETURN_MULT = 5.0
 HOUSE_MARGIN = 0.06
 MIN_ODD = 1.00
 MAX_ODD = 15.00
-MODEL_VERSION = "F1_ECON_V4.0_MC1000"
+MODEL_VERSION = "F1_ECON_V4.1_MC1000"
 
 ADMIN_LOGIN = "LN"
 ADMIN_PASSWORD_HASH = hashlib.sha256("jairo".encode("utf-8")).hexdigest()
@@ -43,6 +49,13 @@ PLAYERS_DB = {}            # pid -> dict
 ADMIN_TOKENS = {}          # token -> expiry_ts
 PROCESSED_BET_IDS = set()
 PROCESSED_SETTLEMENTS = set()
+INVITES = {}               # key (lowercase name or pid) -> list of invite dicts
+
+SERVER_CONFIG = {
+    "initialChips": DEFAULT_INITIAL_CHIPS,
+    "updatedAt": time.time(),
+    "adminLogs": []
+}
 
 DRIVERS_CATALOG = [
     {"id": "NOR", "name": "Lando Norris",      "team": "MCL", "num": 4,  "skill": -0.22, "ov": 0.89},
@@ -96,6 +109,126 @@ def floor2(val):
         return math.floor((float(val) + 1e-9) * 100.0) / 100.0
     except Exception:
         return 0.0
+
+
+def get_initial_chips():
+    try:
+        val = float(SERVER_CONFIG.get("initialChips", DEFAULT_INITIAL_CHIPS))
+        return r2(val) if val >= 0 else DEFAULT_INITIAL_CHIPS
+    except Exception:
+        return DEFAULT_INITIAL_CHIPS
+
+
+def load_server_config():
+    global SERVER_CONFIG
+    if os.path.exists(SERVER_CONFIG_PATH):
+        try:
+            with open(SERVER_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    if "initialChips" in data and float(data["initialChips"]) >= 0:
+                        SERVER_CONFIG["initialChips"] = r2(data["initialChips"])
+                    if isinstance(data.get("adminLogs"), list):
+                        SERVER_CONFIG["adminLogs"] = data["adminLogs"][:200]
+        except Exception:
+            pass
+    else:
+        save_server_config()
+
+
+def save_server_config():
+    try:
+        with open(SERVER_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(SERVER_CONFIG, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def append_admin_log(action, detail, extra=None):
+    logs = SERVER_CONFIG.setdefault("adminLogs", [])
+    entry = {
+        "id": f"alog_{int(time.time()*1000)}_{secrets.token_hex(3)}",
+        "action": action,
+        "detail": detail,
+        "ts": time.time(),
+        "date": time.strftime("%d/%m/%Y %H:%M:%S")
+    }
+    if isinstance(extra, dict):
+        entry.update(extra)
+    logs.insert(0, entry)
+    if len(logs) > 200:
+        del logs[200:]
+    save_server_config()
+    return entry
+
+
+load_server_config()
+
+
+def sanitize_player_for_public(rec):
+    if not rec:
+        return None
+    copy = dict(rec)
+    copy.pop("authToken", None)
+    return copy
+
+
+def find_account_for_machine(machine_id, client_ip):
+    if machine_id:
+        for rec in PLAYERS_DB.values():
+            if rec.get("machineId") and rec["machineId"] == machine_id:
+                return rec
+    if not machine_id and client_ip:
+        for rec in PLAYERS_DB.values():
+            if not rec.get("machineId") and rec.get("clientIp") == client_ip:
+                return rec
+    return None
+
+
+def find_player_by_nickname(nickname):
+    clean = str(nickname or "").strip().lower()
+    if not clean:
+        return None
+    for rec in PLAYERS_DB.values():
+        if str(rec.get("name") or "").strip().lower() == clean or str(rec.get("id") or "").lower() == clean:
+            return rec
+    return None
+
+
+def is_protected_account_name(name):
+    raw = str(name or "").strip().lower()
+    if not raw:
+        return False
+    compact = "".join(ch for ch in raw if ch not in " _-.")
+    if compact in ("lx", "lxz", "lxzada"):
+        return True
+    if "lxzada" in compact or compact.startswith("lxz"):
+        return True
+    if compact in ("naoc7k", "n7k", "naoc") or "naoc7k" in compact or "n7k" in compact:
+        return True
+    return False
+
+
+def purge_non_protected_accounts():
+    kept = []
+    removed = []
+    for pid, rec in list(PLAYERS_DB.items()):
+        if rec and is_protected_account_name(rec.get("name")):
+            kept.append({"id": pid, "name": rec.get("name"), "chips": rec.get("chips", 0)})
+        else:
+            removed.append({"id": pid, "name": rec.get("name") if rec else pid})
+            PLAYERS_DB.pop(pid, None)
+    for r_entry in ROOMS.values():
+        st = r_entry.get("state")
+        if not st:
+            continue
+        if "players" in st:
+            st["players"] = [p for p in st["players"] if p and is_protected_account_name(p.get("name"))]
+        if st.get("race") and "bets" in st["race"]:
+            st["race"]["bets"] = [b for b in st["race"]["bets"] if b.get("pid") in PLAYERS_DB]
+        ensure_authorized_creator(r_entry)
+    save_players_db()
+    return {"kept": kept, "removed": removed}
 
 
 def get_lap_multiplier(lap):
@@ -282,12 +415,16 @@ def get_or_init_race_exposure(race, player_id, current_available):
 def ensure_player_financial_fields(rec):
     if not rec:
         return None
-    rec["chips"] = max(0.0, r2(rec.get("chips", INITIAL_CHIPS)))
+    init_val = get_initial_chips()
+    rec["chips"] = max(0.0, r2(rec.get("chips", init_val)))
     rec["committedChips"] = max(0.0, r2(rec.get("committedChips", 0.0)))
     rec["totalBalance"] = r2(rec["chips"] + rec["committedChips"])
     rec["wins"] = max(0, int(rec.get("wins", 0) or 0))
     rec["losses"] = max(0, int(rec.get("losses", 0) or 0))
     rec["balanceVersion"] = max(1, int(rec.get("balanceVersion", 1) or 1))
+    rec["machineId"] = str(rec["machineId"]) if rec.get("machineId") else None
+    rec["clientIp"] = str(rec["clientIp"]) if rec.get("clientIp") else None
+    rec["authToken"] = str(rec["authToken"]) if rec.get("authToken") else None
     if not isinstance(rec.get("settledBets"), dict):
         rec["settledBets"] = {}
     if not isinstance(rec.get("raceExposures"), dict):
@@ -369,33 +506,56 @@ def verify_admin_token(token):
     return True
 
 
-def upsert_player_record(p_data, allow_initial_seed=True):
-    """
-    Registers or updates a player in PLAYERS_DB.
-    Once registered, client requests cannot arbitrarily inflate or overwrite `chips`.
-    """
+def upsert_player_record(p_data, allow_initial_seed=True, client_meta=None):
     if not p_data or not p_data.get("id"):
         return None
+    meta = client_meta or {}
     pid = str(p_data["id"])
     now = time.time()
+    machine_id = str(meta.get("machineId") or p_data.get("machineId") or "").strip() or None
+    client_ip = str(meta.get("clientIp") or p_data.get("clientIp") or "").strip() or None
+    client_auth_token = str(meta.get("authToken") or p_data.get("authToken") or "").strip() or None
+
     existing = PLAYERS_DB.get(pid)
+    if not existing and machine_id:
+        bound = find_account_for_machine(machine_id, client_ip)
+        if bound:
+            existing = bound
+            pid = bound["id"]
+
+    if existing and existing.get("machineId") and machine_id and existing["machineId"] != machine_id:
+        if existing.get("authToken") and client_auth_token != existing["authToken"] and not meta.get("internalTrusted"):
+            my_own = find_account_for_machine(machine_id, client_ip)
+            if my_own:
+                existing = my_own
+                pid = my_own["id"]
+            else:
+                existing = None
+                pid = f"usr_{int(time.time()*1000)}_{secrets.token_hex(3)}"
+
     client_ver = int(p_data.get("balanceVersion", 0) or 0)
+    configured_init = get_initial_chips()
 
     if not existing:
-        chips_val = r2(p_data.get("chips", INITIAL_CHIPS)) if allow_initial_seed else INITIAL_CHIPS
-        if chips_val == 25000 and int(p_data.get("wins", 0) or 0) == 0:
-            chips_val = INITIAL_CHIPS
+        chips_val = configured_init
+        if allow_initial_seed and "chips" in p_data and meta.get("preserveExplicitChips"):
+            chips_val = r2(p_data.get("chips", configured_init))
         if chips_val < 0:
-            chips_val = INITIAL_CHIPS
+            chips_val = configured_init
+        new_auth = client_auth_token or f"tok_{secrets.token_hex(16)}"
         rec = ensure_player_financial_fields({
             "id": pid,
-            "name": str(p_data.get("name") or "Piloto").strip()[:24],
+            "name": str(p_data.get("name") or "Piloto").strip()[:24] or "Piloto",
             "avatarId": str(p_data.get("avatarId") or "av1"),
             "chips": chips_val,
             "committedChips": 0.0,
             "wins": int(p_data.get("wins", 0) or 0),
             "losses": int(p_data.get("losses", 0) or 0),
             "balanceVersion": max(1, client_ver),
+            "machineId": machine_id,
+            "clientIp": client_ip,
+            "authToken": new_auth,
+            "createdAt": now,
             "updatedAt": now,
             "lastAdminOp": None,
             "settledBets": p_data.get("settledBets") if isinstance(p_data.get("settledBets"), dict) else {},
@@ -406,8 +566,25 @@ def upsert_player_record(p_data, allow_initial_seed=True):
         return rec
 
     ensure_player_financial_fields(existing)
-    existing["name"] = str(p_data.get("name") or existing["name"]).strip()[:24]
-    existing["avatarId"] = str(p_data.get("avatarId") or existing.get("avatarId", "av1"))
+    if not existing.get("machineId") and machine_id:
+        existing["machineId"] = machine_id
+    if client_ip:
+        existing["clientIp"] = client_ip
+    if not existing.get("authToken"):
+        existing["authToken"] = client_auth_token or f"tok_{secrets.token_hex(16)}"
+
+    is_owner = (
+        not existing.get("machineId")
+        or not machine_id
+        or existing["machineId"] == machine_id
+        or (existing.get("authToken") and client_auth_token == existing["authToken"])
+        or meta.get("internalTrusted")
+    )
+    if is_owner:
+        if p_data.get("name"):
+            existing["name"] = str(p_data["name"]).strip()[:24]
+        if p_data.get("avatarId"):
+            existing["avatarId"] = str(p_data["avatarId"])
     existing["updatedAt"] = now
     save_players_db()
     return existing
@@ -443,13 +620,14 @@ def recompute_committed_chips(pid, room_state=None):
 def sync_room_player_balances(room_state):
     if not room_state or "players" not in room_state:
         return
+    room_state["players"] = [p for p in room_state["players"] if p and not p.get("isSpectator")]
     for p in room_state["players"]:
         pid = p.get("id")
         if not pid:
             continue
         rec = PLAYERS_DB.get(pid)
         if not rec:
-            rec = upsert_player_record(p, allow_initial_seed=True)
+            rec = upsert_player_record(p, allow_initial_seed=True, client_meta={"internalTrusted": True, "preserveExplicitChips": True})
         if rec:
             recompute_committed_chips(pid, room_state)
             p["chips"] = rec["chips"]
@@ -463,12 +641,17 @@ def ensure_authorized_creator(room_entry):
     state = room_entry.get("state")
     if not state:
         return
-    players = state.get("players", [])
+    players = [p for p in state.get("players", []) if p and not p.get("isSpectator")]
+    state["players"] = players
     creator_id = state.get("creatorId") or state.get("hostId")
     creator_in_room = next((p for p in players if p.get("id") == creator_id), None)
-    if not creator_in_room and players:
-        online_p = next((p for p in players if p.get("online", True)), players[0])
-        creator_id = online_p.get("id")
+    creator_online = creator_in_room and creator_in_room.get("online", True) is not False
+    if (not creator_in_room or not creator_online) and players:
+        online_p = next((p for p in players if p.get("online", True) is not False), None)
+        if online_p:
+            creator_id = online_p.get("id")
+        elif not creator_in_room:
+            creator_id = players[0].get("id")
     state["creatorId"] = creator_id
     state["hostId"] = creator_id
     for p in players:
@@ -497,6 +680,138 @@ def cleanup_presence(room_entry):
         room_entry["updatedAt"] = now
 
 
+def remove_player_from_room(code, target_pid, requester_pid, is_admin=False):
+    entry = ROOMS.get(str(code or "").upper())
+    if not entry or not entry.get("state"):
+        return {"ok": False, "status": 404, "error": "Sala não encontrada."}
+    st = entry["state"]
+    creator_id = st.get("creatorId") or st.get("hostId")
+    if not is_admin and requester_pid != creator_id:
+        return {"ok": False, "status": 403, "error": "Apenas o criador da sala ou o administrador pode remover jogadores."}
+    target = next((p for p in (st.get("players") or []) if p.get("id") == target_pid), None)
+    if not target:
+        return {"ok": False, "status": 404, "error": "Jogador não está nesta sala."}
+    if target_pid == creator_id and not is_admin:
+        return {"ok": False, "status": 400, "error": "O criador não pode remover a si mesmo."}
+
+    st["players"] = [p for p in (st.get("players") or []) if p.get("id") != target_pid]
+    entry.setdefault("heartbeats", {}).pop(target_pid, None)
+    kicked = st.setdefault("kickedPlayerIds", [])
+    if target_pid not in kicked:
+        kicked.append(target_pid)
+
+    ensure_authorized_creator(entry)
+    entry["updatedAt"] = time.time()
+    entry.setdefault("actions", []).append({
+        "id": f"act_kick_{int(time.time()*1000)}_{secrets.token_hex(3)}",
+        "type": "KICK_PLAYER",
+        "playerId": requester_pid or "ADMIN",
+        "targetPlayerId": target_pid,
+        "targetPlayerName": target.get("name"),
+        "ts": int(time.time() * 1000)
+    })
+    return {"ok": True, "status": 200, "removedPlayer": target, "state": st}
+
+
+def delete_player_account_admin(target_id_or_name):
+    clean = str(target_id_or_name or "").strip()
+    if not clean:
+        return {"ok": False, "status": 400, "error": "Informe o ID ou nickname da conta."}
+    rec = PLAYERS_DB.get(clean) or find_player_by_nickname(clean)
+    if not rec:
+        return {"ok": False, "status": 404, "error": "Conta não encontrada."}
+
+    deleted_id = rec["id"]
+    deleted_name = rec["name"]
+    deleted_chips = rec.get("chips", 0.0)
+
+    for r_entry in ROOMS.values():
+        st = r_entry.get("state")
+        if not st:
+            continue
+        if "players" in st:
+            st["players"] = [p for p in st["players"] if p.get("id") != deleted_id]
+        r_entry.setdefault("heartbeats", {}).pop(deleted_id, None)
+        race = st.get("race")
+        if race:
+            if "bets" in race:
+                race["bets"] = [b for b in race["bets"] if b.get("pid") != deleted_id]
+            if isinstance(race.get("exposures"), dict):
+                race["exposures"].pop(deleted_id, None)
+        ensure_authorized_creator(r_entry)
+        r_entry["updatedAt"] = time.time()
+
+    INVITES.pop(deleted_id.lower(), None)
+    INVITES.pop(str(deleted_name).strip().lower(), None)
+    PLAYERS_DB.pop(deleted_id, None)
+    save_players_db()
+
+    log_entry = append_admin_log(
+        "DELETE_ACCOUNT",
+        f"Conta excluída pelo Admin: {deleted_name} ({deleted_id}) · Saldo era {deleted_chips:.2f} fichas",
+        {
+            "targetPlayerId": deleted_id,
+            "targetName": deleted_name,
+            "deletedPlayerId": deleted_id,
+            "deletedPlayerName": deleted_name,
+            "deletedChips": deleted_chips
+        }
+    )
+    return {
+        "ok": True,
+        "status": 200,
+        "deletedPlayerId": deleted_id,
+        "deletedPlayer": {"id": deleted_id, "name": deleted_name, "chips": deleted_chips},
+        "logEntry": log_entry
+    }
+
+
+def list_active_rooms_for_spectator():
+    res = []
+    for code, entry in ROOMS.items():
+        cleanup_presence(entry)
+        st = entry.get("state")
+        if not st:
+            continue
+        players = [p for p in (st.get("players") or []) if not p.get("isSpectator")]
+        online_players = [p for p in players if p.get("online", True) is not False]
+        r = st.get("race")
+        status = "LOBBY"
+        if r:
+            if r.get("done") or r.get("cancelled"):
+                status = "FINISHED"
+            elif r.get("running"):
+                status = "IN_PROGRESS"
+            elif r.get("started"):
+                status = "PAUSED_BETTING"
+            else:
+                status = "PRE_RACE_BETTING"
+        creator = next((p for p in players if p.get("id") == (st.get("creatorId") or st.get("hostId"))), None)
+        res.append({
+            "code": code,
+            "creatorId": st.get("creatorId") or st.get("hostId"),
+            "creatorName": creator.get("name") if creator else "Host",
+            "circuitId": ((r or {}).get("circuit") or {}).get("id") or st.get("circuitId") or "int",
+            "circuitName": ((r or {}).get("circuit") or {}).get("name") or st.get("circuitId") or "Interlagos",
+            "circuitFlag": ((r or {}).get("circuit") or {}).get("flag") or "🏁",
+            "playersCount": len(players),
+            "onlineCount": len(online_players),
+            "totalPlayers": len(players),
+            "onlinePlayers": len(online_players),
+            "players": [{"id": p.get("id"), "name": p.get("name"), "avatarIcon": p.get("avatarIcon"), "color": p.get("color"), "online": p.get("online", True) is not False} for p in players],
+            "hasRace": bool(r),
+            "status": status,
+            "raceStatus": status,
+            "inProgress": bool(r and not r.get("done") and not r.get("cancelled")),
+            "running": bool(r and r.get("running")),
+            "lap": r.get("lap", 0) if r else 0,
+            "totalLaps": r.get("total", st.get("laps", 15)) if r else st.get("laps", 15),
+            "updatedAt": entry.get("updatedAt", 0)
+        })
+    res.sort(key=lambda x: (1 if x["inProgress"] else 0, x["updatedAt"]), reverse=True)
+    return res
+
+
 def process_server_place_bet(room_state, raw_bet, fallback_pid=None):
     if not room_state or not room_state.get("race"):
         return {"ok": False, "status": 400, "error": "Nenhuma corrida ativa na sala."}
@@ -513,7 +828,7 @@ def process_server_place_bet(room_state, raw_bet, fallback_pid=None):
     player_rec = PLAYERS_DB.get(pid)
     if not player_rec:
         room_pl = next((x for x in room_state.get("players", []) if x.get("id") == pid), None)
-        player_rec = upsert_player_record(room_pl or {"id": pid, "name": (raw_bet or {}).get("playerName", "Piloto"), "chips": INITIAL_CHIPS}, True)
+        player_rec = upsert_player_record(room_pl or {"id": pid, "name": (raw_bet or {}).get("playerName", "Piloto"), "chips": get_initial_chips()}, True, {"internalTrusted": True, "preserveExplicitChips": True})
     ensure_player_financial_fields(player_rec)
 
     bet_id = str((raw_bet or {}).get("id") or f"bet_{pid}_{race.get('id')}_{int(time.time()*1000)}_{secrets.token_hex(3)}")
@@ -552,7 +867,7 @@ def process_server_place_bet(room_state, raw_bet, fallback_pid=None):
             "ok": False,
             "status": 400,
             "code": "EXPOSURE_LIMIT_EXCEEDED",
-            "error": f"Limite de exposição de 10% excedido! Máximo na corrida: {exp['maxExposure']:.2f} fichas (Restante: {exp['remainingExposure']:.2f}).",
+            "error": f"Limite de exposição de 50% excedido! Máximo na corrida: {exp['maxExposure']:.2f} fichas (Restante: {exp['remainingExposure']:.2f}).",
             "exposure": exp
         }
 
@@ -656,7 +971,7 @@ def process_server_place_bet(room_state, raw_bet, fallback_pid=None):
     updated_exp = get_or_init_race_exposure(race, pid, player_rec["chips"])
     save_players_db()
     sync_room_player_balances(room_state)
-    return {"ok": True, "status": 200, "bet": confirmed_bet, "exposure": updated_exp, "player": player_rec}
+    return {"ok": True, "status": 200, "bet": confirmed_bet, "exposure": updated_exp, "player": sanitize_player_for_public(player_rec)}
 
 
 def process_server_cancel_bet(room_state, bet_id, pid):
@@ -698,7 +1013,7 @@ def process_server_cancel_bet(room_state, bet_id, pid):
 
     updated_exp = get_or_init_race_exposure(race, bet.get("pid"), player_rec["chips"]) if player_rec else None
     sync_room_player_balances(room_state)
-    return {"ok": True, "status": 200, "betId": bet_id, "exposure": updated_exp, "player": player_rec}
+    return {"ok": True, "status": 200, "betId": bet_id, "exposure": updated_exp, "player": sanitize_player_for_public(player_rec)}
 
 
 def evaluate_ticket_for_race_py(race, bet):
@@ -908,7 +1223,6 @@ def validate_incoming_room_state(existing_state, incoming_state, sender_pid):
         if old_race.get("oddsBook") and not new_race.get("oddsBook"):
             new_race["oddsBook"] = old_race["oddsBook"]
 
-        # Preserve immutable server-confirmed bets
         old_bets = old_race.get("bets") or []
         old_ids = {b.get("id") for b in old_bets if b and b.get("id")}
         merged_bets = list(old_bets)
@@ -916,6 +1230,12 @@ def validate_incoming_room_state(existing_state, incoming_state, sender_pid):
             if nb and nb.get("id") and nb["id"] not in old_ids:
                 merged_bets.append(nb)
         new_race["bets"] = merged_bets
+
+    if existing_state.get("kickedPlayerIds"):
+        kicked_set = set(existing_state["kickedPlayerIds"]) | set(incoming_state.get("kickedPlayerIds") or [])
+        incoming_state["kickedPlayerIds"] = list(kicked_set)
+        if "players" in incoming_state:
+            incoming_state["players"] = [p for p in incoming_state["players"] if p.get("id") not in kicked_set]
 
     return incoming_state, None
 
@@ -929,6 +1249,12 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
             return
         super().log_message(format, *args)
 
+    def _get_client_ip(self):
+        xff = self.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()
+        return str(self.client_address[0] if self.client_address else "127.0.0.1")
+
     def _send_json(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -936,8 +1262,8 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Token")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Token, X-Machine-Id, X-Auth-Token")
         self.end_headers()
         self.wfile.write(body)
 
@@ -963,15 +1289,67 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == "/api/health":
-            return self._send_json(200, {"ok": True, "server": "python", "modelVersion": MODEL_VERSION, "ts": time.time()})
+            return self._send_json(200, {
+                "ok": True,
+                "server": "python",
+                "modelVersion": MODEL_VERSION,
+                "initialChips": get_initial_chips(),
+                "exposureRate": EXPOSURE_RATE,
+                "ts": time.time()
+            })
+
+        if path == "/api/rooms":
+            with STATE_LOCK:
+                return self._send_json(200, {"ok": True, "rooms": list_active_rooms_for_spectator()})
+
+        if path == "/api/players/search":
+            q = str(qs.get("q", [""])[0] or "").strip().lower()
+            with STATE_LOCK:
+                res = [
+                    {"id": p["id"], "name": p["name"], "avatarId": p.get("avatarId", "av1"), "wins": p.get("wins", 0), "chips": p.get("chips", 0)}
+                    for p in PLAYERS_DB.values()
+                    if not q or q in str(p.get("name", "")).lower() or q in str(p.get("id", "")).lower()
+                ][:30]
+                return self._send_json(200, {"ok": True, "players": res})
+
+        if path == "/api/invites":
+            pid = str(qs.get("pid", [""])[0] or "").strip().lower()
+            name = str(qs.get("name", [""])[0] or "").strip().lower()
+            now_ms = int(time.time() * 1000)
+            collected = []
+            with STATE_LOCK:
+                for key in (pid, name):
+                    if not key:
+                        continue
+                    arr = [inv for inv in INVITES.get(key, []) if (now_ms - inv.get("ts", 0)) < 300000]
+                    INVITES[key] = arr
+                    for inv in arr:
+                        if not any(x.get("id") == inv.get("id") for x in collected):
+                            collected.append(inv)
+            return self._send_json(200, {"ok": True, "invites": collected})
+
+        if path == "/api/admin/config":
+            return self._send_json(200, {"ok": True, "initialChips": get_initial_chips(), "exposureRate": EXPOSURE_RATE})
 
         if path == "/api/admin/players":
             token = self._get_admin_token(qs=qs)
+            q = str(qs.get("q", [""])[0] or "").strip().lower()
             with STATE_LOCK:
                 if not verify_admin_token(token):
                     return self._send_json(401, {"ok": False, "error": "UNAUTHORIZED_ADMIN"})
-                players_list = sorted(list(PLAYERS_DB.values()), key=lambda x: x.get("updatedAt", 0), reverse=True)
-                return self._send_json(200, {"ok": True, "players": players_list})
+                players_list = sorted(
+                    [sanitize_player_for_public(ensure_player_financial_fields(p)) for p in PLAYERS_DB.values()],
+                    key=lambda x: x.get("updatedAt", 0),
+                    reverse=True
+                )
+                if q:
+                    players_list = [p for p in players_list if q in str(p.get("name", "")).lower() or q in str(p.get("id", "")).lower()]
+                return self._send_json(200, {
+                    "ok": True,
+                    "players": players_list,
+                    "initialChips": get_initial_chips(),
+                    "adminLogs": (SERVER_CONFIG.get("adminLogs") or [])[:50]
+                })
 
         if path.startswith("/api/player/"):
             parts = path.strip("/").split("/")
@@ -981,33 +1359,34 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                     rec = PLAYERS_DB.get(pid)
                     if not rec:
                         return self._send_json(404, {"ok": False, "error": "PLAYER_NOT_FOUND"})
-                    return self._send_json(200, {"ok": True, "player": ensure_player_financial_fields(rec)})
+                    return self._send_json(200, {"ok": True, "player": sanitize_player_for_public(ensure_player_financial_fields(rec))})
 
         if path.startswith("/api/room/"):
             parts = path.strip("/").split("/")
             if len(parts) >= 3:
                 code = parts[2].upper()
                 pid = qs.get("pid", [None])[0]
+                is_spectator = qs.get("spectator", ["0"])[0] == "1"
                 with STATE_LOCK:
                     entry = ROOMS.get(code)
                     if not entry:
                         return self._send_json(404, {"ok": False, "error": "ROOM_NOT_FOUND"})
-                    if pid:
-                        entry.setdefault("heartbeats", {})[pid] = time.time()
+                    if pid and not is_spectator:
                         if entry.get("state") and "players" in entry["state"]:
                             for p in entry["state"]["players"]:
                                 if p.get("id") == pid:
+                                    entry.setdefault("heartbeats", {})[pid] = time.time()
                                     p["online"] = True
                                     p["lastSeen"] = time.time()
                     cleanup_presence(entry)
                     st = entry["state"]
                     creator_id = st.get("creatorId") or st.get("hostId")
-                    is_host = (qs.get("host", ["0"])[0] == "1") and (not creator_id or pid == creator_id)
+                    is_host = (not is_spectator) and (qs.get("host", ["0"])[0] == "1") and (not creator_id or pid == creator_id)
                     actions = entry.get("actions", [])
                     drained = list(actions) if is_host else []
                     if is_host and actions:
                         entry["actions"] = []
-                    player_rec = PLAYERS_DB.get(pid) if pid else None
+                    player_rec = sanitize_player_for_public(PLAYERS_DB.get(pid)) if pid else None
                     return self._send_json(200, {
                         "ok": True,
                         "state": st,
@@ -1028,8 +1407,142 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             payload = {}
 
+        client_ip = self._get_client_ip()
+        hdr_machine = str(self.headers.get("X-Machine-Id", "")).strip()
+        hdr_auth = str(self.headers.get("X-Auth-Token", "")).strip()
+
+        if path == "/api/account/delete_self":
+            machine_id = str(payload.get("machineId") or hdr_machine or "").strip() or None
+            auth_token = str(payload.get("authToken") or hdr_auth or "").strip() or None
+            req_id = str(payload.get("playerId") or "").strip()
+            with STATE_LOCK:
+                target_rec = PLAYERS_DB.get(req_id) if req_id else None
+                if not target_rec and machine_id:
+                    target_rec = find_account_for_machine(machine_id, client_ip)
+                if not target_rec:
+                    return self._send_json(200, {"ok": True, "deleted": False, "initialChips": get_initial_chips()})
+                is_owner = (
+                    (not target_rec.get("machineId") and not target_rec.get("authToken"))
+                    or (machine_id and target_rec.get("machineId") == machine_id)
+                    or (auth_token and target_rec.get("authToken") == auth_token)
+                    or (target_rec.get("clientIp") and target_rec.get("clientIp") == client_ip)
+                )
+                if not is_owner:
+                    return self._send_json(403, {"ok": False, "error": "Você só pode excluir o perfil vinculado ao seu próprio dispositivo."})
+                del_res = delete_player_account_admin(target_rec["id"])
+                return self._send_json(200, {
+                    "ok": True,
+                    "deleted": True,
+                    "deletedPlayerId": target_rec["id"],
+                    "deletedPlayer": del_res.get("deletedPlayer"),
+                    "initialChips": get_initial_chips()
+                })
+
+        if path == "/api/admin/purge_non_protected":
+            token = self._get_admin_token(payload)
+            with STATE_LOCK:
+                if not verify_admin_token(token):
+                    return self._send_json(401, {"ok": False, "error": "Acesso negado."})
+                purge_res = purge_non_protected_accounts()
+                log_entry = append_admin_log(
+                    "PURGE_NON_PROTECTED",
+                    f"Admin resetou todas as contas exceto LX/LXZADA e naoc7k/N7K (Mantidas: {len(purge_res['kept'])}, Excluídas: {len(purge_res['removed'])})"
+                )
+                players_list = sorted(
+                    [sanitize_player_for_public(ensure_player_financial_fields(p)) for p in PLAYERS_DB.values()],
+                    key=lambda x: x.get("updatedAt", 0),
+                    reverse=True
+                )
+                return self._send_json(200, {
+                    "ok": True,
+                    "kept": purge_res["kept"],
+                    "removed": purge_res["removed"],
+                    "players": players_list,
+                    "logEntry": log_entry,
+                    "adminLogs": (SERVER_CONFIG.get("adminLogs") or [])[:50]
+                })
+
+        if path == "/api/account/init":
+            machine_id = str(payload.get("machineId") or hdr_machine or f"ip_{client_ip}").strip()
+            auth_token = str(payload.get("authToken") or hdr_auth or "").strip() or None
+            p_in = payload.get("player") or {}
+            requested_id = str(p_in.get("id") or payload.get("playerId") or "").strip()
+            create_new = bool(payload.get("createNew"))
+
+            with STATE_LOCK:
+                existing_for_machine = find_account_for_machine(machine_id, client_ip)
+                if create_new and existing_for_machine:
+                    return self._send_json(409, {
+                        "ok": False,
+                        "code": "ACCOUNT_LIMIT_PER_MACHINE",
+                        "error": f"Já existe uma conta registrada para este dispositivo ({existing_for_machine['name']}). Apenas uma conta por máquina é permitida.",
+                        "player": existing_for_machine
+                    })
+                if existing_for_machine:
+                    ensure_player_financial_fields(existing_for_machine)
+                    if p_in.get("name") and (not existing_for_machine.get("authToken") or existing_for_machine.get("authToken") == auth_token):
+                        existing_for_machine["name"] = str(p_in["name"]).strip()[:24] or existing_for_machine["name"]
+                        if p_in.get("avatarId"):
+                            existing_for_machine["avatarId"] = str(p_in["avatarId"])
+                        save_players_db()
+                    return self._send_json(200, {
+                        "ok": True,
+                        "player": existing_for_machine,
+                        "initialChips": get_initial_chips(),
+                        "boundToMachine": True
+                    })
+
+                new_p = p_in or {
+                    "id": requested_id or f"usr_{int(time.time()*1000)}_{secrets.token_hex(3)}",
+                    "name": payload.get("name") or f"Piloto {len(PLAYERS_DB) + 1}",
+                    "avatarId": payload.get("avatarId") or "av1",
+                    "chips": get_initial_chips()
+                }
+                if not new_p.get("id"):
+                    new_p["id"] = requested_id or f"usr_{int(time.time()*1000)}_{secrets.token_hex(3)}"
+                created = upsert_player_record(new_p, False, {"machineId": machine_id, "clientIp": client_ip, "authToken": auth_token})
+                return self._send_json(200, {
+                    "ok": True,
+                    "player": created,
+                    "initialChips": get_initial_chips(),
+                    "boundToMachine": True
+                })
+
+        if path == "/api/invites/send":
+            room_code = str(payload.get("roomCode") or "").strip().upper()
+            from_name = str(payload.get("fromName") or "Jogador").strip()
+            from_id = str(payload.get("fromId") or "").strip()
+            target_nick = str(payload.get("targetNickname") or "").strip()
+            with STATE_LOCK:
+                if not room_code or room_code not in ROOMS:
+                    return self._send_json(404, {"ok": False, "error": "Sala não encontrada no servidor."})
+                if not target_nick:
+                    return self._send_json(400, {"ok": False, "error": "Informe o nickname do jogador."})
+                target_rec = find_player_by_nickname(target_nick)
+                target_key = target_rec["name"].lower() if target_rec else target_nick.lower()
+                inv_obj = {
+                    "id": f"inv_{int(time.time()*1000)}_{secrets.token_hex(3)}",
+                    "roomCode": room_code,
+                    "fromId": from_id,
+                    "fromName": from_name,
+                    "targetNickname": target_rec["name"] if target_rec else target_nick,
+                    "targetPlayerId": target_rec["id"] if target_rec else None,
+                    "ts": int(time.time() * 1000)
+                }
+                INVITES.setdefault(target_key, []).insert(0, inv_obj)
+                if target_rec:
+                    INVITES.setdefault(target_rec["id"].lower(), []).insert(0, inv_obj)
+                return self._send_json(200, {"ok": True, "invite": inv_obj, "foundRegisteredPlayer": bool(target_rec)})
+
+        if path == "/api/invites/dismiss":
+            inv_id = str(payload.get("inviteId") or "").strip()
+            with STATE_LOCK:
+                for k in list(INVITES.keys()):
+                    INVITES[k] = [x for x in INVITES[k] if x.get("id") != inv_id]
+            return self._send_json(200, {"ok": True})
+
         if path == "/api/admin/login":
-            login = str(payload.get("login") or "").strip()
+            login = str(payload.get("login") or "").strip().upper()
             password = str(payload.get("password") or "")
             pw_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
             if not (hmac.compare_digest(login, ADMIN_LOGIN) and hmac.compare_digest(pw_hash, ADMIN_PASSWORD_HASH)):
@@ -1037,14 +1550,74 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
             token = secrets.token_hex(24)
             with STATE_LOCK:
                 ADMIN_TOKENS[token] = time.time() + 86400
-                players_list = sorted(list(PLAYERS_DB.values()), key=lambda x: x.get("updatedAt", 0), reverse=True)
-            return self._send_json(200, {"ok": True, "token": token, "admin": ADMIN_LOGIN, "players": players_list})
+                players_list = sorted(
+                    [sanitize_player_for_public(ensure_player_financial_fields(p)) for p in PLAYERS_DB.values()],
+                    key=lambda x: x.get("updatedAt", 0),
+                    reverse=True
+                )
+            return self._send_json(200, {
+                "ok": True,
+                "token": token,
+                "admin": ADMIN_LOGIN,
+                "players": players_list,
+                "initialChips": get_initial_chips(),
+                "adminLogs": (SERVER_CONFIG.get("adminLogs") or [])[:50]
+            })
 
         if path == "/api/admin/logout":
             token = self._get_admin_token(payload)
             with STATE_LOCK:
                 ADMIN_TOKENS.pop(token, None)
             return self._send_json(200, {"ok": True})
+
+        if path == "/api/admin/config":
+            token = self._get_admin_token(payload)
+            with STATE_LOCK:
+                if not verify_admin_token(token):
+                    return self._send_json(401, {"ok": False, "error": "Acesso negado."})
+                try:
+                    new_init = r2(payload.get("initialChips", -1))
+                except Exception:
+                    new_init = -1
+                if new_init < 0:
+                    return self._send_json(400, {"ok": False, "error": "Valor inicial inválido."})
+                old_init = get_initial_chips()
+                SERVER_CONFIG["initialChips"] = new_init
+                SERVER_CONFIG["updatedAt"] = time.time()
+                save_server_config()
+                log_entry = append_admin_log(
+                    "UPDATE_INITIAL_CHIPS",
+                    f"Admin alterou o saldo inicial padrão de {old_init:.2f} para {new_init:.2f} fichas",
+                    {"oldInitialChips": old_init, "newInitialChips": new_init}
+                )
+                return self._send_json(200, {
+                    "ok": True,
+                    "initialChips": new_init,
+                    "logEntry": log_entry,
+                    "adminLogs": (SERVER_CONFIG.get("adminLogs") or [])[:50]
+                })
+
+        if path == "/api/admin/delete_player":
+            token = self._get_admin_token(payload)
+            with STATE_LOCK:
+                if not verify_admin_token(token):
+                    return self._send_json(401, {"ok": False, "error": "Acesso negado."})
+                target = payload.get("playerId") or payload.get("nickname")
+                del_res = delete_player_account_admin(target)
+                if not del_res.get("ok"):
+                    return self._send_json(del_res.get("status", 400), del_res)
+                players_list = sorted(
+                    [sanitize_player_for_public(ensure_player_financial_fields(p)) for p in PLAYERS_DB.values()],
+                    key=lambda x: x.get("updatedAt", 0),
+                    reverse=True
+                )
+                return self._send_json(200, {
+                    "ok": True,
+                    "deletedPlayer": del_res["deletedPlayer"],
+                    "logEntry": del_res["logEntry"],
+                    "players": players_list,
+                    "adminLogs": (SERVER_CONFIG.get("adminLogs") or [])[:50]
+                })
 
         if path == "/api/admin/balance":
             token = self._get_admin_token(payload)
@@ -1056,12 +1629,12 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                 amount = r2(payload.get("amount", 0))
                 if amount < 0:
                     return self._send_json(400, {"ok": False, "error": "O valor não pode ser negativo."})
-                rec = PLAYERS_DB.get(target_id)
+                rec = PLAYERS_DB.get(target_id) or find_player_by_nickname(target_id)
                 if not rec:
                     return self._send_json(404, {"ok": False, "error": "Jogador não encontrado."})
 
                 ensure_player_financial_fields(rec)
-                old_chips = r2(rec.get("chips", INITIAL_CHIPS))
+                old_chips = r2(rec.get("chips", get_initial_chips()))
                 if op == "add":
                     new_chips = r2(old_chips + amount)
                     op_label = f"Admin adicionou +{amount:.2f} fichas"
@@ -1089,27 +1662,39 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                     "ts": time.time()
                 }
                 record_server_tx(rec, "tx_" + adm_id, "ADMIN_ADD" if new_chips >= old_chips else "ADMIN_REMOVE", "Ajuste Administrativo", op_label, r2(new_chips - old_chips))
+                append_admin_log("BALANCE_" + op.upper(), f"{rec['name']} ({rec['id']}): {op_label}")
                 save_players_db()
 
                 for r_entry in ROOMS.values():
                     st = r_entry.get("state")
                     if st and "players" in st:
                         for rp in st["players"]:
-                            if rp.get("id") == target_id:
+                            if rp.get("id") == rec["id"]:
                                 rp["chips"] = new_chips
                                 rp["balanceVersion"] = rec["balanceVersion"]
                                 r_entry["updatedAt"] = time.time()
 
-                players_list = sorted(list(PLAYERS_DB.values()), key=lambda x: x.get("updatedAt", 0), reverse=True)
-                return self._send_json(200, {"ok": True, "player": rec, "players": players_list})
+                players_list = sorted(
+                    [sanitize_player_for_public(ensure_player_financial_fields(p)) for p in PLAYERS_DB.values()],
+                    key=lambda x: x.get("updatedAt", 0),
+                    reverse=True
+                )
+                return self._send_json(200, {
+                    "ok": True,
+                    "player": sanitize_player_for_public(rec),
+                    "players": players_list,
+                    "adminLogs": (SERVER_CONFIG.get("adminLogs") or [])[:50]
+                })
 
         if path == "/api/player/sync":
             p_obj = payload.get("player") or payload
+            machine_id = str(payload.get("machineId") or p_obj.get("machineId") or hdr_machine or "").strip() or None
+            auth_token = str(payload.get("authToken") or p_obj.get("authToken") or hdr_auth or "").strip() or None
             with STATE_LOCK:
-                rec = upsert_player_record(p_obj, allow_initial_seed=True)
+                rec = upsert_player_record(p_obj, allow_initial_seed=False, client_meta={"machineId": machine_id, "clientIp": client_ip, "authToken": auth_token})
                 if not rec:
                     return self._send_json(400, {"ok": False, "error": "INVALID_PLAYER"})
-                return self._send_json(200, {"ok": True, "player": rec})
+                return self._send_json(200, {"ok": True, "player": rec, "initialChips": get_initial_chips()})
 
         if path.startswith("/api/room/"):
             parts = path.strip("/").split("/")
@@ -1122,9 +1707,12 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                         state = payload.get("state")
                         if not state:
                             return self._send_json(400, {"ok": False, "error": "INVALID_STATE"})
+                        if "players" in state:
+                            state["players"] = [p for p in state["players"] if p and not p.get("isSpectator")]
                         pid = payload.get("pid")
                         existing_entry = ROOMS.get(code)
                         if existing_entry and existing_entry.get("state"):
+                            cleanup_presence(existing_entry)
                             validated_state, err = validate_incoming_room_state(existing_entry["state"], state, pid)
                             if err == "UNAUTHORIZED_NOT_CREATOR":
                                 return self._send_json(403, {"ok": False, "error": err, "state": existing_entry["state"]})
@@ -1136,8 +1724,11 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                             hbs[pid] = now
 
                         for p in state.get("players", []):
+                            if p.get("isSpectator"):
+                                continue
                             p_id = p.get("id")
-                            upsert_player_record(p, allow_initial_seed=True)
+                            if p_id not in PLAYERS_DB:
+                                upsert_player_record(p, allow_initial_seed=True, client_meta={"internalTrusted": True, "preserveExplicitChips": True})
                             if p_id in hbs and (now - hbs[p_id]) < 8.5:
                                 p["online"] = True
                             elif p_id not in hbs:
@@ -1154,6 +1745,14 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                         drained = list(entry.get("actions", []))
                         entry["actions"] = []
                         return self._send_json(200, {"ok": True, "actions": drained, "state": entry["state"]})
+
+                    elif op == "kick":
+                        token = self._get_admin_token(payload)
+                        is_admin = verify_admin_token(token)
+                        kick_res = remove_player_from_room(code, payload.get("targetPlayerId"), payload.get("playerId"), is_admin)
+                        if not kick_res.get("ok"):
+                            return self._send_json(kick_res.get("status", 400), kick_res)
+                        return self._send_json(200, kick_res)
 
                     elif op == "bet":
                         entry = ROOMS.get(code)
@@ -1209,8 +1808,13 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                         act_type = action.get("type")
                         pid = action.get("playerId") or (action.get("player") or {}).get("id")
 
-                        if action.get("player"):
-                            upsert_player_record(action["player"], allow_initial_seed=True)
+                        if action.get("isSpectator") or (action.get("player") or {}).get("isSpectator"):
+                            if not entry:
+                                return self._send_json(404, {"ok": False, "error": "ROOM_NOT_FOUND"})
+                            return self._send_json(200, {"ok": True, "state": entry["state"]})
+
+                        if action.get("player") and action["player"].get("id") not in PLAYERS_DB:
+                            upsert_player_record(action["player"], allow_initial_seed=True, client_meta={"clientIp": client_ip, "machineId": hdr_machine})
 
                         if not entry:
                             if act_type == "CREATE_ROOM" and action.get("state"):
@@ -1228,9 +1832,6 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                                 return self._send_json(200, {"ok": True, "state": st})
                             return self._send_json(404, {"ok": False, "error": "ROOM_NOT_FOUND"})
 
-                        if pid:
-                            entry.setdefault("heartbeats", {})[pid] = now
-
                         st = entry.get("state")
                         creator_id = st.get("creatorId") or st.get("hostId") if st else None
 
@@ -1240,9 +1841,14 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                         if st and "players" in st:
                             if act_type == "JOIN_ROOM" and action.get("player"):
                                 pl = action["player"]
+                                if pl.get("isSpectator"):
+                                    return self._send_json(200, {"ok": True, "state": entry["state"]})
+                                if isinstance(st.get("kickedPlayerIds"), list):
+                                    st["kickedPlayerIds"] = [x for x in st["kickedPlayerIds"] if x != pl.get("id")]
                                 pl["online"] = True
                                 pl["lastSeen"] = now
-                                rec = upsert_player_record(pl, allow_initial_seed=True)
+                                entry.setdefault("heartbeats", {})[pl.get("id")] = now
+                                rec = PLAYERS_DB.get(pl.get("id")) or upsert_player_record(pl, allow_initial_seed=True, client_meta={"clientIp": client_ip, "machineId": hdr_machine})
                                 if rec:
                                     pl["chips"] = rec["chips"]
                                     pl["balanceVersion"] = rec["balanceVersion"]
@@ -1264,7 +1870,17 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                                 ensure_authorized_creator(entry)
                                 entry["updatedAt"] = now
 
+                            elif act_type == "KICK_PLAYER" and action.get("targetPlayerId"):
+                                token = self._get_admin_token(payload)
+                                is_admin = verify_admin_token(token)
+                                kick_res = remove_player_from_room(code, action["targetPlayerId"], pid, is_admin)
+                                if not kick_res.get("ok"):
+                                    return self._send_json(kick_res.get("status", 400), kick_res)
+                                return self._send_json(200, {"ok": True, "state": entry["state"]})
+
                             elif act_type == "PLACE_BET" and action.get("bet"):
+                                if pid:
+                                    entry.setdefault("heartbeats", {})[pid] = now
                                 res_bet = process_server_place_bet(st, action["bet"], pid)
                                 if not res_bet.get("ok"):
                                     return self._send_json(res_bet.get("status", 400), res_bet)
@@ -1273,6 +1889,8 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                                 action["balanceVersion"] = res_bet["player"]["balanceVersion"]
 
                             elif act_type == "CANCEL_BET" and action.get("betId"):
+                                if pid:
+                                    entry.setdefault("heartbeats", {})[pid] = now
                                 res_cancel = process_server_cancel_bet(st, action["betId"], pid)
                                 if not res_cancel.get("ok"):
                                     return self._send_json(res_cancel.get("status", 400), res_cancel)
@@ -1285,6 +1903,7 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                                 for x in st["players"]:
                                     if x.get("id") == pid:
                                         x["online"] = False
+                                ensure_authorized_creator(entry)
                                 entry["updatedAt"] = now
 
                             elif act_type == "LEAVE_ROOM" and pid:
@@ -1293,9 +1912,12 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                                 ensure_authorized_creator(entry)
                                 entry["updatedAt"] = now
 
+                            elif pid and any(x.get("id") == pid for x in st["players"]):
+                                entry.setdefault("heartbeats", {})[pid] = now
+
                         entry.setdefault("actions", []).append(action)
                         cleanup_presence(entry)
-                        me = PLAYERS_DB.get(pid) if pid else None
+                        me = sanitize_player_for_public(PLAYERS_DB.get(pid)) if pid else None
                         return self._send_json(200, {"ok": True, "state": entry["state"], "me": me})
 
         return self._send_json(404, {"ok": False, "error": "NOT_FOUND"})

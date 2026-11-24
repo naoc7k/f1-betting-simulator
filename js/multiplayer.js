@@ -18,6 +18,7 @@
       this.roomCode = null;
       this.playerId = null;
       this.isHost = false;
+      this.isSpectator = false;
       this.backendAvailable = false;
       this.peerConnected = false;
       this.wsConnected = false;
@@ -82,7 +83,7 @@
       });
 
       window.addEventListener('beforeunload', () => {
-        if (this.roomCode && this.playerId) {
+        if (this.roomCode && this.playerId && !this.isSpectator) {
           this.sendAction({
             id: 'act_disc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
             type: 'DISCONNECT',
@@ -132,13 +133,14 @@
       }
     }
 
-    async connectRoom(code, playerId, isHost, initialState = null) {
+    async connectRoom(code, playerId, isHost, initialState = null, isSpectator = false) {
       this.disconnectRoom();
       this.roomCode = String(code).trim().toUpperCase();
       this.playerId = playerId;
-      this.isHost = !!isHost;
+      this.isHost = !isSpectator && !!isHost;
+      this.isSpectator = !!isSpectator;
 
-      if (this.isHost && initialState) {
+      if (this.isHost && initialState && !this.isSpectator) {
         this._saveLocalRoomState(initialState);
         if (this.backendAvailable) {
           try {
@@ -155,13 +157,13 @@
       this._connectWebSocketRelay();
       this._startPollingAndHeartbeat();
 
-      // If joining as guest, immediately check local storage & backend
+      // If joining as guest or spectator, immediately check local storage & backend
       if (!this.isHost) {
         const cached = this._loadLocalRoomState(this.roomCode);
         if (cached && typeof this.onStateUpdate === 'function') {
           this.onStateUpdate(cached, 'local_cache');
         }
-        this._broadcastEnvelope({ type: 'REQUEST_STATE', code: this.roomCode, senderId: this.playerId });
+        this._broadcastEnvelope({ type: 'REQUEST_STATE', code: this.roomCode, senderId: this.playerId, isSpectator: this.isSpectator });
       }
     }
 
@@ -189,6 +191,7 @@
       }
       this.peerConnected = false;
       this.wsConnected = false;
+      this.isSpectator = false;
       this.roomCode = null;
     }
 
@@ -337,21 +340,22 @@
         if (!this.roomCode) return;
         if (this.backendAvailable) {
           try {
-            const res = await fetch(`/api/room/${this.roomCode}?pid=${encodeURIComponent(this.playerId)}&host=${this.isHost ? '1' : '0'}`, {
+            const specFlag = this.isSpectator ? '&spectator=1' : '';
+            const res = await fetch(`/api/room/${this.roomCode}?pid=${encodeURIComponent(this.playerId)}&host=${this.isHost ? '1' : '0'}${specFlag}`, {
               cache: 'no-store'
             });
             if (res.ok) {
               const data = await res.json();
               if (data && data.ok) {
-                if (data.me && typeof this.onServerMeUpdate === 'function') {
+                if (!this.isSpectator && data.me && typeof this.onServerMeUpdate === 'function') {
                   this.onServerMeUpdate(data.me);
                 }
-                if (Array.isArray(data.actions)) {
+                if (!this.isSpectator && Array.isArray(data.actions)) {
                   for (const act of data.actions) {
                     this._handleEnvelope({ type: 'ACTION', code: this.roomCode, action: act, senderId: act.playerId }, 'api');
                   }
                 }
-                if (!this.isHost && data.state) {
+                if ((!this.isHost || this.isSpectator) && data.state) {
                   this._handleEnvelope({ type: 'STATE', code: this.roomCode, state: data.state }, 'api');
                 }
               }
@@ -362,7 +366,7 @@
     }
 
     broadcastState(state, tickOnly = false) {
-      if (!this.roomCode || !state) return;
+      if (!this.roomCode || !state || this.isSpectator) return;
       this._saveLocalRoomState(state);
 
       const env = {
@@ -395,7 +399,7 @@
     }
 
     sendAction(action, isUnload = false) {
-      if (!this.roomCode || !action) return;
+      if (!this.roomCode || !action || this.isSpectator) return;
       if (!action.id) {
         action.id = 'act_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
       }

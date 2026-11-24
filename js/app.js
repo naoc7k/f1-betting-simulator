@@ -17,9 +17,24 @@
   const ACCOUNTS_STORAGE_KEY = 'f1bs_accounts_v2';
   const LAST_ACCOUNT_KEY = 'f1bs_last_account_id_v2';
   const TAB_ACCOUNT_KEY = 'f1bs_tab_account_id_v2';
+  const MACHINE_ID_KEY = 'f1bs_machine_id_v2';
+  const AUTH_TOKEN_KEY = 'f1bs_auth_token_v2';
+  const CONFIG_INITIAL_CHIPS_KEY = 'f1bs_initial_chips_cfg_v2';
   const GLOBAL_HISTORY_KEY = 'f1bs_history_v2';
   const ACTIVE_ROOM_KEY = 'f1bs_active_room_code_v2';
   const ADMIN_TOKEN_KEY = 'f1bs_admin_token_v2';
+  const PURGE_MIGRATION_KEY = 'f1bs_purge_v42_lx_n7k_done';
+
+  function isProtectedAccountName(name) {
+    const raw = String(name || '').trim().toLowerCase();
+    if (!raw) return false;
+    const compact = raw.replace(/[\s_\-\.]/g, '');
+    if (compact === 'lx' || compact === 'lxz' || compact === 'lxzada') return true;
+    if (compact.includes('lxzada') || compact.startsWith('lxz') || /^lx[0-9_]*$/.test(raw)) return true;
+    if (compact === 'naoc7k' || compact === 'n7k' || compact === 'naoc') return true;
+    if (compact.includes('naoc7k') || compact.includes('n7k')) return true;
+    return false;
+  }
 
   const TYRES = {
     S: { p: -0.5, d: 0.07, l: 14, name: 'Macio (S)' },
@@ -32,10 +47,15 @@
   const S = {
     view: 'home',
     profileModalOpen: false,
+    confirmSelfDeleteOpen: false,
     profileDraftName: '',
     profileDraftAvatar: 'av1',
+    machineId: null,
+    initialChipsConfig: INITIAL_CHIPS,
     user: null, // Persistent player profile { id, name, avatarId, chips, balanceVersion, wins, losses, raceExposures, cashbox, settledBets }
     room: null, // Synchronized room { code, hostId, creatorId, circuitId, laps, wxMode, grid, players, race }
+    pendingInvites: [],
+    inviteTargetNickname: '',
     betTab: 'overtake',       // 'overtake' | 'placement'
     selectedBetDriver: 'VER',
     selectedBetMarket: 'P1',  // 'P1' | 'P2' | 'P3' | 'PODIUM' | 'TOP5' | 'TOP10'
@@ -43,6 +63,10 @@
     betInFlight: false,       // Mutex against simultaneous double-click / concurrent bet requests
     highlightedDriver: null,
     spectator: false,
+    spectatingOnly: false,    // True when watching a room solely as a spectator (not a participant)
+    spectatorRoomsList: [],
+    spectatorPollTimer: null,
+    invitePollTimer: null,
     history: [],
     champ: { d: {}, t: {}, n: 0 },
     connStatus: { backend: false, webrtc: false, ws: false, local: true },
@@ -54,6 +78,8 @@
       authenticated: false,
       loginName: '',
       players: [],
+      adminLogs: [],
+      initialChipsDraft: INITIAL_CHIPS,
       loading: false,
       searchQuery: ''
     },
@@ -103,17 +129,56 @@
     } catch (e) {}
   }
 
+  function getOrCreateMachineId() {
+    if (S.machineId) return S.machineId;
+    try {
+      let mid = localStorage.getItem(MACHINE_ID_KEY);
+      if (!mid) {
+        const navSig = [
+          navigator.userAgent || '',
+          navigator.language || '',
+          (screen && screen.width) || 0,
+          (screen && screen.height) || 0,
+          Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+        ].join('|');
+        const h = FIN.hashStr(navSig).toString(36);
+        mid = 'mch_' + h + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+        localStorage.setItem(MACHINE_ID_KEY, mid);
+      }
+      S.machineId = mid;
+      return mid;
+    } catch (e) {
+      S.machineId = 'mch_fallback_' + Math.random().toString(36).slice(2, 10);
+      return S.machineId;
+    }
+  }
+
+  function getConfiguredInitialChips() {
+    try {
+      const saved = localStorage.getItem(CONFIG_INITIAL_CHIPS_KEY);
+      if (saved !== null && !isNaN(+saved) && +saved >= 0) {
+        S.initialChipsConfig = r2(+saved);
+      }
+    } catch (e) {}
+    return r2(S.initialChipsConfig !== undefined ? S.initialChipsConfig : INITIAL_CHIPS);
+  }
+
   function createDefaultAccount(name = 'Piloto 1', avatarId = 'av1', customId = null) {
     const id = customId || ('usr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7));
+    const initChips = getConfiguredInitialChips();
+    const mid = getOrCreateMachineId();
     return {
       id,
       name: name.trim() || 'Piloto',
       avatarId: avatarId || 'av1',
-      chips: INITIAL_CHIPS,
+      chips: initChips,
       balanceVersion: 1,
       initial100Applied: true,
+      machineId: mid,
       wins: 0,
+      losses: 0,
       settledBets: {},
+      raceExposures: {},
       cashbox: {
         totalBet: 0,
         totalWon: 0,
@@ -177,37 +242,74 @@
   async function syncPlayerWithBackend(userObj) {
     if (!userObj || location.protocol === 'file:') return;
     try {
+      const mid = getOrCreateMachineId();
+      const authToken = userObj.authToken || localStorage.getItem(AUTH_TOKEN_KEY) || '';
       const res = await fetch('/api/player/sync', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Machine-Id': mid,
+          'X-Auth-Token': authToken
+        },
         body: JSON.stringify({
+          machineId: mid,
+          authToken,
           player: {
             id: userObj.id,
             name: userObj.name,
             avatarId: userObj.avatarId,
             chips: userObj.chips,
             wins: userObj.wins || 0,
-            balanceVersion: userObj.balanceVersion || 1
+            balanceVersion: userObj.balanceVersion || 1,
+            machineId: mid,
+            authToken
           }
         })
       });
       if (res.ok) {
         const data = await res.json();
-        if (data && data.ok && data.player) {
-          applyAuthoritativeServerPlayerRecord(data.player);
+        if (data && data.ok) {
+          if (typeof data.initialChips === 'number') {
+            S.initialChipsConfig = r2(data.initialChips);
+            S.admin.initialChipsDraft = S.initialChipsConfig;
+            try { localStorage.setItem(CONFIG_INITIAL_CHIPS_KEY, String(S.initialChipsConfig)); } catch (e) {}
+          }
+          if (data.player) {
+            if (data.player.authToken) {
+              userObj.authToken = data.player.authToken;
+              try { localStorage.setItem(AUTH_TOKEN_KEY, data.player.authToken); } catch (e) {}
+            }
+            applyAuthoritativeServerPlayerRecord(data.player);
+          }
         }
       }
     } catch (e) {}
   }
 
   function applyAuthoritativeServerPlayerRecord(srvRec) {
-    if (!srvRec || !S.user || srvRec.id !== S.user.id) return;
+    if (!srvRec || !S.user) return;
+    // Requirement 1: If server bound this machine to its authoritative account, adopt that account ID and token!
+    if (srvRec.id && srvRec.id !== S.user.id && srvRec.machineId === getOrCreateMachineId()) {
+      const map = loadAccountsMap();
+      delete map[S.user.id];
+      S.user = ensureAccountIntegrity(Object.assign({}, S.user, srvRec));
+      map[S.user.id] = S.user;
+      saveAccountsMap(map);
+      saveCurrentUser(true, false);
+      render();
+      return;
+    }
+    if (srvRec.id !== S.user.id) return;
+    if (srvRec.authToken) {
+      S.user.authToken = srvRec.authToken;
+      try { localStorage.setItem(AUTH_TOKEN_KEY, srvRec.authToken); } catch (e) {}
+    }
     const srvVer = Number(srvRec.balanceVersion || 1);
     const myVer = Number(S.user.balanceVersion || 1);
-    if (srvVer > myVer) {
+    if (srvVer > myVer || Math.abs(r2(srvRec.chips) - r2(S.user.chips)) > 0.01) {
       const diff = r2(srvRec.chips - S.user.chips);
       S.user.chips = r2(srvRec.chips);
-      S.user.balanceVersion = srvVer;
+      S.user.balanceVersion = Math.max(srvVer, myVer);
       if (srvRec.lastAdminOp && srvRec.lastAdminOp.id) {
         recordFinancialTx(
           'tx_' + srvRec.lastAdminOp.id,
@@ -234,51 +336,104 @@
   };
 
   function initUserAuth() {
-    const map = loadAccountsMap();
-    let tabAccId = null;
+    const mid = getOrCreateMachineId();
+    let map = loadAccountsMap();
     let lastAccId = null;
     try {
-      tabAccId = sessionStorage.getItem(TAB_ACCOUNT_KEY);
       lastAccId = localStorage.getItem(LAST_ACCOUNT_KEY);
     } catch (e) {}
 
-    // Migrate any existing local accounts with untouched 25000 chips to 100
-    let mapChanged = false;
-    Object.values(map).forEach(acc => {
-      const prevChips = acc.chips;
-      ensureAccountIntegrity(acc);
-      if (acc.chips !== prevChips) mapChanged = true;
-    });
-    if (mapChanged) saveAccountsMap(map);
-
-    const urlParams = new URLSearchParams(window.location.search);
-    const forceNewPlayer = urlParams.get('newplayer') === '1';
-
-    if (!forceNewPlayer && tabAccId && map[tabAccId]) {
-      S.user = ensureAccountIntegrity(map[tabAccId]);
-    } else if (!forceNewPlayer && lastAccId && map[lastAccId]) {
-      S.user = ensureAccountIntegrity(map[lastAccId]);
-      try { sessionStorage.setItem(TAB_ACCOUNT_KEY, S.user.id); } catch (e) {}
-    } else {
-      const existingIds = Object.keys(map);
-      if (!forceNewPlayer && existingIds.length > 0) {
-        S.user = ensureAccountIntegrity(map[existingIds[0]]);
-        saveCurrentUser(true, false);
-      } else {
-        const num = existingIds.length + 1;
-        const defAv = AVATARS[(num - 1) % AVATARS.length].id;
-        S.user = createDefaultAccount(`Piloto ${num}`, defAv);
-        saveCurrentUser(!forceNewPlayer, false);
+    // Reset/Purge migration: clear all secondary or bugged local accounts EXCEPT LX/LXZADA (and similar) and naoc7k / N7K
+    try {
+      if (!localStorage.getItem(PURGE_MIGRATION_KEY)) {
+        const filteredMap = {};
+        let keptId = null;
+        for (const [id, acc] of Object.entries(map)) {
+          if (acc && isProtectedAccountName(acc.name)) {
+            filteredMap[id] = acc;
+            if (!keptId) keptId = id;
+          }
+        }
+        map = filteredMap;
+        saveAccountsMap(map);
+        if (keptId) {
+          lastAccId = keptId;
+          localStorage.setItem(LAST_ACCOUNT_KEY, keptId);
+          sessionStorage.setItem(TAB_ACCOUNT_KEY, keptId);
+        } else {
+          lastAccId = null;
+          localStorage.removeItem(LAST_ACCOUNT_KEY);
+          localStorage.removeItem(AUTH_TOKEN_KEY);
+          sessionStorage.removeItem(TAB_ACCOUNT_KEY);
+          sessionStorage.removeItem(ACTIVE_ROOM_KEY);
+        }
+        localStorage.setItem(PURGE_MIGRATION_KEY, '1');
       }
+    } catch (e) {}
+
+    // Migrate any existing local accounts with untouched 25000 chips to 100
+    const allIds = Object.keys(map);
+    if (allIds.length > 0) {
+      // Requirement 1: Enforce 1 account per machine. Pick the primary account bound to this machine.
+      const primaryId = (lastAccId && map[lastAccId]) ? lastAccId : allIds[0];
+      const primaryAcc = ensureAccountIntegrity(map[primaryId]);
+      primaryAcc.machineId = mid;
+      S.user = primaryAcc;
+      // Keep only the single bound account in local map so link parameters can never create/switch accounts
+      const cleanMap = {};
+      cleanMap[primaryAcc.id] = primaryAcc;
+      saveAccountsMap(cleanMap);
+      saveCurrentUser(true, false);
+    } else {
+      S.user = createDefaultAccount('Piloto 1', AVATARS[0].id);
+      saveCurrentUser(true, false);
     }
 
     S.profileDraftName = S.user.name;
     S.profileDraftAvatar = S.user.avatarId;
 
-    // Register / sync all local accounts with backend so Admin can see all registered players
-    Object.values(loadAccountsMap()).forEach(acc => {
-      syncPlayerWithBackend(acc);
-    });
+    // Bind & validate account on authoritative backend (/api/account/init)
+    if (location.protocol !== 'file:') {
+      const authToken = S.user.authToken || localStorage.getItem(AUTH_TOKEN_KEY) || '';
+      fetch('/api/account/init', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Machine-Id': mid,
+          'X-Auth-Token': authToken
+        },
+        body: JSON.stringify({
+          machineId: mid,
+          authToken,
+          player: S.user
+        })
+      }).then(r => r.json()).then(data => {
+        if (data && data.ok) {
+          if (typeof data.initialChips === 'number') {
+            S.initialChipsConfig = r2(data.initialChips);
+            S.admin.initialChipsDraft = S.initialChipsConfig;
+            try { localStorage.setItem(CONFIG_INITIAL_CHIPS_KEY, String(S.initialChipsConfig)); } catch (e) {}
+          }
+          if (data.player) {
+            const cleanMap = {};
+            S.user = ensureAccountIntegrity(Object.assign({}, S.user, data.player));
+            if (data.player.authToken) {
+              S.user.authToken = data.player.authToken;
+              try { localStorage.setItem(AUTH_TOKEN_KEY, data.player.authToken); } catch (e) {}
+            }
+            cleanMap[S.user.id] = S.user;
+            saveAccountsMap(cleanMap);
+            saveCurrentUser(true, false);
+            S.profileDraftName = S.user.name;
+            S.profileDraftAvatar = S.user.avatarId;
+            updateHeaderAndRoomDOM();
+          }
+        }
+      }).catch(() => {});
+    }
+
+    // Start polling for nickname invitations
+    startInvitePolling();
 
     // Restore admin token if saved in sessionStorage
     try {
@@ -296,6 +451,31 @@
         S.champ = gh.champ || { d: {}, t: {}, n: 0 };
       }
     } catch (e) {}
+  }
+
+  function startInvitePolling() {
+    clearInterval(S.invitePollTimer);
+    if (location.protocol === 'file:') return;
+    S.invitePollTimer = setInterval(async () => {
+      if (!S.user) return;
+      try {
+        const res = await fetch(`/api/invites?pid=${encodeURIComponent(S.user.id)}&name=${encodeURIComponent(S.user.name)}`, { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.ok && Array.isArray(data.invites)) {
+            const prevCount = S.pendingInvites.length;
+            S.pendingInvites = data.invites.filter(inv => !S.room || inv.roomCode !== S.room.code);
+            if (S.pendingInvites.length !== prevCount) {
+              if (S.pendingInvites.length > prevCount) {
+                const newest = S.pendingInvites[0];
+                toast(`📩 Convite recebido de ${newest.fromName} para a Sala ${newest.roomCode}!`, 'gold');
+              }
+              if (S.view === 'home' || S.view === 'room') render();
+            }
+          }
+        }
+      } catch (e) {}
+    }, 3000);
   }
 
   function saveGlobalHistory() {
@@ -331,51 +511,147 @@
   function updateProfile(name, avatarId) {
     const clean = (name || '').trim();
     if (!clean) return toast('Digite um nome de login válido');
-    const map = loadAccountsMap();
 
-    const existingByName = Object.values(map).find(
-      a => a.name.toLowerCase() === clean.toLowerCase() && a.id !== S.user.id
-    );
-
-    if (existingByName) {
-      S.user = ensureAccountIntegrity(existingByName);
-      if (avatarId) S.user.avatarId = avatarId;
-    } else {
-      S.user.name = clean;
-      S.user.avatarId = avatarId || S.user.avatarId;
-    }
+    S.user.name = clean;
+    S.user.avatarId = avatarId || S.user.avatarId;
 
     saveCurrentUser(true, true);
     S.profileModalOpen = false;
 
-    if (S.room) {
+    if (S.room && !S.spectatingOnly) {
       syncMyPlayerInRoom();
     }
-    toast(`Perfil salvo: ${S.user.name}`, 'ok');
+    toast(`Perfil atualizado: ${S.user.name}`, 'ok');
     render();
   }
 
   function createOrSwitchAccount(accId) {
-    const map = loadAccountsMap();
     if (accId === 'NEW') {
-      const count = Object.keys(map).length + 1;
-      const av = AVATARS[(count - 1) % AVATARS.length].id;
-      const newAcc = createDefaultAccount(`Piloto ${count}`, av);
-      map[newAcc.id] = newAcc;
-      saveAccountsMap(map);
-      S.user = newAcc;
-      saveCurrentUser(true, true);
-    } else if (map[accId]) {
-      S.user = ensureAccountIntegrity(map[accId]);
-      saveCurrentUser(true, true);
+      return toast('Limite de segurança: apenas uma conta por máquina/dispositivo é permitida.');
     }
+    toast(`Sua conta vinculada a este dispositivo é ${S.user.name}.`);
+  }
+
+  /**
+   * Self-service profile deletion / reset with user confirmation prompt
+   */
+  function askDeleteOwnProfile() {
+    S.confirmSelfDeleteOpen = true;
+    render();
+  }
+
+  function cancelDeleteOwnProfile() {
+    S.confirmSelfDeleteOpen = false;
+    render();
+  }
+
+  async function confirmDeleteOwnProfile() {
+    if (!S.user) return;
+    const oldId = S.user.id;
+    const oldName = S.user.name;
+    const mid = getOrCreateMachineId();
+    const authToken = S.user.authToken || (() => {
+      try { return localStorage.getItem(AUTH_TOKEN_KEY) || ''; } catch (e) { return ''; }
+    })();
+
+    // If inside a room, leave cleanly first
+    if (S.room) {
+      try {
+        stopHostRaceLoop();
+        clearInterval(S.presenceTimer);
+        if (!S.spectatingOnly) {
+          MP.sendAction({
+            type: 'LEAVE_ROOM',
+            playerId: oldId,
+            playerName: oldName,
+            ts: Date.now()
+          }, true);
+        }
+        MP.disconnectRoom();
+      } catch (e) {}
+      S.room = null;
+      S.spectator = false;
+      S.spectatingOnly = false;
+    }
+
+    // Request authoritative deletion on backend
+    if (location.protocol !== 'file:') {
+      try {
+        const res = await fetch('/api/account/delete_self', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Machine-Id': mid,
+            'X-Auth-Token': authToken
+          },
+          body: JSON.stringify({
+            playerId: oldId,
+            machineId: mid,
+            authToken
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && typeof data.initialChips === 'number') {
+            S.initialChipsConfig = r2(data.initialChips);
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Clear all local profile & secondary account data
+    try {
+      localStorage.removeItem(ACCOUNTS_STORAGE_KEY);
+      localStorage.removeItem(LAST_ACCOUNT_KEY);
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+      sessionStorage.removeItem(TAB_ACCOUNT_KEY);
+      sessionStorage.removeItem(ACTIVE_ROOM_KEY);
+    } catch (e) {}
+
+    // Create a clean fresh default account on this device and register with server
+    S.user = createDefaultAccount('Piloto 1', AVATARS[0].id);
     S.profileDraftName = S.user.name;
     S.profileDraftAvatar = S.user.avatarId;
+    S.confirmSelfDeleteOpen = false;
     S.profileModalOpen = false;
-    if (S.room) {
-      syncMyPlayerInRoom();
+    S.pendingInvites = [];
+    S.view = 'home';
+
+    saveCurrentUser(true, false);
+
+    if (location.protocol !== 'file:') {
+      try {
+        const res = await fetch('/api/account/init', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Machine-Id': mid
+          },
+          body: JSON.stringify({
+            machineId: mid,
+            player: S.user
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.ok && data.player) {
+            S.user = ensureAccountIntegrity(Object.assign({}, S.user, data.player));
+            if (data.player.authToken) {
+              S.user.authToken = data.player.authToken;
+              try { localStorage.setItem(AUTH_TOKEN_KEY, data.player.authToken); } catch (e) {}
+            }
+            const cleanMap = {};
+            cleanMap[S.user.id] = S.user;
+            saveAccountsMap(cleanMap);
+            saveCurrentUser(true, false);
+            S.profileDraftName = S.user.name;
+            S.profileDraftAvatar = S.user.avatarId;
+          }
+        }
+      } catch (e) {}
     }
-    toast(`Conectado como ${S.user.name}`, 'ok');
+
+    toast(`🗑️ Perfil "${oldName}" excluído e resetado com sucesso! Um novo perfil limpo foi criado.`, 'gold');
     render();
   }
 
@@ -467,6 +743,12 @@
         }).then(r => r.json()).then(data => {
           if (data && data.ok && data.token) {
             S.admin.token = data.token;
+            try { sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token); } catch (e) {}
+            if (typeof data.initialChips === 'number') {
+              S.initialChipsConfig = r2(data.initialChips);
+              S.admin.initialChipsDraft = S.initialChipsConfig;
+            }
+            if (Array.isArray(data.adminLogs)) S.admin.adminLogs = data.adminLogs;
             if (data.players && data.players.length) {
               S.admin.players = data.players;
               if (S.view === 'admin') render();
@@ -491,6 +773,11 @@
           S.admin.authenticated = true;
           S.admin.loginName = data.admin || login;
           S.admin.players = data.players || [];
+          S.admin.adminLogs = data.adminLogs || [];
+          if (typeof data.initialChips === 'number') {
+            S.initialChipsConfig = r2(data.initialChips);
+            S.admin.initialChipsDraft = S.initialChipsConfig;
+          }
           try { sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token); } catch (e) {}
           toast(`Painel Administrativo autenticado (${S.admin.loginName})!`, 'ok');
           render();
@@ -525,36 +812,198 @@
   async function fetchAdminPlayers(silent = false) {
     if (!S.admin.token) return;
 
-    if (S.admin.token.startsWith('admin-token-gh-')) {
-      S.admin.authenticated = true;
-      S.admin.players = getLocalPlayersForAdmin();
-      if (S.view === 'admin') render();
-      return;
+    if (!S.admin.token.startsWith('admin-token-gh-')) {
+      try {
+        const res = await fetch('/api/admin/players', {
+          headers: { 'Authorization': 'Bearer ' + S.admin.token },
+          cache: 'no-store'
+        });
+        if (res.status === 401) {
+          S.admin.token = null;
+          S.admin.authenticated = false;
+          try { sessionStorage.removeItem(ADMIN_TOKEN_KEY); } catch (e) {}
+          if (!silent) render();
+          return;
+        }
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          S.admin.authenticated = true;
+          S.admin.players = data.players || [];
+          if (typeof data.initialChips === 'number') {
+            S.initialChipsConfig = r2(data.initialChips);
+            S.admin.initialChipsDraft = S.initialChipsConfig;
+          }
+          if (Array.isArray(data.adminLogs)) S.admin.adminLogs = data.adminLogs;
+          if (S.view === 'admin') render();
+          return;
+        }
+      } catch (e) {}
     }
 
+    // Even if token started as local fallback, query public /api/players/search if backend is reachable
     try {
-      const res = await fetch('/api/admin/players', {
-        headers: { 'Authorization': 'Bearer ' + S.admin.token },
-        cache: 'no-store'
-      });
-      if (res.status === 401) {
-        S.admin.token = null;
-        S.admin.authenticated = false;
-        try { sessionStorage.removeItem(ADMIN_TOKEN_KEY); } catch (e) {}
-        if (!silent) render();
-        return;
+      const res = await fetch('/api/players/search', { cache: 'no-store' });
+      if (res.ok) {
+        const d = await res.json();
+        if (d && d.ok && Array.isArray(d.players)) {
+          S.admin.authenticated = true;
+          S.admin.players = d.players;
+          if (S.view === 'admin') render();
+          return;
+        }
       }
-      const data = await res.json();
-      if (res.ok && data.ok) {
-        S.admin.authenticated = true;
-        S.admin.players = data.players || [];
-        if (S.view === 'admin') render();
-      }
-    } catch (e) {
-      // Fallback to local accounts list
-      S.admin.players = getLocalPlayersForAdmin();
-      if (S.view === 'admin') render();
+    } catch (e) {}
+
+    S.admin.authenticated = true;
+    S.admin.players = getLocalPlayersForAdmin();
+    if (S.view === 'admin') render();
+  }
+
+  /**
+   * 7. CONFIGURAÇÃO DO SALDO INICIAL PELO ADMINISTRADOR
+   */
+  async function adminUpdateInitialChips() {
+    if (!S.admin.authenticated || !S.admin.token) {
+      return toast('Acesso negado: faça login como administrador.');
     }
+    const inEl = $('#admin-initial-chips-in');
+    const newVal = r2(+(inEl ? inEl.value : S.admin.initialChipsDraft));
+    if (isNaN(newVal) || newVal < 0) {
+      return toast('Informe um valor de saldo inicial válido (maior ou igual a zero).');
+    }
+
+    if (!S.admin.token.startsWith('admin-token-gh-')) {
+      try {
+        const res = await fetch('/api/admin/config', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + S.admin.token
+          },
+          body: JSON.stringify({ token: S.admin.token, initialChips: newVal })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ok) {
+            S.initialChipsConfig = r2(data.initialChips);
+            S.admin.initialChipsDraft = S.initialChipsConfig;
+            if (Array.isArray(data.adminLogs)) S.admin.adminLogs = data.adminLogs;
+            try { localStorage.setItem(CONFIG_INITIAL_CHIPS_KEY, String(S.initialChipsConfig)); } catch (e) {}
+            toast(`✓ Saldo inicial padrão atualizado para ${fmt(S.initialChipsConfig)} fichas (aplicado às próximas novas contas)!`, 'gold');
+            render();
+            return;
+          }
+        }
+      } catch (e) {}
+    }
+
+    S.initialChipsConfig = newVal;
+    S.admin.initialChipsDraft = newVal;
+    try { localStorage.setItem(CONFIG_INITIAL_CHIPS_KEY, String(newVal)); } catch (e) {}
+    toast(`✓ Saldo inicial padrão configurado para ${fmt(newVal)} fichas!`, 'gold');
+    render();
+  }
+
+  /**
+   * 9. EXCLUSÃO DE CONTAS PELO ADMINISTRADOR
+   * Exclui contas criadas por engano com confirmação prévia, sem banir ou bloquear novo acesso.
+   */
+  async function adminPurgeNonProtectedAccounts() {
+    if (!S.admin.authenticated || !S.admin.token) {
+      return toast('Acesso negado: faça login como administrador.');
+    }
+    const confirmed = window.confirm('Deseja EXCLUIR/RESETAR todas as contas secundárias ou de outros jogadores, mantendo APENAS as contas protegidas (LX / LXZADA e naoc7k / N7K)?');
+    if (!confirmed) return;
+
+    if (!S.admin.token.startsWith('admin-token-gh-')) {
+      try {
+        const res = await fetch('/api/admin/purge_non_protected', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + S.admin.token
+          },
+          body: JSON.stringify({ token: S.admin.token })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ok) {
+            S.admin.players = data.players || [];
+            if (Array.isArray(data.adminLogs)) S.admin.adminLogs = data.adminLogs;
+            const map = loadAccountsMap();
+            const cleanMap = {};
+            for (const [id, acc] of Object.entries(map)) {
+              if (acc && isProtectedAccountName(acc.name)) cleanMap[id] = acc;
+            }
+            saveAccountsMap(cleanMap);
+            toast(`🧹 Limpeza concluída! ${data.removed ? data.removed.length : 0} contas secundárias removidas (Mantidas: ${data.kept ? data.kept.length : 0}).`, 'gold');
+            render();
+            return;
+          }
+        }
+      } catch (e) {}
+    }
+
+    const map = loadAccountsMap();
+    const cleanMap = {};
+    for (const [id, acc] of Object.entries(map)) {
+      if (acc && isProtectedAccountName(acc.name)) cleanMap[id] = acc;
+    }
+    saveAccountsMap(cleanMap);
+    S.admin.players = (S.admin.players || []).filter(p => isProtectedAccountName(p.name));
+    toast('🧹 Limpeza concluída! Apenas as contas protegidas (LX/LXZADA e naoc7k/N7K) foram mantidas.', 'gold');
+    render();
+  }
+
+  async function adminDeletePlayer(playerId, playerName) {
+    if (!S.admin.authenticated || !S.admin.token) {
+      return toast('Acesso negado: faça login como administrador.');
+    }
+    const targetName = playerName || playerId;
+    const confirmed = window.confirm(`Tem certeza que deseja EXCLUIR a conta "${targetName}" (${playerId})?\n\nEsta ação removerá a conta e seus registros sem bloquear o dispositivo de criar uma nova conta limpa.`);
+    if (!confirmed) return;
+
+    if (!S.admin.token.startsWith('admin-token-gh-')) {
+      try {
+        const res = await fetch('/api/admin/delete_player', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + S.admin.token
+          },
+          body: JSON.stringify({ token: S.admin.token, playerId })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ok) {
+            S.admin.players = data.players || S.admin.players.filter(p => p.id !== playerId);
+            if (Array.isArray(data.adminLogs)) S.admin.adminLogs = data.adminLogs;
+            const map = loadAccountsMap();
+            if (map[playerId]) {
+              delete map[playerId];
+              saveAccountsMap(map);
+            }
+            if (S.room && Array.isArray(S.room.players)) {
+              S.room.players = S.room.players.filter(p => p.id !== playerId);
+            }
+            toast(`🗑️ Conta "${targetName}" excluída com sucesso!`, 'gold');
+            render();
+            return;
+          }
+        }
+      } catch (e) {}
+    }
+
+    const map = loadAccountsMap();
+    delete map[playerId];
+    saveAccountsMap(map);
+    S.admin.players = (S.admin.players || []).filter(p => p.id !== playerId);
+    if (S.room && Array.isArray(S.room.players)) {
+      S.room.players = S.room.players.filter(p => p.id !== playerId);
+      if (isAuthorizedCreator()) MP.broadcastState(S.room);
+    }
+    toast(`🗑️ Conta "${targetName}" excluída com sucesso!`, 'gold');
+    render();
   }
 
   async function adminModifyBalance(playerId, operation) {
@@ -761,29 +1210,12 @@
     const rawCode = (codeInput || ($('#jc') ? $('#jc').value : '') || '').trim().toUpperCase();
     if (rawCode.length < 4) return toast('Digite um código de sala válido');
 
+    S.spectatingOnly = false;
+    S.spectator = false;
+
     const cachedRoom = MP._loadLocalRoomState(rawCode);
-    if (cachedRoom && Array.isArray(cachedRoom.players)) {
-      const alreadyInRoom = cachedRoom.players.find(p => p.id === S.user.id && p.online);
-      const otherTabMarker = sessionStorage.getItem('f1bs_tab_joined_' + rawCode);
-      if (alreadyInRoom && !otherTabMarker) {
-        const map = loadAccountsMap();
-        const otherAcc = Object.values(map).find(a => a.id !== S.user.id && !cachedRoom.players.some(p => p.id === a.id && p.online));
-        if (otherAcc) {
-          S.user = ensureAccountIntegrity(otherAcc);
-          try { sessionStorage.setItem(TAB_ACCOUNT_KEY, S.user.id); } catch (e) {}
-        } else {
-          const count = Object.keys(map).length + 1;
-          const av = AVATARS[(count - 1) % AVATARS.length].id;
-          const friendAcc = createDefaultAccount(`Amigo ${count}`, av);
-          map[friendAcc.id] = friendAcc;
-          saveAccountsMap(map);
-          S.user = friendAcc;
-          try { sessionStorage.setItem(TAB_ACCOUNT_KEY, S.user.id); } catch (e) {}
-        }
-        syncPlayerWithBackend(S.user);
-        toast(`2ª Aba detectada: conectado como ${S.user.name}`, 'gold');
-      }
-    }
+    // Requirement 1: Never create or switch to a secondary account via URL link or 2nd tab!
+    // Every player always uses their own machine-bound account.
 
     try {
       sessionStorage.setItem(ACTIVE_ROOM_KEY, rawCode);
@@ -794,6 +1226,9 @@
 
     if (cachedRoom) {
       S.room = cachedRoom;
+      if (Array.isArray(S.room.kickedPlayerIds)) {
+        S.room.kickedPlayerIds = S.room.kickedPlayerIds.filter(id => id !== S.user.id);
+      }
       upsertPlayerInRoom(S.room, myEntry);
     } else {
       S.room = {
@@ -812,7 +1247,7 @@
     }
 
     const amHost = isAuthorizedCreator();
-    await MP.connectRoom(rawCode, S.user.id, amHost, amHost ? S.room : null);
+    await MP.connectRoom(rawCode, S.user.id, amHost, amHost ? S.room : null, false);
 
     MP.sendAction({
       type: 'JOIN_ROOM',
@@ -824,6 +1259,169 @@
     startPresenceLoop();
     toast(`Conectado ao lobby da sala ${rawCode}!`, 'ok');
     go(S.room.race && !S.room.race.done ? 'race' : 'room');
+  }
+
+  /**
+   * 1. CONVIDAR JOGADORES PELO NICKNAME (SEM DEPENDER DE LINKS)
+   */
+  async function invitePlayerByNickname() {
+    if (!S.room) return toast('Crie ou entre em uma sala antes de enviar convites.');
+    const inEl = $('#invite-nick-input');
+    const nick = (inEl ? inEl.value : S.inviteTargetNickname || '').trim();
+    if (!nick) return toast('Digite o nickname (nome de usuário) do jogador para convidar.');
+
+    try {
+      const res = await fetch('/api/invites/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomCode: S.room.code,
+          fromId: S.user.id,
+          fromName: S.user.name,
+          targetNickname: nick
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        if (inEl) inEl.value = '';
+        S.inviteTargetNickname = '';
+        toast(`📩 Convite enviado para "${data.invite.targetNickname}" entrar na Sala ${S.room.code}!`, 'ok');
+        return;
+      } else {
+        return toast((data && data.error) || 'Não foi possível enviar o convite.');
+      }
+    } catch (e) {
+      return toast('Servidor de convites indisponível no momento.');
+    }
+  }
+
+  async function acceptInvite(inviteId, roomCode) {
+    S.pendingInvites = S.pendingInvites.filter(x => x.id !== inviteId);
+    try {
+      fetch('/api/invites/dismiss', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inviteId })
+      }).catch(() => {});
+    } catch (e) {}
+    await joinRoom(roomCode);
+  }
+
+  async function dismissInvite(inviteId) {
+    S.pendingInvites = S.pendingInvites.filter(x => x.id !== inviteId);
+    try {
+      fetch('/api/invites/dismiss', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inviteId })
+      }).catch(() => {});
+    } catch (e) {}
+    render();
+  }
+
+  /**
+   * 2. REMOVER JOGADORES DO LOBBY (CRIADOR OU ADMIN, COM CONFIRMAÇÃO E SYNC EM TEMPO REAL)
+   */
+  async function kickPlayerFromLobby(targetPlayerId, targetPlayerName) {
+    if (!S.room) return;
+    const canKick = isAuthorizedCreator() || (S.admin && S.admin.authenticated);
+    if (!canKick) {
+      return toast('Apenas o criador da sala ou o administrador pode remover jogadores do lobby.');
+    }
+    if (targetPlayerId === S.user.id) {
+      return toast('Você não pode remover a si mesmo do lobby.');
+    }
+    const pName = targetPlayerName || targetPlayerId;
+    const confirmed = window.confirm(`Deseja realmente remover o jogador "${pName}" deste lobby?`);
+    if (!confirmed) return;
+
+    if (MP.backendAvailable && location.protocol !== 'file:') {
+      try {
+        const res = await fetch(`/api/room/${encodeURIComponent(S.room.code)}/kick`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(S.admin.token ? { 'Authorization': 'Bearer ' + S.admin.token } : {})
+          },
+          body: JSON.stringify({
+            playerId: S.user.id,
+            targetPlayerId,
+            token: S.admin.token
+          })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok && data.state) {
+          S.room = data.state;
+        }
+      } catch (e) {}
+    }
+
+    if (S.room && Array.isArray(S.room.players)) {
+      S.room.players = S.room.players.filter(p => p.id !== targetPlayerId);
+      S.room.kickedPlayerIds = Array.isArray(S.room.kickedPlayerIds) ? S.room.kickedPlayerIds : [];
+      if (!S.room.kickedPlayerIds.includes(targetPlayerId)) {
+        S.room.kickedPlayerIds.push(targetPlayerId);
+      }
+    }
+    MP.sendAction({
+      type: 'KICK_PLAYER',
+      playerId: S.user.id,
+      targetPlayerId,
+      targetPlayerName: pName,
+      ts: Date.now()
+    });
+    if (isAuthorizedCreator()) {
+      MP.broadcastState(S.room);
+    }
+    toast(`🚫 ${pName} foi removido do lobby.`, 'gold');
+    refreshUI();
+  }
+
+  /**
+   * 3. MODO ESPECTADOR: LISTAGEM DE LOBBIES E VISUALIZAÇÃO SEM REGISTRAR COMO PARTICIPANTE
+   */
+  async function fetchActiveRoomsForSpectator() {
+    if (location.protocol === 'file:') return;
+    try {
+      const res = await fetch('/api/rooms', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.ok && Array.isArray(data.rooms)) {
+          S.spectatorRoomsList = data.rooms;
+          const listEl = $('#spectator-lobbies-list');
+          if (listEl) {
+            listEl.innerHTML = renderSpectatorLobbiesListHTML();
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  async function spectateRoomByCode(codeInput) {
+    const code = String(codeInput || '').trim().toUpperCase();
+    if (!code) return;
+
+    // If we are not already a participant in this room, connect in strict read-only spectator mode!
+    const alreadyParticipant = S.room && S.room.code === code && !S.spectatingOnly && (S.room.players || []).some(p => p.id === S.user.id);
+    if (!alreadyParticipant) {
+      stopHostRaceLoop();
+      clearInterval(S.presenceTimer);
+      S.spectatingOnly = true;
+      S.room = {
+        code,
+        hostId: null,
+        creatorId: null,
+        circuitId: 'int',
+        laps: 15,
+        wxMode: 'auto',
+        grid: DRIVERS.map(d => d.id),
+        players: [],
+        race: null
+      };
+      await MP.connectRoom(code, S.user.id, false, null, true);
+    }
+    S.spectator = true;
+    render();
   }
 
   function leaveRoom() {
@@ -909,8 +1507,10 @@
 
   function startPresenceLoop() {
     clearInterval(S.presenceTimer);
+    if (S.spectatingOnly) return;
     S.presenceTimer = setInterval(() => {
-      if (!S.room || !S.user) return;
+      if (!S.room || !S.user || S.spectatingOnly) return;
+      if (Array.isArray(S.room.kickedPlayerIds) && S.room.kickedPlayerIds.includes(S.user.id)) return;
       const now = Date.now();
       const myEntry = makePlayerEntry(S.user, isAuthorizedCreator());
       upsertPlayerInRoom(S.room, myEntry);
@@ -932,6 +1532,18 @@
           refreshUI();
         }
       } else {
+        // If current creator went offline (>9s without update), promote next online player so race is never stuck!
+        const curCreator = S.room.players.find(p => p.id === (S.room.creatorId || S.room.hostId));
+        if (curCreator && curCreator.online === false) {
+          const firstOnline = S.room.players.find(p => p.online !== false);
+          if (firstOnline && firstOnline.id === S.user.id) {
+            S.room.creatorId = S.user.id;
+            S.room.hostId = S.user.id;
+            MP.isHost = true;
+            MP.broadcastState(S.room);
+            refreshUI();
+          }
+        }
         MP.sendAction({
           type: 'HEARTBEAT',
           playerId: S.user.id,
@@ -946,6 +1558,22 @@
   MP.onStateUpdate = (newState) => {
     if (!newState || !S.room || newState.code !== S.room.code) return;
 
+    // Requirement 2: Check if current user was removed (kicked) from the lobby
+    if (!S.spectatingOnly && S.user && Array.isArray(newState.kickedPlayerIds) && newState.kickedPlayerIds.includes(S.user.id)) {
+      stopHostRaceLoop();
+      clearInterval(S.presenceTimer);
+      MP.disconnectRoom();
+      const kickedCode = S.room.code;
+      S.room = null;
+      try {
+        sessionStorage.removeItem(ACTIVE_ROOM_KEY);
+        sessionStorage.removeItem('f1bs_tab_joined_' + kickedCode);
+      } catch (e) {}
+      toast('🚫 Você foi removido do lobby pelo criador ou administrador.', 'gold');
+      go('home');
+      return;
+    }
+
     const prevRaceId = S.room.race ? S.room.race.id : null;
     const wasDone = S.room.race ? S.room.race.done : false;
     const prevCreator = S.room.creatorId || S.room.hostId;
@@ -954,9 +1582,14 @@
     if (!S.room.creatorId) S.room.creatorId = S.room.hostId;
 
     // Update MultiplayerManager host flag if creator role was assigned to us
-    MP.isHost = isAuthorizedCreator();
+    MP.isHost = !S.spectatingOnly && isAuthorizedCreator();
 
-    if (S.user) {
+    // If we were just promoted to Creator while a race was actively running, take over the simulation loop seamlessly!
+    if (MP.isHost && S.room.race && S.room.race.running && !S.hostTickTimer) {
+      startHostRaceLoop();
+    }
+
+    if (S.user && !S.spectatingOnly) {
       const meInRoom = S.room.players.find(p => p.id === S.user.id);
       if (meInRoom) {
         meInRoom.online = true;
@@ -971,7 +1604,7 @@
           const balanceEl = $('#header-balance-val');
           if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
         }
-      } else {
+      } else if (!Array.isArray(S.room.kickedPlayerIds) || !S.room.kickedPlayerIds.includes(S.user.id)) {
         const myEntry = makePlayerEntry(S.user, false);
         MP.sendAction({ type: 'JOIN_ROOM', playerId: S.user.id, player: myEntry, ts: Date.now() });
       }
@@ -1044,10 +1677,50 @@
       const pl = S.room.players.find(p => p.id === act.playerId);
       if (pl && pl.online) {
         pl.online = false;
-        toast(`⚠️ ${pl.name} desconectou.`);
+        // Reassign creator immediately if the creator disconnected so remaining players can continue/resume the race!
+        if ((S.room.creatorId === act.playerId || S.room.hostId === act.playerId) && S.room.players.length > 0) {
+          const nextCreator = S.room.players.find(p => p.online !== false && p.id !== act.playerId);
+          if (nextCreator) {
+            S.room.creatorId = nextCreator.id;
+            S.room.hostId = nextCreator.id;
+            S.room.players.forEach(p => {
+              p.isHost = (p.id === nextCreator.id);
+              p.isCreator = (p.id === nextCreator.id);
+            });
+            MP.isHost = !S.spectatingOnly && isAuthorizedCreator();
+            if (MP.isHost && S.room.race && S.room.race.running && !S.hostTickTimer) {
+              startHostRaceLoop();
+            }
+          }
+        }
+        toast(`⚠️ ${pl.name} desconectou. A partida continua normalmente.`);
         if (isAuthorizedCreator()) MP.broadcastState(S.room);
         refreshUI();
       }
+      return;
+    }
+
+    if (act.type === 'KICK_PLAYER' && act.targetPlayerId) {
+      if (S.user && act.targetPlayerId === S.user.id && !S.spectatingOnly) {
+        stopHostRaceLoop();
+        clearInterval(S.presenceTimer);
+        MP.disconnectRoom();
+        const kickedCode = S.room ? S.room.code : '';
+        S.room = null;
+        try {
+          sessionStorage.removeItem(ACTIVE_ROOM_KEY);
+          sessionStorage.removeItem('f1bs_tab_joined_' + kickedCode);
+        } catch (e) {}
+        toast('🚫 Você foi removido do lobby.', 'gold');
+        go('home');
+        return;
+      }
+      S.room.players = (S.room.players || []).filter(p => p.id !== act.targetPlayerId);
+      S.room.kickedPlayerIds = Array.isArray(S.room.kickedPlayerIds) ? S.room.kickedPlayerIds : [];
+      if (!S.room.kickedPlayerIds.includes(act.targetPlayerId)) {
+        S.room.kickedPlayerIds.push(act.targetPlayerId);
+      }
+      refreshUI();
       return;
     }
 
@@ -1488,8 +2161,11 @@
     if (r.done || r.running) return;
 
     const onlinePlayers = getOnlinePlayers();
-    if (onlinePlayers.length < MIN_PLAYERS_TO_START) {
-      return toast(`Mínimo de ${MIN_PLAYERS_TO_START} jogadores conectados na sala para iniciar a corrida! (Conectados: ${onlinePlayers.length})`);
+    // Requirement 5: Require 2 players ONLY for the initial race start (!r.started).
+    // If the race has already started (e.g. paused at lap 10 after a player disconnected), allow the remaining player(s) (>= 1) to resume normally!
+    const requiredOnline = r.started ? 1 : MIN_PLAYERS_TO_START;
+    if (onlinePlayers.length < requiredOnline) {
+      return toast(`Mínimo de ${requiredOnline} jogadores conectados na sala para iniciar a corrida! (Conectados: ${onlinePlayers.length})`);
     }
 
     if (!r.total || r.total < MIN_RACE_LAPS) {
@@ -1514,9 +2190,11 @@
       r.lapProgress = 0;
       pushEvent(r, 1, '🚦 Luzes vermelhas se apagam! LARGADA AUTORIZADA!', 'g');
     } else {
-      r.lap = r.lap + 1;
-      r.lapProgress = 0;
-      pushEvent(r, r.lap, `▶ Corrida retomada para a volta ${r.lap}!`, 'g');
+      // If paused mid-lap vs paused at a 10-lap betting boundary (where lapProgress === 0), increment lap only if at boundary
+      if ((r.lapProgress || 0) === 0 && r.lap < r.total) {
+        r.lap = r.lap + 1;
+      }
+      pushEvent(r, r.lap, `▶ Corrida retomada na volta ${r.lap}!`, 'g');
     }
 
     r.running = true;
@@ -2331,7 +3009,8 @@
 
   function renderProfileModal() {
     if (!S.profileModalOpen) return '';
-    const accounts = Object.values(loadAccountsMap());
+    const u = S.user;
+    const av = avObj(u.avatarId);
 
     return `<div class="modal-backdrop" onclick="if(event.target===this)F1App.closeProfileModal()">
       <div class="modal-card">
@@ -2339,10 +3018,10 @@
           <h2>Perfil & Conta do Jogador</h2>
           <button class="btn ghost sm" onclick="F1App.closeProfileModal()">✕</button>
         </div>
-        <p class="mut" style="font-size:13px;margin-top:0">Suas informações, avatar, saldo (inicial: 100 fichas) e Caixa de Fichas ficam salvos automaticamente.</p>
+        <p class="mut" style="font-size:13px;margin-top:0">Sua conta é única e vinculada a este dispositivo (1 conta por máquina). Suas informações, avatar, saldo e Caixa de Fichas ficam salvos automaticamente no servidor.</p>
         <div style="margin-bottom:12px">
-          <small class="mut">Nome de Login</small>
-          <input id="prof-name-in" maxlength="18" value="${esc(S.profileDraftName)}" placeholder="Seu nome ou apelido" onkeydown="if(event.key==='Enter')F1App.saveProfileFromModal()">
+          <small class="mut">Nickname (Nome de Usuário)</small>
+          <input id="prof-name-in" maxlength="18" value="${esc(S.profileDraftName)}" placeholder="Seu nickname" onkeydown="if(event.key==='Enter')F1App.saveProfileFromModal()">
         </div>
         <div>
           <small class="mut">Escolha seu Avatar</small>
@@ -2358,25 +3037,65 @@
           <button class="btn ok" onclick="F1App.saveProfileFromModal()">💾 Salvar Perfil</button>
         </div>
         <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
-        <h3>Contas Cadastradas neste Dispositivo</h3>
-        <div style="display:flex;flex-direction:column;gap:6px;max-height:150px;overflow-y:auto;margin-top:8px">
-          ${accounts.map(acc => {
-            const av = avObj(acc.avatarId);
-            const isCur = acc.id === S.user.id;
-            return `<div class="pl" style="padding:6px 8px;background:var(--bg2);border-radius:8px;border:1px solid ${isCur ? 'var(--gold)' : 'var(--line)'}">
-              <span class="av" style="background:${av.color};width:26px;height:26px;font-size:13px">${av.icon}</span>
-              <div>
-                <b>${esc(acc.name)}</b> ${isCur ? '<span class="chip" style="padding:1px 7px;font-size:10px;color:var(--gold)">ATIVA</span>' : ''}
-                <small class="mut" style="display:block">ID: ${esc(acc.id.slice(0, 10))} · Saldo: ${fmt(acc.chips)} 🪙</small>
-              </div>
-              ${!isCur ? `<button class="btn ghost sm" style="margin-left:auto" onclick="F1App.switchAccount('${acc.id}')">Usar Conta</button>` : ''}
-            </div>`;
-          }).join('')}
+        <h3>Conta Vinculada a este Dispositivo</h3>
+        <div class="pl" style="padding:8px 10px;background:var(--bg2);border-radius:8px;border:1px solid var(--gold);margin-top:8px">
+          <span class="av" style="background:${av.color};width:30px;height:30px;font-size:14px">${av.icon}</span>
+          <div>
+            <b>${esc(u.name)}</b> <span class="chip" style="padding:1px 7px;font-size:10px;color:var(--gold)">CONTA ÚNICA VINCULADA</span>
+            <small class="mut" style="display:block">ID: ${esc(u.id)} · Saldo Disponível: ${fmt(u.chips)} 🪙</small>
+          </div>
         </div>
-        <div class="row" style="margin-top:10px">
-          <button class="btn ghost sm" style="width:100%" onclick="F1App.switchAccount('NEW')">➕ Criar Nova Conta Secundária (Saldo Inicial: 100 🪙)</button>
+
+        <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+        <div style="background:rgba(225,6,0,0.08);border:1px solid var(--red2);border-radius:10px;padding:12px">
+          <div class="row" style="justify-content:space-between;align-items:center;gap:10px">
+            <div>
+              <b style="color:var(--red2);font-size:13.5px">🗑️ Excluir / Resetar Meu Perfil</b>
+              <small class="mut" style="display:block;margin-top:2px">
+                Está com bug de conta secundária ou deseja apagar seu perfil atual e começar do zero?
+              </small>
+            </div>
+            ${!S.confirmSelfDeleteOpen ? `
+              <button type="button" class="btn ghost sm no-flex" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.askDeleteOwnProfile()">
+                🗑️ Excluir Meu Perfil
+              </button>
+            ` : ''}
+          </div>
+
+          ${S.confirmSelfDeleteOpen ? `
+            <div style="margin-top:12px;padding-top:10px;border-top:1px dashed rgba(255,80,80,0.4)">
+              <div style="font-weight:800;color:var(--gold);font-size:13px;margin-bottom:6px">
+                ⚠️ Tem certeza que deseja excluir o perfil "${esc(u.name)}"?
+              </div>
+              <small class="mut" style="display:block;margin-bottom:10px">
+                Ao confirmar, sua conta atual (${fmt(u.chips)} 🪙 e histórico) será permanentemente apagada do servidor e deste dispositivo, e um perfil novo e limpo será gerado.
+              </small>
+              <div class="row" style="justify-content:flex-end;gap:8px">
+                <button type="button" class="btn ghost sm" onclick="F1App.cancelDeleteOwnProfile()">Não, Manter Conta</button>
+                <button type="button" class="btn sm" style="background:var(--red);border-color:var(--red2);color:#fff" onclick="F1App.confirmDeleteOwnProfile()">✓ Sim, Excluir Perfil Agora</button>
+              </div>
+            </div>
+          ` : ''}
         </div>
       </div>
+    </div>`;
+  }
+
+  function renderPendingInvitesBannerHTML() {
+    if (!Array.isArray(S.pendingInvites) || S.pendingInvites.length === 0) return '';
+    return `<div style="max-width:580px;margin:0 auto 18px;text-align:left">
+      ${S.pendingInvites.map(inv => `<div class="card ok-edge" style="margin-bottom:8px;padding:12px 14px">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <small class="ok" style="font-weight:900;letter-spacing:0.8px">📩 CONVITE DE SALA RECEBIDO POR NICKNAME</small>
+            <div style="font-size:14px;margin-top:2px"><b>${esc(inv.fromName)}</b> convidou você (<b>${esc(inv.targetNickname)}</b>) para a Sala <b class="mono gold-tx">${esc(inv.roomCode)}</b></div>
+          </div>
+          <div class="row no-flex" style="gap:6px">
+            <button class="btn ok sm" onclick="F1App.acceptInvite('${esc(inv.id)}', '${esc(inv.roomCode)}')">✓ Entrar na Sala</button>
+            <button class="btn ghost sm" onclick="F1App.dismissInvite('${esc(inv.id)}')">✕</button>
+          </div>
+        </div>
+      </div>`).join('')}
     </div>`;
   }
 
@@ -2386,14 +3105,16 @@
     return `<div class="hero">
       <div class="chip" style="margin-bottom:14px;border-color:var(--red)">🏎️ SIMULADOR 3D EM TEMPO REAL · MULTIPLAYER SINCRONIZADO</div>
       <h1>F1 <span>BETTING</span><br>SIMULATOR 3D</h1>
-      <p>Crie sua sala, convide seus amigos por código ou link, acompanhe a corrida em 10 circuitos 3D exclusivos e aposte suas fichas virtuais em tempo real.</p>
+      <p>Crie sua sala, convide amigos diretamente pelo nickname ou código, acompanhe a corrida em circuitos 3D exclusivos e aposte suas fichas virtuais em tempo real.</p>
+
+      ${renderPendingInvitesBannerHTML()}
 
       <div class="card gold-edge" style="max-width:580px;margin:0 auto 22px;text-align:left">
         <div class="row" style="justify-content:space-between">
           <div class="dr">
             <span class="av" style="background:${av.color};width:42px;height:42px;font-size:20px">${av.icon}</span>
             <div>
-              <small class="mut">BEM-VINDO DE VOLTA</small>
+              <small class="mut">CONTA VINCULADA AO DISPOSITIVO</small>
               <div style="font-size:17px;font-weight:900">${esc(u.name)}</div>
             </div>
           </div>
@@ -2401,7 +3122,10 @@
             <small class="mut">SALDO DISPONÍVEL</small>
             <div class="mono" style="font-size:20px;font-weight:900;color:var(--gold)">${fmt(u.chips)} 🪙</div>
           </div>
-          <button class="btn ghost sm no-flex" onclick="F1App.openProfileModal()">✏️ Editar Perfil</button>
+          <div class="row no-flex" style="gap:6px">
+            <button class="btn ghost sm no-flex" onclick="F1App.openProfileModal()">✏️ Editar Perfil</button>
+            <button class="btn ghost sm no-flex" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.openProfileModal(true)" title="Excluir e resetar seu próprio perfil">🗑️ Excluir Perfil</button>
+          </div>
         </div>
       </div>
 
@@ -2411,7 +3135,7 @@
         <button class="btn ghost" style="padding:13px 20px" onclick="F1App.joinRoom()">Entrar na Sala</button>
       </div>
 
-      ${S.room ? `<div style="margin-top:16px">
+      ${S.room && !S.spectatingOnly ? `<div style="margin-top:16px">
         <button class="btn gold" onclick="F1App.go('${S.room.race && !S.room.race.done ? 'race' : 'room'}')">↩ Voltar para Sala Ativa (${esc(S.room.code)})</button>
       </div>` : ''}
 
@@ -2419,16 +3143,16 @@
 
       <div class="grid g3" style="text-align:left;margin-top:28px">
         <div class="card">
-          <h3>🌐 Controle & Multiplayer</h3>
-          Apenas o jogador autorizado (Criador da Sala) configura e inicia as corridas, enquanto todos apostam e assistem sincronizados.
+          <h3>🌐 Controle & Convites por Nickname</h3>
+          Convide jogadores registrados diretamente pelo nickname sem depender de links e gerencie participantes do lobby em tempo real.
         </div>
         <div class="card cyan-edge">
-          <h3>🏎️ 10 Circuitos 3D Exclusivos</h3>
-          Cada autódromo possui traçado, cores de zebras, vegetação e monumentos 3D próprios (Roda-gigante de Suzuka, Porto de Mônaco, Alpes, etc.).
+          <h3>🏎️ Circuitos 3D & Modo Espectador</h3>
+          Assista a qualquer lobby ou partida em andamento em tempo real no Modo Espectador sem interferir nos participantes.
         </div>
         <div class="card gold-edge">
-          <h3>🛡️ Painel Administrativo</h3>
-          Gestão completa de saldos autenticada no servidor para consultar, adicionar, remover ou definir fichas de qualquer jogador.
+          <h3>🛡️ Economia & Administração</h3>
+          Limite de exposição de 50% por corrida, odds dinâmicas via 1.000 simulações e gestão global de contas e saldo inicial.
         </div>
       </div>
     </div>`;
@@ -2436,10 +3160,12 @@
 
   function renderRoomPlayersListHTML(R) {
     const creatorId = R.creatorId || R.hostId;
-    return R.players.map(p => {
+    const canManageLobby = isAuthorizedCreator() || (S.admin && S.admin.authenticated);
+    return (R.players || []).filter(p => !p.isSpectator).map(p => {
       const isMe = p.id === S.user.id;
       const isCreator = p.id === creatorId;
       const av = avObj(p.avatarId);
+      const showKickBtn = canManageLobby && !isMe && (!isCreator || (S.admin && S.admin.authenticated));
       return `<div class="pl">
         <span class="av" style="background:${p.color || av.color}">${p.avatarIcon || av.icon}</span>
         <div>
@@ -2453,7 +3179,10 @@
             ${p.online !== false ? 'Conectado em tempo real' : 'Desconectado (aguardando retorno)'}
           </small>
         </div>
-        <span class="bal mono">${fmt(p.chips)} 🪙</span>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+          <span class="bal mono">${fmt(p.chips)} 🪙</span>
+          ${showKickBtn ? `<button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2);padding:4px 9px" onclick="F1App.kickPlayerFromLobby('${esc(p.id)}', '${esc(p.name)}')" title="Remover jogador do lobby">🚫 Remover</button>` : ''}
+        </div>
       </div>`;
     }).join('');
   }
@@ -2482,14 +3211,13 @@
 
   function renderRoomView() {
     const R = S.room;
-    if (!R) return renderNoRoomCard();
+    if (!R || S.spectatingOnly) return renderNoRoomCard();
 
     const onlinePlayers = getOnlinePlayers(R);
     const canProceed = onlinePlayers.length >= MIN_PLAYERS_TO_START;
     const amCreator = isAuthorizedCreator();
     const creatorName = (R.players.find(p => p.id === (R.creatorId || R.hostId)) || {}).name || 'Host';
     const inviteUrl = `${location.origin}${location.pathname}?room=${encodeURIComponent(R.code)}`;
-    const friendTestUrl = `${location.origin}${location.pathname}?room=${encodeURIComponent(R.code)}&newplayer=1`;
 
     return `<div class="grid g2">
       <div class="card gold-edge">
@@ -2497,14 +3225,22 @@
           <h2>Lobby da Sala Multiplayer</h2>
           <span class="chip mono" style="color:var(--ok)">● SINCRONIZAÇÃO ATIVA</span>
         </div>
-        <p class="mut" style="margin:4px 0 10px">Compartilhe o código ou o link de convite com seu amigo para participarem da mesma corrida:</p>
+        <p class="mut" style="margin:4px 0 10px">Convide jogadores diretamente pelo nickname ou compartilhe o código da sala (cada jogador entra com sua própria conta):</p>
         <div class="code-box mono" id="room-code-display">${esc(R.code)}</div>
         <div class="row" style="margin-top:12px">
           <button class="btn" onclick="F1App.copyRoomCode()">📋 Copiar Código</button>
-          <button class="btn ghost" onclick="F1App.copyInviteLink('${esc(inviteUrl)}')">🔗 Copiar Link de Convite</button>
-          <button class="btn ghost" onclick="window.open('${esc(friendTestUrl)}', '_blank')" title="Abre uma 2ª aba já conectada nesta sala com um segundo jogador">👥 Abrir 2ª Aba (Amigo)</button>
+          <button class="btn ghost" onclick="F1App.copyInviteLink('${esc(inviteUrl)}')">🔗 Copiar Link da Sala</button>
         </div>
+
         <div class="bet-summary-box" style="margin-top:14px">
+          <small class="mut" style="display:block;margin-bottom:6px;font-weight:800">📩 CONVIDAR JOGADOR PELO NICKNAME (NOME DE USUÁRIO):</small>
+          <div class="row">
+            <input id="invite-nick-input" placeholder="Digite o nickname do jogador..." value="${esc(S.inviteTargetNickname || '')}" oninput="F1App.onInviteNickInput(this.value)" onkeydown="if(event.key==='Enter')F1App.invitePlayerByNickname()">
+            <button class="btn gold no-flex" onclick="F1App.invitePlayerByNickname()">📩 Enviar Convite</button>
+          </div>
+        </div>
+
+        <div class="bet-summary-box" style="margin-top:12px">
           <div class="row" style="justify-content:space-between">
             <span>Status do Lobby:</span>
             <b id="room-lobby-status-text" style="color:var(--${canProceed ? 'ok' : 'red2'})">
@@ -2512,7 +3248,7 @@
             </b>
           </div>
           <small class="mut" style="display:block;margin-top:4px">
-            Permissão de Criação: <b style="color:var(--gold)">${esc(creatorName)}</b> ${amCreator ? '(Você possui autorização para criar corridas)' : '(Participante — você pode apostar e acompanhar)'}
+            Permissão de Criação: <b style="color:var(--gold)">${esc(creatorName)}</b> ${amCreator ? '(Você possui autorização para criar corridas e gerenciar o lobby)' : '(Participante — você pode apostar e acompanhar)'}
           </small>
         </div>
         <div class="row" style="margin-top:12px;justify-content:space-between">
@@ -2725,7 +3461,7 @@
 
     return `<div class="card cyan-edge" id="general-financial-panel">
       <div class="row" style="justify-content:space-between;margin-bottom:6px">
-        <h3>📊 Painel Financeiro Geral & Exposição (10%)</h3>
+        <h3>📊 Painel Financeiro Geral & Exposição (50%)</h3>
         <span class="chip mono" style="font-size:10.5px;padding:2px 8px">Fator F: 0,20 · Margem: 6%</span>
       </div>
 
@@ -2743,7 +3479,7 @@
           <b class="mono" style="color:var(--cyan)">${fmt(committedNow)} 🪙</b>
         </div>
         <div class="fin-mini-item">
-          <small>Limite de Exposição (10%)</small>
+          <small>Limite de Exposição (50%)</small>
           <b class="mono">${fmt(exp.remainingExposure)} / ${fmt(exp.maxExposure)} 🪙</b>
         </div>
         <div class="fin-mini-item">
@@ -2777,7 +3513,7 @@
   }
 
   function renderBettingPanel(r) {
-    if (r.done || r.cancelled) return renderGeneralFinancialPanel(r);
+    if (r.done || r.cancelled) return '';
 
     const curMult = mult(r.lap);
     const roundNum = Math.floor(r.lap / 10) + 1;
@@ -2803,8 +3539,7 @@
                 : `Corrida no trecho final! As apostas estão bloqueadas até a bandeira quadriculada.`)
             : `O período de apostas desta rodada foi encerrado definitivamente e não pode ser reaberto.`}
         </p>
-      </div>
-      <div style="margin-top:12px">${renderGeneralFinancialPanel(r)}</div>`;
+      </div>`;
     }
 
     const orderedDrivers = (r.order && r.order.length ? r.order : r.start).slice();
@@ -2822,7 +3557,7 @@
       <div class="row" style="justify-content:space-between">
         <h3>🪙 Painel de Apostas · Rodada ${roundNum} (${isPreRace ? 'Pré-Largada' : 'Volta ' + r.lap})</h3>
         <span class="chip mono" style="border-color:var(--gold);color:var(--gold)">
-          Limite 10%: ${fmt(exp.remainingExposure)} / ${fmt(exp.maxExposure)} 🪙
+          Limite 50%: ${fmt(exp.remainingExposure)} / ${fmt(exp.maxExposure)} 🪙
         </span>
       </div>
 
@@ -2863,11 +3598,11 @@
         </div>
         <div class="quick-chips">
           ${[1, 2, 5, 10, 25, 50, 100].map(v => `<button type="button" class="quick-chip mono" onclick="F1App.setBetAmount(${v})">${fmt(v)}</button>`).join('')}
-          ${exp.remainingExposure > 0 ? `<button type="button" class="quick-chip mono" style="border-color:var(--cyan);color:var(--cyan)" onclick="F1App.setBetAmount(${exp.remainingExposure})">MÁX 10% (${fmt(exp.remainingExposure)})</button>` : ''}
+          ${exp.remainingExposure > 0 ? `<button type="button" class="quick-chip mono" style="border-color:var(--cyan);color:var(--cyan)" onclick="F1App.setBetAmount(${exp.remainingExposure})">MÁX 50% (${fmt(exp.remainingExposure)})</button>` : ''}
         </div>
         <div class="row" style="margin-top:6px">
           <input id="bet-amount-input" type="number" min="0.5" max="${Math.max(1, exp.maxExposure)}" step="1" value="${amt}" oninput="F1App.onBetAmountInput(this.value)">
-          <button class="btn gold" id="confirm-bet-btn" onclick="F1App.placeBet()" ${exp.remainingExposure <= 0 ? 'disabled title="Limite de 10% de exposição atingido nesta corrida"' : ''}>
+          <button class="btn gold" id="confirm-bet-btn" onclick="F1App.placeBet()" ${exp.remainingExposure <= 0 || S.spectatingOnly ? 'disabled title="Limite de 50% de exposição atingido nesta corrida"' : ''}>
             ✓ Confirmar Aposta
           </button>
         </div>
@@ -2876,8 +3611,7 @@
       <div class="bet-summary-box" id="bet-calc-details" style="margin-top:10px;margin-bottom:0">
         ${renderBetCalculationDetails(amt, curMult, selDrv, selPos, r)}
       </div>
-    </div>
-    <div style="margin-top:12px">${renderGeneralFinancialPanel(r)}</div>`;
+    </div>`;
   }
 
   function renderSelectedBetPreviewHTML(r, selDrv, selTeam, selPos, curMult) {
@@ -3109,7 +3843,8 @@
   function renderRaceControlsBar(r) {
     const onlineCount = getOnlinePlayers().length;
     const amCreator = isAuthorizedCreator();
-    const hasEnoughPlayers = onlineCount >= MIN_PLAYERS_TO_START;
+    const requiredPlayers = r.started ? 1 : MIN_PLAYERS_TO_START;
+    const hasEnoughPlayers = onlineCount >= requiredPlayers;
     const hasValidLaps = r.total >= MIN_RACE_LAPS;
     const windowClosed = !r.bettingOpen;
 
@@ -3132,7 +3867,7 @@
         </div>
         <div class="row no-flex" style="gap:6px">
           <span class="chip" style="border-color:var(--${hasEnoughPlayers ? 'ok' : 'red2'});color:var(--${hasEnoughPlayers ? 'ok' : 'red2'})">
-            ${hasEnoughPlayers ? '✓' : '✗'} ${onlineCount}/2 Jogadores Online
+            ${hasEnoughPlayers ? '✓' : '✗'} ${onlineCount}/${requiredPlayers} Jogadores Online
           </span>
           <span class="chip" style="border-color:var(--${hasValidLaps ? 'ok' : 'red2'});color:var(--${hasValidLaps ? 'ok' : 'red2'})">
             ${hasValidLaps ? '✓' : '✗'} ${r.total} Voltas (Mín. 5)
@@ -3279,7 +4014,7 @@
       <div class="grid" style="gap:14px">
         <div id="race-betting-panel">${renderBettingPanel(r)}</div>
 
-        <div class="card">
+        <div class="card" id="race-classification-card">
           <div class="row" style="justify-content:space-between;margin-bottom:6px">
             <h3>Classificação Ao Vivo</h3>
             <small class="mut">Clique no piloto para destacar em 3D</small>
@@ -3288,6 +4023,8 @@
             ${renderClassificationTower(r)}
           </div>
         </div>
+
+        <div id="general-financial-panel-wrap">${renderGeneralFinancialPanel(r)}</div>
       </div>
     </div>`;
   }
@@ -3479,7 +4216,8 @@
           <h2>Painel Administrativo · Gestão de Jogadores e Saldos</h2>
           <p class="mut" style="margin:0;font-size:13px">Consulte, adicione, remova ou defina manualmente o saldo de qualquer jogador cadastrado no servidor.</p>
         </div>
-        <div class="row no-flex">
+        <div class="row no-flex" style="gap:8px;flex-wrap:wrap">
+          <button class="btn ghost sm" style="border-color:var(--gold);color:var(--gold)" onclick="F1App.adminPurgeNonProtectedAccounts()" title="Excluir todas as contas exceto LX/LXZADA e naoc7k/N7K">🧹 Limpar Contas (Manter LX / N7K)</button>
           <button class="btn ghost sm" onclick="F1App.refreshAdminPlayers()">🔄 Atualizar Lista</button>
           <button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.adminLogout()">🚪 Sair do Admin</button>
         </div>
@@ -3487,9 +4225,9 @@
 
       <div class="grid g3" style="margin-bottom:16px">
         <div class="card gold-edge">
-          <h3>Jogadores Cadastrados</h3>
+          <h3>Jogadores Cadastrados (Global)</h3>
           <div class="stat mono">${allPlayers.length}</div>
-          <small class="mut">Contas sincronizadas com o servidor</small>
+          <small class="mut">Contas de todos os dispositivos sincronizadas</small>
         </div>
         <div class="card ok-edge">
           <h3>Total de Fichas em Circulação</h3>
@@ -3497,17 +4235,21 @@
           <small class="mut">Soma dos saldos de todos os jogadores</small>
         </div>
         <div class="card cyan-edge">
-          <h3>Saldo Inicial Padrão</h3>
-          <div class="stat mono">${fmt(INITIAL_CHIPS)} 🪙</div>
-          <small class="mut">Aplicado automaticamente a novos jogadores</small>
+          <h3>Saldo Inicial Padrão (Novas Contas)</h3>
+          <div class="stat mono">${fmt(S.initialChipsConfig || INITIAL_CHIPS)} 🪙</div>
+          <div class="row" style="margin-top:8px;gap:6px">
+            <input id="admin-initial-chips-in" type="number" min="1" max="1000000" step="10" value="${S.initialChipsConfig || INITIAL_CHIPS}" class="mono" style="padding:6px 10px;font-size:13px">
+            <button class="btn gold sm" onclick="F1App.adminUpdateInitialChips()" title="Salvar saldo inicial para novos jogadores">💾 Salvar</button>
+          </div>
+          <small class="mut" style="display:block;margin-top:4px">Aplicado apenas às contas criadas após a alteração</small>
         </div>
       </div>
 
       <div class="card">
         <div class="row" style="justify-content:space-between;margin-bottom:14px">
-          <h3>Jogadores Cadastrados & Controle de Saldo (${filtered.length})</h3>
-          <div style="max-width:300px;width:100%">
-            <input id="admin-search-in" placeholder="🔍 Filtrar jogador por nome ou ID..." value="${esc(S.admin.searchQuery)}" oninput="F1App.onAdminSearch(this.value)">
+          <h3>Gerenciamento Global de Contas & Saldos (${filtered.length})</h3>
+          <div style="max-width:320px;width:100%">
+            <input id="admin-search-in" placeholder="🔍 Localizar jogador por nickname ou ID..." value="${esc(S.admin.searchQuery)}" oninput="F1App.onAdminSearch(this.value)">
           </div>
         </div>
 
@@ -3515,8 +4257,8 @@
           <table class="tower" id="admin-players-table">
             <thead>
               <tr>
-                <th>JOGADOR</th>
-                <th>ID DA CONTA</th>
+                <th>JOGADOR (NICKNAME)</th>
+                <th>ID / DISPOSITIVO</th>
                 <th>SALDO ATUAL</th>
                 <th>VALOR (FICHAS)</th>
                 <th style="text-align:right">AÇÕES ADMINISTRATIVAS</th>
@@ -3537,24 +4279,40 @@
                       </div>
                     </div>
                   </td>
-                  <td class="mono mut" style="font-size:12px">${esc(p.id)}</td>
+                  <td class="mono mut" style="font-size:11.5px">
+                    <div>${esc(p.id)}</div>
+                    ${p.machineId ? `<small style="font-size:10px;opacity:0.75">HW: ${esc(String(p.machineId).slice(0, 12))}…</small>` : ''}
+                  </td>
                   <td class="mono" style="font-size:15px;font-weight:900;color:var(--gold)">${fmt(p.chips)} 🪙</td>
-                  <td style="width:150px">
+                  <td style="width:140px">
                     <input id="adm-amt-${esc(p.id)}" type="number" min="0" step="10" value="100" style="padding:6px 10px;font-size:13px" class="mono">
                   </td>
                   <td style="text-align:right">
-                    <div class="row no-flex" style="justify-content:flex-end;gap:6px">
+                    <div class="row no-flex" style="justify-content:flex-end;gap:6px;flex-wrap:wrap">
                       <button class="btn ok sm" onclick="F1App.adminModifyBalance('${esc(p.id)}', 'add')" title="Adicionar valor ao saldo do jogador">➕ Adicionar</button>
                       <button class="btn sm" onclick="F1App.adminModifyBalance('${esc(p.id)}', 'remove')" title="Remover valor do saldo do jogador">➖ Remover</button>
-                      <button class="btn gold sm" onclick="F1App.adminModifyBalance('${esc(p.id)}', 'set')" title="Definir manualmente o saldo exato do jogador">✏️ Definir Saldo</button>
+                      <button class="btn gold sm" onclick="F1App.adminModifyBalance('${esc(p.id)}', 'set')" title="Definir manualmente o saldo exato do jogador">✏️ Definir</button>
+                      <button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.adminDeletePlayer('${esc(p.id)}', '${esc(p.name)}')" title="Excluir conta criada por engano (sem bloquear acesso)">🗑️ Excluir Conta</button>
                     </div>
                   </td>
                 </tr>`;
-              }).join('') : `<tr><td colspan="5"><div class="slot">Nenhum jogador encontrado.</div></td></tr>`}
+              }).join('') : `<tr><td colspan="5"><div class="slot">Nenhum jogador encontrado com este nickname.</div></td></tr>`}
             </tbody>
           </table>
         </div>
       </div>
+
+      ${(S.admin.adminLogs && S.admin.adminLogs.length) ? `
+      <div class="card" style="margin-top:14px">
+        <h3>📋 Registro de Ações Administrativas Recentes (${S.admin.adminLogs.length})</h3>
+        <div style="max-height:180px;overflow-y:auto;margin-top:6px">
+          ${S.admin.adminLogs.slice(0, 15).map(log => `<div class="ev" style="display:flex;justify-content:space-between;gap:8px;font-size:12px">
+            <span><b>[${esc(log.action)}]</b> ${esc(log.targetName || log.detail || '')} ${log.targetPlayerId ? `<span class="mut mono">(${esc(log.targetPlayerId)})</span>` : ''}</span>
+            <small class="mut mono">${new Date(log.timestamp || Date.now()).toLocaleString('pt-BR')}</small>
+          </div>`).join('')}
+        </div>
+      </div>
+      ` : ''}
     </div>`;
   }
 
@@ -3626,6 +4384,50 @@
     return `${['☀️ Pista Seca', '🌦️ Chuva Leve', '🌧️ Chuva Forte'][r.ws || 0]} · ${Math.round((r.w || 0) * 100)}% molhada${r.sc && r.sc.type ? ` · <b style="color:var(--gold)">🚨 ${r.sc.type === 'SC' ? 'SAFETY CAR' : 'VSC'}</b>` : ''}`;
   }
 
+  function renderSpectatorLobbiesListHTML() {
+    const rooms = S.spectatorRoomsList || [];
+    const curCode = S.room ? S.room.code : null;
+    return `<div class="card cyan-edge" style="margin-bottom:14px">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <div>
+          <h3 style="margin:0">📡 Lobbies Online & Partidas em Andamento (${rooms.length})</h3>
+          <small class="mut">Modo Espectador: visualize qualquer lobby ou corrida ao vivo sem ser registrado como participante da partida.</small>
+        </div>
+        <button class="btn ghost sm" onclick="F1App.refreshSpectatorRooms()">🔄 Atualizar Lobbies</button>
+      </div>
+      ${rooms.length ? `<div class="grid g2" style="gap:10px" id="spectator-lobbies-grid">
+        ${rooms.map(rm => {
+          const isCurrent = curCode === rm.code;
+          const isRunning = rm.status === 'IN_PROGRESS';
+          const isBetting = rm.status === 'PAUSED_BETTING' || rm.status === 'PRE_RACE_BETTING';
+          const statusBadge = isRunning
+            ? `<span class="chip" style="border-color:var(--ok);color:var(--ok)"><span class="live"></span>EM ANDAMENTO · Volta ${rm.lap}/${rm.totalLaps}</span>`
+            : isBetting
+              ? `<span class="chip" style="border-color:var(--gold);color:var(--gold)">🪙 APOSTAS ABERTAS · Volta ${rm.lap}/${rm.totalLaps}</span>`
+              : rm.status === 'FINISHED'
+                ? `<span class="chip">🏁 CORRIDA FINALIZADA</span>`
+                : `<span class="chip" style="border-color:var(--cyan);color:var(--cyan)">⏳ AGUARDANDO NO LOBBY</span>`;
+          return `<div class="pl" style="justify-content:space-between;border:1px solid var(--${isCurrent ? 'gold' : isRunning ? 'ok' : 'line'});padding:10px 12px">
+            <div>
+              <div class="row no-flex" style="gap:8px;margin-bottom:4px">
+                <b class="mono" style="font-size:15px;color:var(--gold)">SALA ${esc(rm.code)}</b>
+                ${statusBadge}
+              </div>
+              <small class="mut" style="display:block">
+                ${esc(rm.circuitFlag || '🏁')} <b>${esc(rm.circuitName || 'Circuito')}</b> · Criador: <b>${esc(rm.creatorName || 'Líder')}</b> · 👥 ${rm.onlinePlayers}/${rm.totalPlayers} online
+              </small>
+            </div>
+            <div>
+              ${isCurrent
+                ? `<span class="chip" style="border-color:var(--gold);color:var(--gold)">👁️ Assistindo</span>`
+                : `<button class="btn ${isRunning ? 'ok' : 'gold'} sm" onclick="F1App.spectateRoomByCode('${esc(rm.code)}')">👁️ Assistir</button>`}
+            </div>
+          </div>`;
+        }).join('')}
+      </div>` : `<div class="slot">Nenhum lobby online encontrado no momento. Assim que uma sala for criada ou uma partida estiver em andamento, ela aparecerá aqui.</div>`}
+    </div>`;
+  }
+
   function renderSpectatorOverlay() {
     if (!S.spectator) return '';
     const r = S.room ? S.room.race : null;
@@ -3638,10 +4440,12 @@
       <div class="top">
         <div class="big"><span class="live"></span>F1 BROADCAST · MODO ESPECTADOR AO VIVO</div>
         <div class="row no-flex" style="gap:10px">
-          <span class="chip mono" style="background:var(--card)">SALA ${R ? esc(R.code) : '—'}</span>
+          <span class="chip mono" style="background:var(--card)">SALA ${R ? esc(R.code) : 'NENHUMA SELECIONADA'} ${S.spectatingOnly ? '· SOMENTE ESPECTADOR' : ''}</span>
           <button class="btn ghost sm" onclick="F1App.toggleSpectator(false)">✕ Fechar (Esc)</button>
         </div>
       </div>
+
+      ${renderSpectatorLobbiesListHTML()}
 
       ${r ? `
       <div class="sim3d-stage-card" style="margin-bottom:14px">
@@ -4023,14 +4827,19 @@
           betPanelWrap.innerHTML = renderBettingPanel(r);
         }
       } else {
-        const genFinEl = $('#general-financial-panel');
-        if (genFinEl) {
-          genFinEl.outerHTML = renderGeneralFinancialPanel(r);
-        }
         const expAvailEl = $('#bet-exp-avail');
         if (expAvailEl) {
           const exp = getMyRaceExposure(r);
           expAvailEl.textContent = fmt(exp.remainingExposure) + ' 🪙';
+        }
+      }
+      const genFinWrap = $('#general-financial-panel-wrap');
+      if (genFinWrap) {
+        genFinWrap.innerHTML = renderGeneralFinancialPanel(r);
+      } else {
+        const genFinEl = $('#general-financial-panel');
+        if (genFinEl) {
+          genFinEl.outerHTML = renderGeneralFinancialPanel(r);
         }
       }
       return;
@@ -4078,6 +4887,18 @@
     adminLogin,
     adminLogout,
     adminModifyBalance,
+    adminUpdateInitialChips,
+    adminDeletePlayer,
+    adminPurgeNonProtectedAccounts,
+    invitePlayerByNickname,
+    onInviteNickInput(val) {
+      S.inviteTargetNickname = val || '';
+    },
+    acceptInvite,
+    dismissInvite,
+    kickPlayerFromLobby,
+    spectateRoomByCode,
+    refreshSpectatorRooms: fetchActiveRoomsForSpectator,
     refreshAdminPlayers: () => fetchAdminPlayers(false),
     onAdminSearch(val) {
       S.admin.searchQuery = val || '';
@@ -4091,16 +4912,21 @@
     getRaceState: () => (S.room ? S.room.race : null),
     getState: () => S,
 
-    openProfileModal() {
+    openProfileModal(openDeleteConfirm = false) {
       S.profileDraftName = S.user.name;
       S.profileDraftAvatar = S.user.avatarId;
+      S.confirmSelfDeleteOpen = !!openDeleteConfirm;
       S.profileModalOpen = true;
       render();
     },
     closeProfileModal() {
       S.profileModalOpen = false;
+      S.confirmSelfDeleteOpen = false;
       render();
     },
+    askDeleteOwnProfile,
+    cancelDeleteOwnProfile,
+    confirmDeleteOwnProfile,
     selectDraftAvatar(avId) {
       const nameIn = $('#prof-name-in');
       if (nameIn) S.profileDraftName = nameIn.value;
@@ -4300,6 +5126,23 @@
     },
     toggleSpectator(on) {
       S.spectator = !!on;
+      if (S.spectator) {
+        fetchActiveRoomsForSpectator();
+        if (S.spectatorPollTimer) clearInterval(S.spectatorPollTimer);
+        S.spectatorPollTimer = setInterval(() => {
+          if (S.spectator) fetchActiveRoomsForSpectator();
+        }, 2500);
+      } else {
+        if (S.spectatorPollTimer) {
+          clearInterval(S.spectatorPollTimer);
+          S.spectatorPollTimer = null;
+        }
+        if (S.spectatingOnly) {
+          S.spectatingOnly = false;
+          MP.disconnect();
+          S.room = null;
+        }
+      }
       render();
     }
   };
@@ -4307,8 +5150,7 @@
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (S.spectator) {
-        S.spectator = false;
-        render();
+        window.F1App.toggleSpectator(false);
       } else if (S.profileModalOpen) {
         S.profileModalOpen = false;
         render();

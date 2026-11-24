@@ -493,42 +493,42 @@ function getJson(port, reqPath) {
         state: { code: roomCode, creatorId: p1.id, hostId: p1.id, players: [p1], race }
       });
 
-      // 600 in Overtake + 400 in Placement = 1.000 (exact 10% limit of 10.000)
+      // 3000 in Overtake + 2000 in Placement = 5.000 (exact 50% limit of 10.000)
       const r1 = await postJson(testPort, `/api/room/${roomCode}/bet`, {
         playerId: p1.id,
-        bet: { pid: p1.id, modality: 'overtake', driver: 'HAM', amount: 600 }
+        bet: { pid: p1.id, modality: 'overtake', driver: 'HAM', amount: 3000 }
       });
       const r2 = await postJson(testPort, `/api/room/${roomCode}/bet`, {
         playerId: p1.id,
-        bet: { pid: p1.id, modality: 'placement', driver: 'VER', market: 'P1', amount: 400 }
+        bet: { pid: p1.id, modality: 'placement', driver: 'VER', market: 'P1', amount: 2000 }
       });
       assert.strictEqual(r1.status, 200);
       assert.strictEqual(r2.status, 200);
-      assert.strictEqual(r2.data.exposure.committedOvertake, 600);
-      assert.strictEqual(r2.data.exposure.committedPlacement, 400);
-      assert.strictEqual(r2.data.exposure.totalCommitted, 1000);
+      assert.strictEqual(r2.data.exposure.committedOvertake, 3000);
+      assert.strictEqual(r2.data.exposure.committedPlacement, 2000);
+      assert.strictEqual(r2.data.exposure.totalCommitted, 5000);
       assert.strictEqual(r2.data.exposure.remainingExposure, 0);
-      assert.strictEqual(srv.PLAYERS_DB.get(p1.id).chips, 9000);
-      return `Saldo 10.000 -> 600 (Ultrapassagem) + 400 (Colocação) = 1.000 comprometidos (Saldo disp: 9.000)`;
+      assert.strictEqual(srv.PLAYERS_DB.get(p1.id).chips, 5000);
+      return `Saldo 10.000 -> 3.000 (Ultrapassagem) + 2.000 (Colocação) = 5.000 comprometidos (Limite 50%, Saldo disp: 5.000)`;
     });
 
-    // 22. Tentativa de ultrapassar os 10% de exposição
-    await runTest(22, 'Financeiro & MP', 'Bloqueio estrito ao tentar ultrapassar o limite de 10% de exposição na corrida', async () => {
-      const roomCode = 'T21MOD'; // Reusing player usr_t21 who already committed 1000 / 1000
+    // 22. Tentativa de ultrapassar os 50% de exposição
+    await runTest(22, 'Financeiro & MP', 'Bloqueio estrito ao tentar ultrapassar o limite de 50% de exposição na corrida', async () => {
+      const roomCode = 'T21MOD'; // Reusing player usr_t21 who already committed 5000 / 5000
       const rExceed = await postJson(testPort, `/api/room/${roomCode}/bet`, {
         playerId: 'usr_t21',
         bet: { pid: 'usr_t21', modality: 'overtake', driver: 'NOR', amount: 1 }
       });
       assert.strictEqual(rExceed.status, 400);
       assert.strictEqual(rExceed.data.code, 'EXPOSURE_LIMIT_EXCEEDED');
-      assert.strictEqual(srv.PLAYERS_DB.get('usr_t21').chips, 9000);
-      return `Tentativa de apostar +1 ficha após atingir 1.000/1.000 bloqueada com código EXPOSURE_LIMIT_EXCEEDED`;
+      assert.strictEqual(srv.PLAYERS_DB.get('usr_t21').chips, 5000);
+      return `Tentativa de apostar +1 ficha após atingir 5.000/5.000 (50%) bloqueada com código EXPOSURE_LIMIT_EXCEEDED`;
     });
 
-    // 23. Duas apostas simultâneas em abas diferentes tentando contornar o limite de 10%
-    await runTest(23, 'Financeiro & MP', 'Proteção contra duas apostas simultâneas em abas diferentes tentando burlar os 10%', async () => {
+    // 23. Duas apostas simultâneas em abas diferentes tentando contornar o limite de 50%
+    await runTest(23, 'Financeiro & MP', 'Proteção contra duas apostas simultâneas em abas diferentes tentando burlar os 50%', async () => {
       const roomCode = 'T23CON';
-      const p1 = { id: 'usr_t23', name: 'ConcurrentTabPlayer', chips: 5000, balanceVersion: 1 }; // 10% limit = 500
+      const p1 = { id: 'usr_t23', name: 'ConcurrentTabPlayer', chips: 5000, balanceVersion: 1 }; // 50% limit = 2500
       srv.PLAYERS_DB.set(p1.id, Object.assign({}, p1));
       const race = makeMockRace();
       await postJson(testPort, `/api/room/${roomCode}/state`, {
@@ -536,15 +536,15 @@ function getJson(port, reqPath) {
         state: { code: roomCode, creatorId: p1.id, hostId: p1.id, players: [p1], race }
       });
 
-      // Fire two parallel 300-chip requests at the exact same millisecond (300 + 300 = 600 > 500 limit)
+      // Fire two parallel 1500-chip requests at the exact same millisecond (1500 + 1500 = 3000 > 2500 limit)
       const [tabA, tabB] = await Promise.all([
         postJson(testPort, `/api/room/${roomCode}/bet`, {
           playerId: p1.id,
-          bet: { pid: p1.id, modality: 'overtake', driver: 'VER', amount: 300 }
+          bet: { pid: p1.id, modality: 'overtake', driver: 'VER', amount: 1500 }
         }),
         postJson(testPort, `/api/room/${roomCode}/bet`, {
           playerId: p1.id,
-          bet: { pid: p1.id, modality: 'placement', driver: 'NOR', market: 'PODIUM', amount: 300 }
+          bet: { pid: p1.id, modality: 'placement', driver: 'NOR', market: 'PODIUM', amount: 1500 }
         })
       ]);
 
@@ -552,8 +552,8 @@ function getJson(port, reqPath) {
       const rejections = [tabA, tabB].filter(r => r.status === 400 && r.data.code === 'EXPOSURE_LIMIT_EXCEEDED');
       assert.strictEqual(successes.length, 1);
       assert.strictEqual(rejections.length, 1);
-      assert.strictEqual(srv.PLAYERS_DB.get(p1.id).chips, 4700);
-      return `2 requisições simultâneas de 300 (limite 500): 1 aceita, 1 rejeitada (Saldo final exato: 4.700)`;
+      assert.strictEqual(srv.PLAYERS_DB.get(p1.id).chips, 3500);
+      return `2 requisições simultâneas de 1.500 (limite 2.500): 1 aceita, 1 rejeitada (Saldo final exato: 3.500)`;
     });
 
     // 24. Dois jogadores realizando apostas simultaneamente na mesma sala
@@ -572,7 +572,7 @@ function getJson(port, reqPath) {
       const [resA, resB] = await Promise.all([
         postJson(testPort, `/api/room/${roomCode}/bet`, {
           playerId: pA.id,
-          bet: { pid: pA.id, modality: 'overtake', driver: 'LEC', amount: 150 }
+          bet: { pid: pA.id, modality: 'overtake', driver: 'LEC', amount: 750 }
         }),
         postJson(testPort, `/api/room/${roomCode}/bet`, {
           playerId: pB.id,
@@ -582,10 +582,10 @@ function getJson(port, reqPath) {
 
       assert.strictEqual(resA.status, 200);
       assert.strictEqual(resB.status, 200);
-      assert.strictEqual(srv.PLAYERS_DB.get(pA.id).chips, 1850);
+      assert.strictEqual(srv.PLAYERS_DB.get(pA.id).chips, 1250);
       assert.strictEqual(srv.PLAYERS_DB.get(pB.id).chips, 2750);
       assert.strictEqual(srv.ROOMS.get(roomCode).state.race.bets.length, 2);
-      return `Piloto A (1850 🪙) e Piloto B (2750 🪙) processados simultaneamente sem colisão de estado`;
+      return `Piloto A (1250 🪙) e Piloto B (2750 🪙) processados simultaneamente sem colisão de estado`;
     });
 
     // 25. Atualização da página (F5) durante a corrida não reinicia o limite de exposição nem perde apostas
@@ -597,14 +597,14 @@ function getJson(port, reqPath) {
       delete clientRefreshState.race.exposures; // Client lost exposure object on refresh
       await postJson(testPort, `/api/room/${roomCode}/state`, { pid: 'usr_t24_a', state: clientRefreshState });
 
-      // Attempt to bet 100 more for Piloto A (initial was 2000 -> maxExposure 200, already committed 150 -> only 50 left)
+      // Attempt to bet 300 more for Piloto A (initial was 2000 -> 50% maxExposure 1000, already committed 750 -> only 250 left)
       const betAfterRefresh = await postJson(testPort, `/api/room/${roomCode}/bet`, {
         playerId: 'usr_t24_a',
-        bet: { pid: 'usr_t24_a', modality: 'overtake', driver: 'NOR', amount: 100 }
+        bet: { pid: 'usr_t24_a', modality: 'overtake', driver: 'NOR', amount: 300 }
       });
       assert.strictEqual(betAfterRefresh.status, 400);
       assert.strictEqual(betAfterRefresh.data.code, 'EXPOSURE_LIMIT_EXCEEDED');
-      return `Exposição de 200 fichas (150 já usados) permaneceu intacta após refresh de página; aposta de 100 bloqueada`;
+      return `Exposição de 1.000 fichas (750 já usados) permaneceu intacta após refresh de página; aposta de 300 bloqueada`;
     });
 
     // 26. Fechamento e reabertura do site (Persistência em disco e recuperação de sessão)
@@ -612,15 +612,15 @@ function getJson(port, reqPath) {
       srv.savePlayersDb();
       const rawDisk = JSON.parse(fs.readFileSync(PLAYERS_DB_PATH, 'utf-8'));
       assert.ok(rawDisk['usr_t24_a']);
-      assert.strictEqual(rawDisk['usr_t24_a'].chips, 1850);
-      assert.strictEqual(rawDisk['usr_t24_a'].committedChips, 150);
+      assert.strictEqual(rawDisk['usr_t24_a'].chips, 1250);
+      assert.strictEqual(rawDisk['usr_t24_a'].committedChips, 750);
       assert.strictEqual(rawDisk['usr_t24_a'].totalBalance, 2000);
 
       // Simulate client re-opening site and querying /api/player/usr_t24_a
       const getRes = await getJson(testPort, `/api/player/usr_t24_a`);
       assert.strictEqual(getRes.status, 200);
-      assert.strictEqual(getRes.data.player.chips, 1850);
-      return `Registro persistido em disco e recuperado via GET /api/player: Disponível=1850, Comprometido=150, Total=2000`;
+      assert.strictEqual(getRes.data.player.chips, 1250);
+      return `Registro persistido em disco e recuperado via GET /api/player: Disponível=1250, Comprometido=750, Total=2000`;
     });
 
     // 27. Tentativa de pagamento/bilhete duplicado

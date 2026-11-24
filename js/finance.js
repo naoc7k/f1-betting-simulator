@@ -20,8 +20,8 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  const MODEL_VERSION = 'F1_ECON_V4.0_MC1000';
-  const EXPOSURE_RATE = 0.10;          // 10% of initial available balance at start of race
+  const MODEL_VERSION = 'F1_ECON_V4.1_MC1000';
+  const EXPOSURE_RATE = 0.50;          // 50% of initial available balance at start of race
   const OVERTAKE_FACTOR_F = 0.20;      // Financial factor per excess overtake (0,20)
   const MAX_OVERTAKE_RETURN_MULT = 5.0; // Max total return = 5x stake (including stake)
   const HOUSE_MARGIN = 0.06;           // 6% house margin -> 0.94 / probability
@@ -838,13 +838,13 @@
       };
     }
 
-    // Lock / check 10% exposure rule
+    // Lock / check 50% exposure rule
     const exp = getOrInitRaceExposure(race, player.id, availableChips);
     if (r2(exp.totalCommitted + stake) > r2(exp.maxExposure + 1e-6)) {
       return {
         ok: false,
         code: 'EXPOSURE_LIMIT_EXCEEDED',
-        error: `Limite de exposição de 10% excedido! Limite na corrida: ${exp.maxExposure.toFixed(2)} fichas (Já comprometido: ${exp.totalCommitted.toFixed(2)} · Disponível no limite: ${exp.remainingExposure.toFixed(2)}).`,
+        error: `Limite de exposição de 50% excedido! Limite na corrida: ${exp.maxExposure.toFixed(2)} fichas (Já comprometido: ${exp.totalCommitted.toFixed(2)} · Disponível no limite: ${exp.remainingExposure.toFixed(2)}).`,
         exposure: exp
       };
     }
