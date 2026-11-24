@@ -1,5 +1,5 @@
 /**
- * F1 Betting Simulator 3D · Full-Stack Multiplayer, Admin Panel, Betting & Cashbox Application
+ * F1 BETTING SIMULATOR · Full-Stack Multiplayer, Admin Panel, Betting & Cashbox Application
  */
 (function () {
   const { TEAMS, DRIVERS, TEAM_PACE, AVATARS, CIRCUITS } = window.F1Tracks;
@@ -3051,7 +3051,7 @@
       navItems.push(['setup', 'Circuito & Grid']);
     }
     navItems.push(
-      ['race', 'Simulador 3D & Apostas'],
+      ['race', 'Simulador & Apostas'],
       ['wallet', 'Caixa de Fichas'],
       ['rank', 'Ranking'],
       ['admin', S.admin.authenticated ? '🛡️ Admin (LN)' : '🔒 Admin']
@@ -3059,7 +3059,7 @@
 
     return `<header class="top-header">
       <div class="header-left">
-        <div class="logo" onclick="F1App.go('home')"><i></i>F1 BETTING 3D</div>
+        <div class="logo" onclick="F1App.go('home')"><i></i>F1 BETTING SIMULATOR</div>
         <nav class="main-nav">
           ${navItems.map(([id, label]) => `<button class="${S.view === id ? 'on' : ''}" onclick="F1App.go('${id}')">${label}</button>`).join('')}
         </nav>
@@ -3181,26 +3181,26 @@
     const u = S.user;
     const av = avObj(u.avatarId);
     return `<div class="hero">
-      <div class="chip" style="margin-bottom:14px;border-color:var(--red)">🏎️ SIMULADOR 3D EM TEMPO REAL · MULTIPLAYER SINCRONIZADO</div>
-      <h1>F1 <span>BETTING</span><br>SIMULATOR 3D</h1>
+      <div class="chip" style="margin-bottom:14px;border-color:var(--red)">🏎️ SIMULADOR EM TEMPO REAL · MULTIPLAYER SINCRONIZADO</div>
+      <h1>F1 <span>BETTING</span><br>SIMULATOR</h1>
       <p>Crie sua sala, convide amigos diretamente pelo nickname ou código, acompanhe a corrida em circuitos 3D exclusivos e aposte suas fichas virtuais em tempo real.</p>
 
       ${renderPendingInvitesBannerHTML()}
 
-      <div class="card gold-edge" style="max-width:580px;margin:0 auto 22px;text-align:left">
-        <div class="row" style="justify-content:space-between">
-          <div class="dr">
+      <div class="card gold-edge home-account-card" style="max-width:580px;margin:0 auto 22px;text-align:left">
+        <div class="row home-account-row" style="justify-content:space-between">
+          <div class="dr home-account-user">
             <span class="av" style="background:${av.color};width:42px;height:42px;font-size:20px">${av.icon}</span>
-            <div>
+            <div style="min-width:0">
               <small class="mut">CONTA VINCULADA AO DISPOSITIVO</small>
-              <div style="font-size:17px;font-weight:900">${esc(u.name)}</div>
+              <div style="font-size:17px;font-weight:900;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(u.name)}</div>
             </div>
           </div>
-          <div style="text-align:right">
+          <div class="home-account-balance" style="text-align:right">
             <small class="mut">SALDO DISPONÍVEL</small>
             <div class="mono" style="font-size:20px;font-weight:900;color:var(--gold)">${fmt(u.chips)} 🪙</div>
           </div>
-          <div class="row no-flex" style="gap:6px">
+          <div class="row no-flex home-account-actions" style="gap:6px">
             <button class="btn ghost sm no-flex" onclick="F1App.openProfileModal()">✏️ Editar Perfil</button>
           </div>
         </div>

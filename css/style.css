@@ -1262,6 +1262,37 @@ input:focus, select:focus {
     grid-template-columns: 1fr;
     gap: 14px;
   }
+
+  /* Desacoplar .header-left para que logo + saldo fiquem na linha 1 e o menu nav na linha 2 */
+  .header-left {
+    display: contents;
+  }
+
+  .logo {
+    order: 1;
+  }
+
+  .header-right {
+    order: 2;
+    margin-left: auto;
+  }
+
+  nav.main-nav {
+    order: 3;
+    width: 100%;
+    flex: 0 0 100%;
+    overflow-x: auto;
+    white-space: nowrap;
+    padding: 4px 0 2px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    gap: 4px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  nav.main-nav::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 @media (max-width: 768px) {
@@ -1270,74 +1301,61 @@ input:focus, select:focus {
     overflow-x: hidden;
     width: 100%;
     max-width: 100vw;
+    font-size: 13.5px;
+    line-height: 1.42;
   }
 
-  /* Cabeçalho compacto para mobile */
+  /* Cabeçalho harmônico e proporcional para mobile */
   header.top-header {
-    padding: 8px 10px;
+    padding: 8px 12px 6px;
     gap: 8px;
     flex-wrap: wrap;
     background: rgba(10, 11, 16, 0.98);
   }
 
-  .header-left {
-    gap: 8px;
-    width: auto;
-  }
-
   .logo {
-    font-size: 15px;
+    font-size: 14.5px;
+    gap: 7px;
   }
 
   .logo i {
-    width: 20px;
-    height: 14px;
-  }
-
-  /* Barra de navegação com rolagem horizontal suave */
-  nav.main-nav {
-    order: 3;
-    width: 100%;
-    overflow-x: auto;
-    white-space: nowrap;
-    padding-bottom: 4px;
-    gap: 4px;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-  nav.main-nav::-webkit-scrollbar {
-    display: none;
+    width: 18px;
+    height: 13px;
   }
 
   nav.main-nav button {
     padding: 7px 11px;
-    font-size: 12.5px;
+    font-size: 12px;
+    border-radius: 6px;
   }
 
   .header-right {
     gap: 6px;
-    margin-left: auto;
+    align-items: center;
+    flex-wrap: nowrap;
   }
 
   .room-badge {
-    padding: 4px 9px;
-    font-size: 11px;
-    gap: 5px;
+    padding: 4px 8px;
+    font-size: 10.5px;
+    gap: 4px;
+    white-space: nowrap;
   }
 
   .top-balance-hud {
-    padding: 3px 10px 3px 6px;
+    padding: 4px 10px 4px 6px;
     gap: 6px;
   }
 
   .top-balance-hud .bal-icon {
-    width: 22px;
-    height: 22px;
+    width: 24px;
+    height: 24px;
     font-size: 13px;
   }
 
   .top-balance-hud .bal-label {
-    font-size: 8.5px;
+    font-size: 9.5px;
+    letter-spacing: 0.4px;
   }
 
   .top-balance-hud .bal-value {
@@ -1345,48 +1363,209 @@ input:focus, select:focus {
   }
 
   .profile-pill {
-    padding: 3px 8px 3px 4px;
+    padding: 3px 9px 3px 4px;
     font-size: 12px;
+    gap: 6px;
+    max-width: 135px;
+  }
+
+  .profile-pill #header-profile-name {
+    max-width: 72px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
   }
 
   .profile-pill .av {
-    width: 26px;
-    height: 26px;
-    font-size: 13px;
+    width: 26px !important;
+    height: 26px !important;
+    font-size: 13px !important;
   }
 
-  /* Layout Geral */
+  /* Layout Geral & Tipografia Mobile Harmônica */
   main {
-    padding: 12px 8px 60px;
+    padding: 12px 10px 64px;
     max-width: 100%;
   }
 
-  .grid.g2, .grid.g3, .grid.g4 {
+  h2 {
+    font-size: 16.5px !important;
+    line-height: 1.25;
+  }
+
+  h3 {
+    font-size: 11.5px !important;
+    letter-spacing: 0.9px;
+    line-height: 1.3;
+  }
+
+  .stat {
+    font-size: 20px !important;
+  }
+
+  .grid.g2, .grid.g3 {
     grid-template-columns: 1fr;
     gap: 12px;
   }
 
+  /* Grids de 4 colunas (ex: Caixa de Fichas e Circuitos) ficam em 2 colunas harmônicas no celular */
+  .grid.g4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
   .card {
-    padding: 12px 10px;
+    padding: 13px 12px;
     border-radius: 12px;
   }
 
-  /* Viewport 3D no Mobile */
+  /* Evitar que elementos dentro de .row fiquem esmagados ou cortados */
+  .row {
+    gap: 8px;
+  }
+
+  .row > * {
+    min-width: 0;
+  }
+
+  .btn {
+    padding: 10px 14px;
+    font-size: 12px;
+    max-width: 100%;
+    white-space: normal;
+    text-align: center;
+    line-height: 1.25;
+  }
+
+  .btn.sm {
+    padding: 6px 10px;
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+
+  input, select {
+    font-size: 15px;
+    padding: 10px 12px;
+    min-height: 40px;
+  }
+
+  .chip {
+    font-size: 11px;
+    padding: 4px 10px;
+    max-width: 100%;
+    white-space: normal;
+    text-align: center;
+    line-height: 1.25;
+  }
+
+  /* Hero & Tela Inicial Mobile */
+  .hero {
+    padding: 18px 4px 20px;
+  }
+
+  .hero h1 {
+    font-size: clamp(26px, 8vw, 38px);
+    line-height: 1.04;
+    margin-bottom: 10px;
+  }
+
+  .hero p {
+    font-size: 13.5px;
+    margin-bottom: 18px;
+    padding: 0 4px;
+  }
+
+  /* Card de Conta na Tela Inicial (Home) bem distribuído */
+  .home-account-row {
+    display: grid !important;
+    grid-template-columns: 1fr auto;
+    gap: 10px 12px !important;
+    align-items: center;
+  }
+
+  .home-account-user {
+    grid-column: 1 / 2;
+    min-width: 0;
+  }
+
+  .home-account-balance {
+    grid-column: 2 / 3;
+    text-align: right;
+  }
+
+  .home-account-actions {
+    grid-column: 1 / -1;
+    width: 100%;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+    justify-content: stretch;
+  }
+
+  .home-account-actions .btn {
+    width: 100%;
+    flex: 1 1 100% !important;
+    justify-content: center;
+    padding: 8px 12px;
+  }
+
+  /* Código da Sala no Lobby proporcional */
+  .code-box {
+    font-size: 26px;
+    letter-spacing: 5px;
+    padding: 10px;
+  }
+
+  /* Listas de jogadores (.pl), apostas e lobbies com quebra limpa sem esconder botões */
+  .pl {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 0;
+  }
+
+  .pl > div:first-of-type {
+    flex: 1 1 150px;
+    min-width: 0;
+  }
+
+  .pl > div:last-child {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  /* Viewport 3D e Controles de Câmera no Mobile */
   .sim3d-stage-card {
     border-radius: 12px;
   }
 
   .sim3d-viewport {
-    height: 320px !important;
+    height: 310px !important;
   }
 
   .sim3d-topbar {
-    padding: 8px 10px;
-    gap: 6px;
+    padding: 10px 12px;
+    gap: 8px;
+  }
+
+  .sim3d-title-group {
+    width: 100%;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .sim3d-topbar > .row.no-flex {
+    width: 100%;
+    justify-content: space-between;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .sim3d-topbar > .row.no-flex > div:first-child {
+    text-align: left !important;
   }
 
   .sim3d-lap-counter {
-    padding: 3px 9px;
+    padding: 4px 10px;
     border-radius: 8px;
   }
 
@@ -1395,71 +1574,148 @@ input:focus, select:focus {
   }
 
   .sim3d-lap-counter .lap-tot {
-    font-size: 12px;
+    font-size: 11.5px;
   }
 
   .sim3d-hud-overlay {
-    padding: 8px;
+    padding: 6px 8px;
+  }
+
+  .sim3d-hud-top {
+    width: 100%;
+    gap: 6px;
   }
 
   .cam-toolbar {
-    padding: 2px;
-    gap: 2px;
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    padding: 3px;
+    gap: 3px;
   }
 
   .cam-btn {
-    padding: 4px 7px;
+    padding: 5px 4px;
     font-size: 10.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: center;
+  }
+
+  .selected-driver-telemetry {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    padding: 8px 10px;
+    border-radius: 9px;
+  }
+
+  .selected-driver-telemetry > div {
+    min-width: 0;
   }
 
   .driver-selector-strip {
     padding: 8px 10px;
-    gap: 4px;
+    gap: 5px;
   }
 
   .drv-pill {
-    padding: 4px 8px;
-    font-size: 11px;
+    padding: 5px 9px;
+    font-size: 11.5px;
   }
 
-  /* Grid de Cards de Apostas em 2 colunas no Mobile */
+  /* Painel de Controle da Corrida (Criador) — botões sempre 100% visíveis */
+  #race-controls-bar-wrap .row > .btn {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  /* Abas e Grid de Cards de Apostas em 2 colunas proporcionais no Mobile */
+  .bet-tabs {
+    grid-template-columns: 1fr 1fr;
+    gap: 5px;
+    padding: 4px;
+  }
+
+  .bet-tab-btn {
+    padding: 8px 6px;
+    font-size: 11px;
+    line-height: 1.2;
+    text-align: center;
+    white-space: normal;
+  }
+
   .bet-driver-grid {
-    grid-template-columns: repeat(2, 1fr) !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
     gap: 6px;
-    max-height: 240px;
+    max-height: 250px;
     padding: 2px;
   }
 
   .bet-driver-card {
-    padding: 6px 7px;
+    padding: 7px 8px;
     gap: 6px;
     border-radius: 8px;
+    min-width: 0;
   }
 
   .bet-pos-badge {
     min-width: 22px;
     height: 20px;
-    font-size: 10px;
+    font-size: 10.5px;
   }
 
   .bet-driver-card .tm {
     height: 22px;
   }
 
+  .market-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .market-card {
+    padding: 8px;
+    min-width: 0;
+  }
+
   .quick-chips {
-    gap: 4px;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
   }
 
   .quick-chip {
-    padding: 4px 7px;
-    font-size: 10.5px;
-    flex: 1 1 calc(20% - 4px);
+    padding: 7px 4px;
+    font-size: 11px;
     text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  /* Tabela de Classificação e Eventos */
+  .fin-mini-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .fin-mini-item {
+    padding: 7px 8px;
+    min-width: 0;
+  }
+
+  .fin-mini-item small {
+    font-size: 10px;
+  }
+
+  .fin-mini-item b {
+    font-size: 12.5px;
+  }
+
+  /* Tabela de Classificação e Admin */
   .tower td, .tower th {
-    padding: 6px 4px;
+    padding: 6px 5px;
     font-size: 12px;
   }
 
@@ -1468,12 +1724,12 @@ input:focus, select:focus {
   }
 
   .tyre-badge {
-    width: 19px;
-    height: 19px;
-    font-size: 9.5px;
+    width: 20px;
+    height: 20px;
+    font-size: 10.5px;
   }
 
-  /* Lobby e Entrar na Sala */
+  /* Lobby, Convites e Setup no Mobile */
   .row.row-stack-mobile {
     flex-direction: column;
     align-items: stretch;
@@ -1488,24 +1744,78 @@ input:focus, select:focus {
     width: 100% !important;
   }
 
-  /* Modal */
+  /* Modal de Perfil adaptável com rolagem interna em telas pequenas */
+  .modal-backdrop {
+    padding: 10px;
+    overflow-y: auto;
+  }
+
   .modal-card {
-    padding: 16px 12px;
+    padding: 16px 14px;
     border-radius: 14px;
+    max-height: 92vh;
+    overflow-y: auto;
   }
 
   .avatar-grid {
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 6px;
+  }
+
+  /* Modo Espectador no Mobile */
+  .spec {
+    padding: 12px 10px;
+  }
+
+  .spec .big {
+    font-size: 17px;
   }
 }
 
 @media (max-width: 480px) {
-  .bet-driver-grid {
-    grid-template-columns: 1fr 1fr !important;
+  header.top-header {
+    padding: 7px 9px 5px;
+    gap: 6px;
+  }
+
+  .logo {
+    font-size: 13.5px;
+  }
+
+  .room-badge {
+    display: none;
+  }
+
+  .top-balance-hud .bal-label {
+    display: none;
+  }
+
+  .top-balance-hud {
+    padding: 4px 9px 4px 5px;
+  }
+
+  .grid.g4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  #setup-circuits-grid.grid.g4 {
+    grid-template-columns: 1fr;
   }
 
   .sim3d-viewport {
-    height: 280px !important;
+    height: 275px !important;
+  }
+
+  /* Empilhar input + botão de aposta ou convite em telas muito estreitas */
+  #betting-form-card .row > #confirm-bet-btn {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  #room-action-footer .btn,
+  #setup-prepare-btn {
+    width: 100% !important;
+    flex: 1 1 100% !important;
   }
 }
