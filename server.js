@@ -1520,6 +1520,20 @@ const server = http.createServer((req, res) => {
                 state.players = state.players.filter(p => !state.kickedPlayerIds.includes(p.id));
               }
             }
+            // Merge any active/recently joined players from entry.state.players so host state updates never wipe a guest who just joined
+            if (Array.isArray(entry.state.players)) {
+              state.players = Array.isArray(state.players) ? state.players : [];
+              const kickedSet = new Set(state.kickedPlayerIds || []);
+              const incomingIds = new Set(state.players.map(p => p && p.id));
+              for (const ep of entry.state.players) {
+                if (!ep || !ep.id || ep.isSpectator || kickedSet.has(ep.id) || incomingIds.has(ep.id)) continue;
+                const lastHb = entry.heartbeats.get(ep.id) || 0;
+                if ((now - lastHb) < 12 && state.players.length < 8) {
+                  state.players.push(ep);
+                  incomingIds.add(ep.id);
+                }
+              }
+            }
           } else {
             entry = { state, actions: [], updatedAt: now, heartbeats: new Map() };
             ROOMS.set(code, entry);
@@ -1617,7 +1631,25 @@ const server = http.createServer((req, res) => {
           }
 
           if (action.player && !PLAYERS_DB.has(action.player.id)) {
-            upsertPlayerRecord(action.player, true, { clientIp, machineId: headerMachineId });
+            upsertPlayerRecord(action.player, true, { clientIp, machineId: headerMachineId, internalTrusted: true });
+          }
+          if (!entry && action.type === 'JOIN_ROOM' && action.player && !action.player.isSpectator) {
+            const initPl = Object.assign({}, action.player, { online: true });
+            const newSt = {
+              code,
+              hostId: initPl.id,
+              creatorId: initPl.id,
+              createdAt: Date.now(),
+              circuitId: 'int',
+              laps: 15,
+              wxMode: 'auto',
+              grid: ['VER','NOR','LEC','PIA','HAM','RUS','SAI','ALO','GAS','ALB','HUL','OCO','TSU','STR','LAW','BEA','ANT','DOO','BOR','HAD','COL','BOT'],
+              players: [initPl],
+              race: null,
+              processedActions: []
+            };
+            entry = { state: newSt, actions: [], updatedAt: now, heartbeats: new Map([[initPl.id, now]]) };
+            ROOMS.set(code, entry);
           }
           if (!entry) return sendJson(res, 404, { ok: false, error: 'ROOM_NOT_FOUND' });
           const st = entry.state;
@@ -1636,7 +1668,7 @@ const server = http.createServer((req, res) => {
               entry.heartbeats.set(pl.id, now);
               let rec = PLAYERS_DB.get(pl.id);
               if (!rec) {
-                rec = upsertPlayerRecord(pl, true, { clientIp, machineId: headerMachineId });
+                rec = upsertPlayerRecord(pl, true, { clientIp, machineId: headerMachineId, internalTrusted: true });
               }
               if (rec) {
                 pl.chips = rec.chips;
@@ -1649,6 +1681,7 @@ const server = http.createServer((req, res) => {
                 st.players.push(pl);
               }
               ensureAuthorizedCreator(entry);
+              entry.updatedAt = now;
             } else if (action.type === 'KICK_PLAYER' && action.targetPlayerId) {
               const token = getAdminToken(req, payload, parsed.query);
               const isAdmin = verifyAdminToken(token);

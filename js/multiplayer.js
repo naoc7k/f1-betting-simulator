@@ -32,6 +32,7 @@
       this.pollTimer = null;
       this.heartbeatTimer = null;
       this.seenActionIds = new Set();
+      this.lastJoinAction = null;
 
       this.onStateUpdate = null;   // (state, source) => void
       this.onActionReceived = null; // (action) => void
@@ -135,20 +136,25 @@
 
     async connectRoom(code, playerId, isHost, initialState = null, isSpectator = false) {
       this.disconnectRoom();
-      this.roomCode = String(code).trim().toUpperCase();
+      this.roomCode = String(code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
       this.playerId = playerId;
       this.isHost = !isSpectator && !!isHost;
       this.isSpectator = !!isSpectator;
+      this.lastJoinAction = null;
 
       if (this.isHost && initialState && !this.isSpectator) {
         this._saveLocalRoomState(initialState);
-        if (this.backendAvailable) {
+        if (location.protocol !== 'file:') {
           try {
-            await fetch(`/api/room/${this.roomCode}/state`, {
+            const res = await fetch(`/api/room/${this.roomCode}/state`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ state: initialState, pid: this.playerId })
             });
+            if (res.ok) {
+              this.backendAvailable = true;
+              this._emitStatus();
+            }
           } catch (e) {}
         }
       }
@@ -157,14 +163,24 @@
       this._connectWebSocketRelay();
       this._startPollingAndHeartbeat();
 
-      // If joining as guest or spectator, immediately check local storage & backend
+      // If joining as guest or spectator, immediately check local storage & request host state
       if (!this.isHost) {
         const cached = this._loadLocalRoomState(this.roomCode);
         if (cached && typeof this.onStateUpdate === 'function') {
           this.onStateUpdate(cached, 'local_cache');
         }
-        this._broadcastEnvelope({ type: 'REQUEST_STATE', code: this.roomCode, senderId: this.playerId, isSpectator: this.isSpectator });
+        this.requestHostState();
       }
+    }
+
+    requestHostState() {
+      if (!this.roomCode) return;
+      this._broadcastEnvelope({
+        type: 'REQUEST_STATE',
+        code: this.roomCode,
+        senderId: this.playerId,
+        isSpectator: this.isSpectator
+      });
     }
 
     disconnectRoom() {
@@ -277,17 +293,32 @@
     }
 
     _connectToHostPeer(hostPeerId) {
-      if (!this.peer || !this.roomCode) return;
+      if (!this.peer || !this.roomCode || this.peer.destroyed) return;
       try {
+        if (this.hostConn && this.hostConn.open) return;
         const conn = this.peer.connect(hostPeerId, { reliable: true });
         this.hostConn = conn;
         conn.on('open', () => {
           this.peerConnected = true;
           this._emitStatus();
-          conn.send({ type: 'REQUEST_STATE', code: this.roomCode, senderId: this.playerId });
+          if (this.lastJoinAction && !this.isSpectator) {
+            conn.send({
+              type: 'ACTION',
+              code: this.roomCode,
+              action: this.lastJoinAction,
+              senderId: this.playerId,
+              ts: Date.now()
+            });
+          }
+          conn.send({ type: 'REQUEST_STATE', code: this.roomCode, senderId: this.playerId, isSpectator: this.isSpectator });
         });
         conn.on('data', (data) => {
           this._handleEnvelope(data, 'webrtc');
+        });
+        conn.on('close', () => {
+          if (this.hostConn === conn) {
+            this.hostConn = null;
+          }
         });
       } catch (e) {}
     }
@@ -296,11 +327,29 @@
       if (!this.roomCode || typeof WebSocket === 'undefined') return;
       try {
         const topic = `f1bs_v2_sync_${this.roomCode}`;
-        const ws = new WebSocket(`wss://ntfy.sh/${topic}/ws`);
+        const ws = new WebSocket(`wss://ntfy.sh/${topic}/ws?since=45s`);
         this.ws = ws;
         ws.onopen = () => {
           this.wsConnected = true;
           this._emitStatus();
+          if (!this.isHost) {
+            if (this.lastJoinAction && !this.isSpectator) {
+              this._publishWebSocketRelay({
+                type: 'ACTION',
+                code: this.roomCode,
+                action: this.lastJoinAction,
+                senderId: this.playerId,
+                ts: Date.now()
+              });
+            }
+            this._publishWebSocketRelay({
+              type: 'REQUEST_STATE',
+              code: this.roomCode,
+              senderId: this.playerId,
+              isSpectator: this.isSpectator,
+              ts: Date.now()
+            });
+          }
         };
         ws.onmessage = (ev) => {
           try {
@@ -322,7 +371,7 @@
     }
 
     _publishWebSocketRelay(env) {
-      if (!this.roomCode || !this.wsConnected) return;
+      if (!this.roomCode) return;
       // Only publish important state transitions & actions over public relay to avoid rate limits
       if (env.type === 'STATE' && env.tickOnly) return;
       try {
@@ -334,34 +383,65 @@
       } catch (e) {}
     }
 
-    _startPollingAndHeartbeat() {
-      // Poll local backend API & storage every 350ms
-      this.pollTimer = setInterval(async () => {
-        if (!this.roomCode) return;
-        if (this.backendAvailable) {
-          try {
-            const specFlag = this.isSpectator ? '&spectator=1' : '';
-            const res = await fetch(`/api/room/${this.roomCode}?pid=${encodeURIComponent(this.playerId)}&host=${this.isHost ? '1' : '0'}${specFlag}`, {
-              cache: 'no-store'
-            });
-            if (res.ok) {
-              const data = await res.json();
-              if (data && data.ok) {
-                if (!this.isSpectator && data.me && typeof this.onServerMeUpdate === 'function') {
-                  this.onServerMeUpdate(data.me);
-                }
-                if (!this.isSpectator && Array.isArray(data.actions)) {
-                  for (const act of data.actions) {
-                    this._handleEnvelope({ type: 'ACTION', code: this.roomCode, action: act, senderId: act.playerId }, 'api');
-                  }
-                }
-                if ((!this.isHost || this.isSpectator) && data.state) {
-                  this._handleEnvelope({ type: 'STATE', code: this.roomCode, state: data.state }, 'api');
+    async _pollBackendOnce() {
+      if (!this.roomCode || location.protocol === 'file:') return;
+      try {
+        const specFlag = this.isSpectator ? '&spectator=1' : '';
+        const res = await fetch(`/api/room/${this.roomCode}?pid=${encodeURIComponent(this.playerId)}&host=${this.isHost ? '1' : '0'}${specFlag}`, {
+          cache: 'no-store'
+        });
+        if (res.ok) {
+          if (!this.backendAvailable) {
+            this.backendAvailable = true;
+            this._emitStatus();
+          }
+          const data = await res.json();
+          if (data && data.ok) {
+            if (!this.isSpectator && data.me && typeof this.onServerMeUpdate === 'function') {
+              this.onServerMeUpdate(data.me);
+            }
+            if (!this.isSpectator && Array.isArray(data.actions)) {
+              for (const act of data.actions) {
+                this._handleEnvelope({ type: 'ACTION', code: this.roomCode, action: act, senderId: act.playerId }, 'api');
+              }
+            }
+            if ((!this.isHost || this.isSpectator) && data.state) {
+              this._handleEnvelope({ type: 'STATE', code: this.roomCode, state: data.state }, 'api');
+            } else if (this.isHost && !this.isSpectator && data.state && Array.isArray(data.state.players)) {
+              // Ensure host also discovers any player who joined directly via the backend API
+              for (const pl of data.state.players) {
+                if (pl && pl.id && pl.id !== this.playerId && pl.online !== false) {
+                  this._handleEnvelope({
+                    type: 'ACTION',
+                    code: this.roomCode,
+                    action: {
+                      type: 'HEARTBEAT',
+                      playerId: pl.id,
+                      player: pl,
+                      ts: Date.now()
+                    },
+                    senderId: pl.id
+                  }, 'api');
                 }
               }
             }
-          } catch (e) {}
+          }
         }
+      } catch (e) {}
+    }
+
+    _startPollingAndHeartbeat() {
+      this._pollBackendOnce();
+      let tickCount = 0;
+      // Poll local backend API & storage every 350ms
+      this.pollTimer = setInterval(async () => {
+        if (!this.roomCode) return;
+        tickCount++;
+        // Retry WebRTC connection to host if guest is not yet connected
+        if (!this.isHost && tickCount % 7 === 0 && this.peer && !this.peer.destroyed && (!this.hostConn || !this.hostConn.open)) {
+          this._connectToHostPeer(PEER_PREFIX + this.roomCode);
+        }
+        await this._pollBackendOnce();
       }, 350);
     }
 
@@ -380,17 +460,36 @@
 
       this._broadcastEnvelope(env);
 
-      if (this.backendAvailable) {
+      if (location.protocol !== 'file:') {
         fetch(`/api/room/${this.roomCode}/state`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ state, pid: this.playerId })
         }).then(async (r) => {
           if (r.ok) {
+            this.backendAvailable = true;
             const d = await r.json();
             if (d && Array.isArray(d.actions)) {
               for (const act of d.actions) {
                 this._handleEnvelope({ type: 'ACTION', code: this.roomCode, action: act, senderId: act.playerId }, 'api');
+              }
+            }
+            if (this.isHost && d && d.state && Array.isArray(d.state.players)) {
+              const localIds = new Set((state.players || []).map(p => p.id));
+              for (const pl of d.state.players) {
+                if (pl && pl.id && !localIds.has(pl.id) && pl.online !== false) {
+                  this._handleEnvelope({
+                    type: 'ACTION',
+                    code: this.roomCode,
+                    action: {
+                      type: 'JOIN_ROOM',
+                      playerId: pl.id,
+                      player: pl,
+                      ts: Date.now()
+                    },
+                    senderId: pl.id
+                  }, 'api');
+                }
               }
             }
           }
@@ -404,6 +503,9 @@
         action.id = 'act_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
       }
       this.seenActionIds.add(action.id);
+      if (action.type === 'JOIN_ROOM') {
+        this.lastJoinAction = action;
+      }
 
       const env = {
         type: 'ACTION',
@@ -423,7 +525,7 @@
 
       this._broadcastEnvelope(env);
 
-      if (this.backendAvailable) {
+      if (location.protocol !== 'file:') {
         const url = `/api/room/${this.roomCode}/action`;
         const body = JSON.stringify({ action });
         if (isUnload && navigator.sendBeacon) {
@@ -434,6 +536,19 @@
             headers: { 'Content-Type': 'application/json' },
             body,
             keepalive: !!isUnload
+          }).then(async (r) => {
+            if (r.ok && !isUnload) {
+              this.backendAvailable = true;
+              const d = await r.json();
+              if (d && d.ok) {
+                if (d.me && typeof this.onServerMeUpdate === 'function') {
+                  this.onServerMeUpdate(d.me);
+                }
+                if (d.state && (!this.isHost || this.isSpectator)) {
+                  this._handleEnvelope({ type: 'STATE', code: this.roomCode, state: d.state }, 'api');
+                }
+              }
+            }
           }).catch(() => {});
         }
       }

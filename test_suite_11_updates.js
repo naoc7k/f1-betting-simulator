@@ -541,6 +541,58 @@ function requestJson(port, method, reqPath, bodyObj = null, customHeaders = {}) 
       return `Auto-exclusão validada e limpeza manteve intocadas apenas as contas protegidas: ${remainingNames.join(', ')}`;
     });
 
+    // 13. Entrada de jogadores no mesmo lobby via código (proteção contra sobrescrita de POST /state e ausência de Excluir Perfil na Home)
+    await runTest(13, 'Entrada garantida no mesmo lobby pelo código da sala e botão Excluir Perfil apenas no menu superior', async () => {
+      const appJsCode = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf-8');
+      const homeFnStart = appJsCode.indexOf('function renderHomeView()');
+      const homeFnEnd = appJsCode.indexOf('function renderRoomPlayersListHTML(');
+      const homeFnBody = appJsCode.slice(homeFnStart, homeFnEnd);
+      assert.ok(!homeFnBody.includes('Excluir Perfil'), 'O botão Excluir Perfil não deve aparecer na tela inicial (renderHomeView)');
+      assert.ok(appJsCode.includes('Excluir Meu Perfil'), 'O botão Excluir Meu Perfil deve permanecer dentro do modal de perfil (renderProfileModal)');
+
+      const hostP = Array.from(srv.PLAYERS_DB.values()).find(p => p.name === 'naoc7k');
+      const guestP = Array.from(srv.PLAYERS_DB.values()).find(p => p.name === 'LXZADA');
+      const code = 'SAME99';
+
+      // Host creates room SAME99
+      await requestJson(port, 'POST', `/api/room/${code}/state`, {
+        pid: hostP.id,
+        state: {
+          code,
+          hostId: hostP.id,
+          creatorId: hostP.id,
+          players: [{ id: hostP.id, name: hostP.name, chips: hostP.chips, online: true }]
+        }
+      });
+
+      // Guest joins room SAME99 with the same code
+      const joinRes = await requestJson(port, 'POST', `/api/room/${code}/action`, {
+        action: {
+          id: 'act_join_same99',
+          type: 'JOIN_ROOM',
+          playerId: guestP.id,
+          player: { id: guestP.id, name: guestP.name, chips: guestP.chips, online: true }
+        }
+      });
+      assert.strictEqual(joinRes.status, 200);
+      assert.strictEqual(joinRes.data.state.players.length, 2, 'Guest deve ver imediatamente os 2 jogadores na sala ao entrar pelo código');
+
+      // Simulate Host sending an overlapping POST /state that still only had 1 player in its local snapshot
+      const hostPost = await requestJson(port, 'POST', `/api/room/${code}/state`, {
+        pid: hostP.id,
+        state: {
+          code,
+          hostId: hostP.id,
+          creatorId: hostP.id,
+          players: [{ id: hostP.id, name: hostP.name, chips: hostP.chips, online: true }]
+        }
+      });
+      assert.strictEqual(hostPost.status, 200);
+      assert.strictEqual(hostPost.data.state.players.length, 2, 'Servidor deve preservar o jogador recém-entrado mesmo se o Host enviar um POST /state antigo');
+
+      return `Ambos os jogadores (${hostP.name} e ${guestP.name}) sincronizados na mesma sala ${code} (2/2 online) e botão Excluir Perfil restrito ao modal superior`;
+    });
+
   } finally {
     // Restore original database files
     fs.writeFileSync(PLAYERS_DB_PATH, originalPlayersDb, 'utf-8');

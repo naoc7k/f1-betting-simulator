@@ -1236,6 +1236,19 @@ def validate_incoming_room_state(existing_state, incoming_state, sender_pid):
         incoming_state["kickedPlayerIds"] = list(kicked_set)
         if "players" in incoming_state:
             incoming_state["players"] = [p for p in incoming_state["players"] if p.get("id") not in kicked_set]
+    else:
+        kicked_set = set(incoming_state.get("kickedPlayerIds") or [])
+
+    if isinstance(existing_state.get("players"), list):
+        inc_players = incoming_state.setdefault("players", [])
+        inc_ids = {p.get("id") for p in inc_players if p and p.get("id")}
+        for ep in existing_state["players"]:
+            if not ep or not ep.get("id") or ep.get("isSpectator"):
+                continue
+            eid = ep["id"]
+            if eid not in kicked_set and eid not in inc_ids and ep.get("online", True) is not False and len(inc_players) < 8:
+                inc_players.append(ep)
+                inc_ids.add(eid)
 
     return incoming_state, None
 
@@ -1814,7 +1827,7 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                             return self._send_json(200, {"ok": True, "state": entry["state"]})
 
                         if action.get("player") and action["player"].get("id") not in PLAYERS_DB:
-                            upsert_player_record(action["player"], allow_initial_seed=True, client_meta={"clientIp": client_ip, "machineId": hdr_machine})
+                            upsert_player_record(action["player"], allow_initial_seed=True, client_meta={"clientIp": client_ip, "machineId": hdr_machine, "internalTrusted": True})
 
                         if not entry:
                             if act_type == "CREATE_ROOM" and action.get("state"):
@@ -1830,7 +1843,30 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
                                 ensure_authorized_creator(ROOMS[code])
                                 sync_room_player_balances(st)
                                 return self._send_json(200, {"ok": True, "state": st})
-                            return self._send_json(404, {"ok": False, "error": "ROOM_NOT_FOUND"})
+                            if act_type == "JOIN_ROOM" and action.get("player") and not action["player"].get("isSpectator"):
+                                init_pl = dict(action["player"], online=True)
+                                st = {
+                                    "code": code,
+                                    "hostId": init_pl.get("id"),
+                                    "creatorId": init_pl.get("id"),
+                                    "createdAt": int(now * 1000),
+                                    "circuitId": "int",
+                                    "laps": 15,
+                                    "wxMode": "auto",
+                                    "grid": [d["id"] for d in DRIVERS_CATALOG],
+                                    "players": [init_pl],
+                                    "race": None,
+                                    "processedActions": []
+                                }
+                                entry = {
+                                    "state": st,
+                                    "actions": [],
+                                    "updatedAt": now,
+                                    "heartbeats": {init_pl.get("id"): now} if init_pl.get("id") else {}
+                                }
+                                ROOMS[code] = entry
+                            else:
+                                return self._send_json(404, {"ok": False, "error": "ROOM_NOT_FOUND"})
 
                         st = entry.get("state")
                         creator_id = st.get("creatorId") or st.get("hostId") if st else None

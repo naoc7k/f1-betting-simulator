@@ -1207,7 +1207,7 @@
   }
 
   async function joinRoom(codeInput) {
-    const rawCode = (codeInput || ($('#jc') ? $('#jc').value : '') || '').trim().toUpperCase();
+    const rawCode = String(codeInput || ($('#jc') ? $('#jc').value : '') || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (rawCode.length < 4) return toast('Digite um código de sala válido');
 
     S.spectatingOnly = false;
@@ -1223,9 +1223,59 @@
     } catch (e) {}
 
     const myEntry = makePlayerEntry(S.user, false);
+    let serverRoomState = null;
 
-    if (cachedRoom) {
+    // Try authoritative backend room lookup & immediate join first
+    if (location.protocol !== 'file:') {
+      try {
+        const mid = getOrCreateMachineId();
+        const joinRes = await fetch(`/api/room/${encodeURIComponent(rawCode)}/action`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Machine-Id': mid
+          },
+          body: JSON.stringify({
+            action: {
+              id: 'act_join_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+              type: 'JOIN_ROOM',
+              playerId: S.user.id,
+              player: myEntry,
+              ts: Date.now()
+            }
+          })
+        });
+        if (joinRes.ok) {
+          const joinData = await joinRes.json();
+          if (joinData && joinData.ok && joinData.state) {
+            serverRoomState = joinData.state;
+            MP.backendAvailable = true;
+          }
+        } else if (joinRes.status !== 404) {
+          const getRes = await fetch(`/api/room/${encodeURIComponent(rawCode)}?pid=${encodeURIComponent(S.user.id)}`, { cache: 'no-store' });
+          if (getRes.ok) {
+            const getData = await getRes.json();
+            if (getData && getData.ok && getData.state) {
+              serverRoomState = getData.state;
+              MP.backendAvailable = true;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (serverRoomState) {
+      S.room = serverRoomState;
+      S.room.awaitingHostState = false;
+      if (!S.room.creatorId) S.room.creatorId = S.room.hostId;
+      if (Array.isArray(S.room.kickedPlayerIds)) {
+        S.room.kickedPlayerIds = S.room.kickedPlayerIds.filter(id => id !== S.user.id);
+      }
+      upsertPlayerInRoom(S.room, myEntry);
+    } else if (cachedRoom && (cachedRoom.creatorId || cachedRoom.hostId)) {
       S.room = cachedRoom;
+      S.room.awaitingHostState = false;
+      if (!S.room.creatorId) S.room.creatorId = S.room.hostId;
       if (Array.isArray(S.room.kickedPlayerIds)) {
         S.room.kickedPlayerIds = S.room.kickedPlayerIds.filter(id => id !== S.user.id);
       }
@@ -1235,6 +1285,7 @@
         code: rawCode,
         hostId: null,
         creatorId: null,
+        awaitingHostState: true,
         createdAt: Date.now(),
         circuitId: 'int',
         laps: 15,
@@ -1450,11 +1501,12 @@
     room.players = room.players || [];
     const existing = room.players.find(p => p.id === playerEntry.id);
 
-    // Ensure room has a single creatorId assigned to the first authorized player
-    if (!room.creatorId && !room.hostId) {
+    // Ensure room has a single creatorId assigned ONLY when created by host or when creatorId is already known
+    // Never hijack creatorId on a guest placeholder room awaiting host state!
+    if (!room.creatorId && !room.hostId && !room.awaitingHostState && playerEntry.isCreator) {
       room.creatorId = playerEntry.id;
       room.hostId = playerEntry.id;
-    } else if (!room.creatorId) {
+    } else if (!room.creatorId && room.hostId) {
       room.creatorId = room.hostId;
     }
 
@@ -1475,15 +1527,15 @@
       existing.wins = playerEntry.wins ?? existing.wins;
       existing.online = true;
       existing.lastSeen = Date.now();
-      existing.isHost = (room.creatorId === existing.id);
-      existing.isCreator = (room.creatorId === existing.id);
+      existing.isHost = !!(room.creatorId && room.creatorId === existing.id);
+      existing.isCreator = !!(room.creatorId && room.creatorId === existing.id);
       return { joinedNew: false, reconnected: wasOffline };
     } else {
       if (room.players.length >= 8) return { joinedNew: false, full: true };
       playerEntry.online = true;
       playerEntry.lastSeen = Date.now();
-      playerEntry.isHost = (room.creatorId === playerEntry.id);
-      playerEntry.isCreator = (room.creatorId === playerEntry.id);
+      playerEntry.isHost = !!(room.creatorId && room.creatorId === playerEntry.id);
+      playerEntry.isCreator = !!(room.creatorId && room.creatorId === playerEntry.id);
       room.players.push(playerEntry);
       return { joinedNew: true, reconnected: false };
     }
@@ -1532,24 +1584,41 @@
           refreshUI();
         }
       } else {
-        // If current creator went offline (>9s without update), promote next online player so race is never stuck!
-        const curCreator = S.room.players.find(p => p.id === (S.room.creatorId || S.room.hostId));
-        if (curCreator && curCreator.online === false) {
-          const firstOnline = S.room.players.find(p => p.online !== false);
-          if (firstOnline && firstOnline.id === S.user.id) {
-            S.room.creatorId = S.user.id;
-            S.room.hostId = S.user.id;
-            MP.isHost = true;
-            MP.broadcastState(S.room);
-            refreshUI();
+        // Only promote next online player if a known creator already existed in this synced room and went offline
+        const knownCreatorId = S.room.creatorId || S.room.hostId;
+        if (!S.room.awaitingHostState && knownCreatorId && knownCreatorId !== S.user.id) {
+          const curCreator = S.room.players.find(p => p.id === knownCreatorId);
+          if (curCreator && curCreator.online === false) {
+            const firstOnline = S.room.players.find(p => p.online !== false);
+            if (firstOnline && firstOnline.id === S.user.id) {
+              S.room.creatorId = S.user.id;
+              S.room.hostId = S.user.id;
+              MP.isHost = true;
+              MP.broadcastState(S.room);
+              refreshUI();
+              return;
+            }
           }
         }
-        MP.sendAction({
-          type: 'HEARTBEAT',
-          playerId: S.user.id,
-          player: myEntry,
-          ts: now
-        });
+        // If still awaiting authoritative host state or alone in a guest lobby, re-announce JOIN_ROOM + REQUEST_STATE
+        if (S.room.awaitingHostState || !knownCreatorId || S.room.players.length <= 1) {
+          MP.sendAction({
+            type: 'JOIN_ROOM',
+            playerId: S.user.id,
+            player: myEntry,
+            ts: now
+          });
+          if (typeof MP.requestHostState === 'function') {
+            MP.requestHostState();
+          }
+        } else {
+          MP.sendAction({
+            type: 'HEARTBEAT',
+            playerId: S.user.id,
+            player: myEntry,
+            ts: now
+          });
+        }
       }
     }, 2400);
   }
@@ -1579,7 +1648,9 @@
     const prevCreator = S.room.creatorId || S.room.hostId;
 
     S.room = newState;
+    S.room.awaitingHostState = false;
     if (!S.room.creatorId) S.room.creatorId = S.room.hostId;
+    MP._saveLocalRoomState(S.room);
 
     // Update MultiplayerManager host flag if creator role was assigned to us
     MP.isHost = !S.spectatingOnly && isAuthorizedCreator();
@@ -1606,6 +1677,7 @@
         }
       } else if (!Array.isArray(S.room.kickedPlayerIds) || !S.room.kickedPlayerIds.includes(S.user.id)) {
         const myEntry = makePlayerEntry(S.user, false);
+        upsertPlayerInRoom(S.room, myEntry);
         MP.sendAction({ type: 'JOIN_ROOM', playerId: S.user.id, player: myEntry, ts: Date.now() });
       }
     }
@@ -1650,9 +1722,9 @@
 
     if (act.type === 'JOIN_ROOM' && act.player) {
       const res = upsertPlayerInRoom(S.room, act.player);
-      if (res.joinedNew) {
+      if (res && res.joinedNew) {
         toast(`🟢 ${act.player.name} entrou na sala!`, 'ok');
-      } else if (res.reconnected) {
+      } else if (res && res.reconnected) {
         toast(`🟢 ${act.player.name} reconectou à corrida!`, 'ok');
       }
       if (isAuthorizedCreator()) MP.broadcastState(S.room);
@@ -1662,10 +1734,16 @@
 
     if ((act.type === 'HEARTBEAT' || act.type === 'PLAYER_SYNC') && act.player) {
       const res = upsertPlayerInRoom(S.room, act.player);
-      if (res.reconnected) {
+      if (res && res.joinedNew) {
+        toast(`🟢 ${act.player.name} entrou na sala!`, 'ok');
+        if (isAuthorizedCreator()) MP.broadcastState(S.room);
+        refreshUI();
+        return;
+      }
+      if (res && res.reconnected) {
         toast(`🟢 ${act.player.name} reconectou à sala!`, 'ok');
       }
-      if (act.type === 'PLAYER_SYNC' && isAuthorizedCreator()) {
+      if ((act.type === 'PLAYER_SYNC' || (res && res.reconnected)) && isAuthorizedCreator()) {
         MP.broadcastState(S.room);
       }
       // Do NOT trigger a full DOM re-render on silent heartbeats! Only update targeted elements if needed.
@@ -3124,7 +3202,6 @@
           </div>
           <div class="row no-flex" style="gap:6px">
             <button class="btn ghost sm no-flex" onclick="F1App.openProfileModal()">✏️ Editar Perfil</button>
-            <button class="btn ghost sm no-flex" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.openProfileModal(true)" title="Excluir e resetar seu próprio perfil">🗑️ Excluir Perfil</button>
           </div>
         </div>
       </div>
