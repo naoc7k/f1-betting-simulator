@@ -3,6 +3,7 @@
  */
 (function () {
   const { TEAMS, DRIVERS, TEAM_PACE, AVATARS, CIRCUITS } = window.F1Tracks;
+  const FIN = window.F1Finance;
   const MP = window.F1Multiplayer;
   const SIM3D = window.F1Sim3D;
 
@@ -33,10 +34,13 @@
     profileModalOpen: false,
     profileDraftName: '',
     profileDraftAvatar: 'av1',
-    user: null, // Persistent player profile { id, name, avatarId, chips, balanceVersion, wins, cashbox, settledBets }
+    user: null, // Persistent player profile { id, name, avatarId, chips, balanceVersion, wins, losses, raceExposures, cashbox, settledBets }
     room: null, // Synchronized room { code, hostId, creatorId, circuitId, laps, wxMode, grid, players, race }
+    betTab: 'overtake',       // 'overtake' | 'placement'
     selectedBetDriver: 'VER',
-    betAmountInput: 20,
+    selectedBetMarket: 'P1',  // 'P1' | 'P2' | 'P3' | 'PODIUM' | 'TOP5' | 'TOP10'
+    betAmountInput: 10,
+    betInFlight: false,       // Mutex against simultaneous double-click / concurrent bet requests
     highlightedDriver: null,
     spectator: false,
     history: [],
@@ -132,6 +136,9 @@
     acc.cashbox.betHistory = acc.cashbox.betHistory || [];
     acc.cashbox.financialHistory = acc.cashbox.financialHistory || [];
     acc.settledBets = acc.settledBets || {};
+    acc.raceExposures = acc.raceExposures || {};
+    acc.losses = Number(acc.losses || 0);
+    acc.committedChips = r2(acc.committedChips || 0);
     acc.avatarId = acc.avatarId || 'av1';
     acc.balanceVersion = Number(acc.balanceVersion || 1);
 
@@ -143,9 +150,10 @@
         acc.balanceVersion += 1;
       }
     }
-    if (typeof acc.chips !== 'number' || isNaN(acc.chips)) {
-      acc.chips = INITIAL_CHIPS;
+    if (typeof acc.chips !== 'number' || isNaN(acc.chips) || acc.chips < 0) {
+      acc.chips = Math.max(0, Number(acc.chips) || INITIAL_CHIPS);
     }
+    acc.totalBalance = r2(acc.chips + acc.committedChips);
     return acc;
   }
 
@@ -1149,6 +1157,41 @@
     return c === cur ? (c === 'M' ? 'H' : 'M') : c;
   };
 
+  function recordRealOvertakeEvent(r, lapNum, passerId, passedId, newPosition, sectorLabel = null) {
+    if (!r || !passerId || !passedId || passerId === passedId) return null;
+    const dPasser = r.drv && r.drv[passerId];
+    const dPassed = r.drv && r.drv[passedId];
+    // Strictly require both drivers to be actively running on track (no DNF, no DNS)
+    if (!dPasser || dPasser.st !== 'run' || !dPassed || dPassed.st !== 'run') return null;
+
+    r.ovSeq = (Number(r.ovSeq) || 0) + 1;
+    r.overtakeLog = Array.isArray(r.overtakeLog) ? r.overtakeLog : [];
+    const evId = `ov_${r.id}_L${lapNum}_S${r.ovSeq}_${passerId}_${passedId}`;
+    if (r.overtakeLog.some(x => x.id === evId)) return null;
+
+    const entry = {
+      id: evId,
+      seq: r.ovSeq,
+      lap: Number(lapNum) || 1,
+      passer: passerId,
+      passed: passedId,
+      position: newPosition,
+      sector: sectorLabel,
+      cause: 'ON_TRACK',
+      realOnTrack: true,
+      passedDriverActive: true,
+      pitPass: false,
+      dnfPass: false,
+      penaltyPass: false,
+      adminChange: false,
+      artificial: false,
+      ts: Date.now()
+    };
+    r.overtakeLog.push(entry);
+    dPasser.ov = (Number(dPasser.ov) || 0) + 1;
+    return entry;
+  }
+
   function pushEvent(r, lapNum, text, kind) {
     r.seq = (r.seq || 0) + 1;
     r.events.unshift({ id: 'ev_' + r.seq, l: lapNum, t: text, k: kind });
@@ -1285,9 +1328,9 @@
             act[i - 1] = b;
             act[i] = a;
             ch = true;
-            if (!pit[a] && dd <= 1.5) {
-              tb.ov++;
-              if (i < 12) ev(`${b} ultrapassa ${a} e assume a P${i}!`, 'o');
+            if (!pit[a] && !pit[b] && ta.st === 'run' && tb.st === 'run' && dd <= 1.5) {
+              recordRealOvertakeEvent(r, L, b, a, i, null);
+              if (i < 12) ev(`${b} ultrapassa ${a} na pista e assume a P${i}!`, 'o');
             }
           } else {
             tb.t = ta.t + 0.32;
@@ -1345,8 +1388,15 @@
       order: [],
       start: [],
       events: [],
+      overtakeLog: [],
+      ovSeq: 0,
+      exposures: {},
+      oddsBook: null,
       dnf: [],
       done: false,
+      cancelled: false,
+      settled: false,
+      settlementId: null,
       started: false,
       running: false,
       bettingOpen: true,
@@ -1392,7 +1442,8 @@
 
     r.order = ids.slice();
     r.start = ids.slice();
-    pushEvent(r, 0, `Grid formado em ${c.name} (${total} voltas). Janela de apostas ABERTA!`, 'g');
+    r.oddsBook = FIN.calculateRaceOdds(r, { catalog: window.F1Tracks, champ: S.champ });
+    pushEvent(r, 0, `Grid formado em ${c.name} (${total} voltas). Odds dinâmicas calculadas (1.000 simulações). Janela de apostas ABERTA!`, 'g');
 
     S.room.race = r;
     if (!r.order.includes(S.selectedBetDriver)) {
@@ -1572,7 +1623,7 @@
           const tmpT = r.drv[ahead].t;
           r.drv[ahead].t = r.drv[behind].t + 0.18;
           r.drv[behind].t = tmpT;
-          r.drv[behind].ov = (r.drv[behind].ov || 0) + 1;
+          recordRealOvertakeEvent(r, r.lap, behind, ahead, posA + 1, sector);
           pushEvent(
             r,
             r.lap,
@@ -1592,148 +1643,294 @@
   }
 
   /* =====================================================================
-   * 5. BETTING SYSTEM (SORTED BY CURRENT CLASSIFICATION, LOCKED CLOSURE)
+   * 5. BETTING SYSTEM (REBALANCED ECONOMY: 10% EXPOSURE, OVERTAKES & PLACEMENT)
    * ===================================================================== */
   function mult(lap) {
-    const completedBlocks = Math.floor(Math.max(0, lap) / 10);
-    return Math.max(0.2, Math.round((1 - completedBlocks * 0.1) * 10) / 10);
+    return FIN.getLapMultiplier(lap);
   }
 
   function posOf(r, id) {
     return r.order.indexOf(id) + 1;
   }
 
-  function calculateBetPayout(bet, finalPos, isDnf) {
-    if (bet.cancelled || isDnf || finalPos <= 0) return 0;
-    let baseFactor = 0;
-    if (finalPos === 1) baseFactor = 3.0;
-    else if (finalPos === 2) baseFactor = 2.0;
-    else if (finalPos === 3) baseFactor = 1.5;
-
-    const gained = Math.max(0, (bet.startPos || finalPos) - finalPos);
-    const gainFactor = gained > 0 ? (1.0 + gained * 0.45) : 0;
-    const bestFactor = Math.max(baseFactor, gainFactor);
-
-    return bestFactor > 0 ? r2(bet.amount * bestFactor * (bet.mult || 1)) : 0;
+  function getMyRaceExposure(r) {
+    if (!S.user) {
+      return { initialBalance: 0, maxExposure: 0, committedOvertake: 0, committedPlacement: 0, totalCommitted: 0, remainingExposure: 0 };
+    }
+    ensureAccountIntegrity(S.user);
+    if (!r) {
+      const lim = r2(S.user.chips * FIN.EXPOSURE_RATE);
+      return {
+        initialBalance: S.user.chips,
+        maxExposure: lim,
+        committedOvertake: 0,
+        committedPlacement: 0,
+        totalCommitted: 0,
+        remainingExposure: lim
+      };
+    }
+    r.exposures = r.exposures || {};
+    if (S.user.raceExposures && S.user.raceExposures[r.id] && !r.exposures[S.user.id]) {
+      r.exposures[S.user.id] = S.user.raceExposures[r.id];
+    }
+    const exp = FIN.getOrInitRaceExposure(r, S.user.id, S.user.chips);
+    S.user.raceExposures[r.id] = r.exposures[S.user.id];
+    return exp;
   }
 
-  function placeBet() {
+  function getCommittedChipsInActiveRace(r, pid) {
+    if (!r || r.done || r.cancelled || r.settled || !Array.isArray(r.bets)) return 0;
+    return r2(
+      r.bets
+        .filter(b => b && b.pid === pid && !b.cancelled && b.status !== 'VOID')
+        .reduce((s, b) => s + (Number(b.amount) || 0), 0)
+    );
+  }
+
+  function calculateBetPayout(bet, finalPos, isDnf, raceRef) {
+    const r = raceRef || (S.room ? S.room.race : null);
+    if (r) {
+      const outcome = FIN.evaluateTicketForRace(r, bet);
+      return outcome ? outcome.ret : 0;
+    }
+    if (bet.cancelled || isDnf || finalPos <= 0) return 0;
+    return 0;
+  }
+
+  async function placeBet() {
+    if (S.betInFlight) {
+      return toast('Aguarde o processamento da aposta anterior.');
+    }
     if (!S.room || !S.room.race) return toast('Nenhuma corrida preparada.');
     const r = S.room.race;
-    if (r.done) return toast('A corrida já foi encerrada.');
+    if (r.done || r.cancelled) return toast('A corrida já foi encerrada ou cancelada.');
     if (r.running || !r.bettingOpen) {
       return toast('A janela de apostas já foi encerrada! Não são permitidas novas apostas neste momento.');
     }
 
+    const modality = (S.betTab === 'placement') ? 'placement' : 'overtake';
+    if (modality === 'placement' && (r.started || Number(r.lap || 0) > 0)) {
+      S.betTab = 'overtake';
+      refreshUI();
+      return toast('Apostas de colocação final são encerradas antes da largada!');
+    }
+
     const driverId = S.selectedBetDriver;
     if (!driverId || !r.order.includes(driverId)) {
-      return toast('Selecione um corredor na tabela de apostas.');
+      return toast('Selecione um piloto válido na tabela de apostas.');
     }
 
     const inputEl = $('#bet-amount-input');
-    const amount = Math.floor(+(inputEl ? inputEl.value : S.betAmountInput));
+    const amount = r2(+(inputEl ? inputEl.value : S.betAmountInput));
 
-    if (!amount || amount < 1) {
-      return toast('O valor mínimo de aposta é 1 ficha.');
-    }
-    if (amount > MAX_BET_AMOUNT) {
-      return toast(`Limite máximo excedido! O valor máximo por aposta é de ${fmt(MAX_BET_AMOUNT)} fichas.`);
+    if (!amount || amount <= 0 || isNaN(amount)) {
+      return toast('Informe um valor válido de fichas para apostar.');
     }
 
-    // Always ensure fresh balance from account map before checking
-    const freshMap = loadAccountsMap();
-    if (freshMap[S.user.id] && typeof freshMap[S.user.id].chips === 'number') {
-      if (freshMap[S.user.id].chips !== S.user.chips && (freshMap[S.user.id].balanceVersion || 1) >= (S.user.balanceVersion || 1)) {
-        S.user.chips = r2(freshMap[S.user.id].chips);
-        S.user.balanceVersion = freshMap[S.user.id].balanceVersion || S.user.balanceVersion;
-      }
-    }
-    // Also check if room player has newer chips from admin
-    if (S.room && Array.isArray(S.room.players)) {
-      const meInRoom = S.room.players.find(p => p.id === S.user.id);
-      if (meInRoom && typeof meInRoom.chips === 'number') {
-        const roomVer = Number(meInRoom.balanceVersion || 1);
-        const myVer = Number(S.user.balanceVersion || 1);
-        if (roomVer > myVer || (roomVer === myVer && meInRoom.chips > S.user.chips)) {
-          S.user.chips = r2(meInRoom.chips);
-          S.user.balanceVersion = roomVer;
+    S.betInFlight = true;
+    try {
+      // Cross-tab synchronize fresh account state before validating
+      const freshMap = loadAccountsMap();
+      if (freshMap[S.user.id]) {
+        const freshAcc = ensureAccountIntegrity(freshMap[S.user.id]);
+        if ((freshAcc.balanceVersion || 1) >= (S.user.balanceVersion || 1)) {
+          S.user.chips = r2(freshAcc.chips);
+          S.user.balanceVersion = freshAcc.balanceVersion;
+          S.user.raceExposures = Object.assign({}, S.user.raceExposures || {}, freshAcc.raceExposures || {});
         }
       }
-    }
 
-    if (amount > S.user.chips) {
-      return toast(`Saldo insuficiente! Seu saldo atual é de ${fmt(S.user.chips)} fichas.`);
-    }
+      // Restore any locked exposure from storage so multi-tab / refresh can never reset the 10% limit
+      r.exposures = r.exposures || {};
+      if (S.user.raceExposures && S.user.raceExposures[r.id]) {
+        r.exposures[S.user.id] = S.user.raceExposures[r.id];
+      }
 
-    S.user.chips = r2(S.user.chips - amount);
-    S.user.balanceVersion = Number(S.user.balanceVersion || 1) + 1;
+      const currentRound = Math.floor((Number(r.lap) || 0) / 10);
+      const betId = `bet_${S.user.id}_${r.id}_r${currentRound}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-    const currentRound = Math.floor(r.lap / 10);
-    const curMult = mult(r.lap);
-    const betId = `bet_${S.user.id}_${r.id}_r${currentRound}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      // If authoritative backend is available, validate & execute transactionally on the server first!
+      if (MP.backendAvailable && location.protocol !== 'file:') {
+        try {
+          const draftBet = {
+            id: betId,
+            raceId: r.id,
+            pid: S.user.id,
+            playerName: S.user.name,
+            playerAvatar: avObj(S.user.avatarId).icon,
+            playerColor: avObj(S.user.avatarId).color,
+            modality,
+            driver: driverId,
+            market: modality === 'placement' ? S.selectedBetMarket : null,
+            amount
+          };
+          const res = await fetch(`/api/room/${encodeURIComponent(S.room.code)}/bet`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ playerId: S.user.id, bet: draftBet })
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            return toast(data.error || 'Aposta recusada pelo servidor autoritativo.');
+          }
+          const srvBet = data.bet;
+          if (data.player) {
+            S.user.chips = r2(data.player.chips);
+            S.user.committedChips = r2(data.player.committedChips || 0);
+            S.user.totalBalance = r2(S.user.chips + S.user.committedChips);
+            S.user.balanceVersion = data.player.balanceVersion;
+            S.user.raceExposures = Object.assign({}, S.user.raceExposures || {}, data.player.raceExposures || {});
+            if (data.player.cashbox) {
+              S.user.cashbox = data.player.cashbox;
+            }
+          }
+          if (data.exposure && r.exposures) {
+            r.exposures[S.user.id] = Object.assign({}, r.exposures[S.user.id] || {}, {
+              initialBalance: data.exposure.initialBalance,
+              maxExposure: data.exposure.maxExposure
+            });
+            S.user.raceExposures[r.id] = r.exposures[S.user.id];
+          }
+          saveCurrentUser(true, false);
+          applyPlaceBetToRoom(srvBet, S.user.chips, S.user.balanceVersion);
+          if (isAuthorizedCreator()) {
+            MP.broadcastState(S.room);
+          } else {
+            MP.sendAction({
+              type: 'PLACE_BET',
+              playerId: S.user.id,
+              bet: srvBet,
+              playerChips: S.user.chips,
+              balanceVersion: S.user.balanceVersion,
+              ts: Date.now()
+            });
+          }
+          const msg = modality === 'placement'
+            ? `✓ Aposta confirmada: ${fmt(srvBet.amount)} 🪙 em ${srvBet.driver} (${srvBet.marketLabel} @ ${srvBet.odd.toFixed(2)}x)!`
+            : `✓ Aposta confirmada: ${fmt(srvBet.amount)} 🪙 em ${srvBet.driver} (Exp: ${srvBet.expectedOvertakes} ULTs · Mult ${vm(srvBet.mult)})!`;
+          toast(msg, 'ok');
+          updateHeaderAndRoomDOM();
+          refreshUI();
+          return;
+        } catch (err) {
+          // If network call failed mid-request, fall through only if backend is unreachable
+        }
+      }
 
-    const betObj = {
-      id: betId,
-      raceId: r.id,
-      pid: S.user.id,
-      playerName: S.user.name,
-      playerAvatar: avObj(S.user.avatarId).icon,
-      playerColor: avObj(S.user.avatarId).color,
-      driver: driverId,
-      amount,
-      round: currentRound,
-      lap: r.lap,
-      startPos: posOf(r, driverId),
-      mult: curMult,
-      locked: false,
-      cancelled: false,
-      ts: Date.now()
-    };
-
-    ensureAccountIntegrity(S.user);
-    S.user.cashbox.totalBet = r2(S.user.cashbox.totalBet + amount);
-    S.user.cashbox.betHistory.unshift({
-      id: betId,
-      raceId: r.id,
-      circuit: r.circuit.name,
-      driver: driverId,
-      amount,
-      round: currentRound,
-      lap: r.lap,
-      mult: curMult,
-      status: 'active',
-      ret: 0,
-      net: 0,
-      date: new Date().toLocaleString('pt-BR')
-    });
-    recordFinancialTx(
-      'tx_bet_' + betId,
-      'BET_PLACED',
-      `Aposta em ${driverId} (${dv(driverId).name})`,
-      `${r.circuit.name} · Rodada ${currentRound + 1} (${vm(curMult)})`,
-      -amount
-    );
-    saveCurrentUser(true, true);
-
-    applyPlaceBetToRoom(betObj, S.user.chips, S.user.balanceVersion);
-    if (isAuthorizedCreator()) {
-      MP.broadcastState(S.room);
-    } else {
-      MP.sendAction({
-        type: 'PLACE_BET',
-        playerId: S.user.id,
-        bet: betObj,
-        playerChips: S.user.chips,
-        balanceVersion: S.user.balanceVersion,
-        ts: Date.now()
+      // Local / P2P Authoritative Validation via F1Finance
+      const validation = FIN.validateBetRequest({
+        race: r,
+        player: S.user,
+        modality,
+        driverId,
+        market: S.selectedBetMarket,
+        amount,
+        catalog: window.F1Tracks,
+        champ: S.champ
       });
-    }
 
-    toast(`Aposta de ${fmt(amount)} fichas confirmada em ${driverId}!`, 'ok');
-    const balanceEl = $('#header-balance-val');
-    if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
-    updateHeaderAndRoomDOM();
-    refreshUI();
+      if (!validation.ok) {
+        return toast(validation.error);
+      }
+
+      const stake = validation.stake;
+      S.user.raceExposures[r.id] = r.exposures[S.user.id];
+      S.user.chips = r2(S.user.chips - stake);
+      S.user.balanceVersion = Number(S.user.balanceVersion || 1) + 1;
+
+      const confirmedEventSeq = Array.isArray(r.overtakeLog) ? r.overtakeLog.length : (Number(r.ovSeq) || 0);
+      const betObj = {
+        id: betId,
+        raceId: r.id,
+        pid: S.user.id,
+        playerName: S.user.name,
+        playerAvatar: avObj(S.user.avatarId).icon,
+        playerColor: avObj(S.user.avatarId).color,
+        modality,
+        driver: driverId,
+        amount: stake,
+        round: currentRound,
+        lap: r.lap,
+        startPos: posOf(r, driverId),
+        confirmedEventSeq,
+        locked: false,
+        cancelled: false,
+        status: 'ACTIVE',
+        modelVersion: validation.modelVersion,
+        ts: Date.now()
+      };
+
+      if (modality === 'placement') {
+        betObj.market = validation.market;
+        betObj.marketLabel = validation.marketLabel;
+        betObj.odd = validation.odd;
+        betObj.probability = validation.probability;
+      } else {
+        betObj.mult = validation.mult;
+        betObj.expectedOvertakes = validation.expectedOvertakes;
+        betObj.factorF = validation.factorF;
+      }
+
+      ensureAccountIntegrity(S.user);
+      applyPlaceBetToRoom(betObj, S.user.chips, S.user.balanceVersion);
+      S.user.committedChips = getCommittedChipsInActiveRace(r, S.user.id);
+      S.user.totalBalance = r2(S.user.chips + S.user.committedChips);
+
+      S.user.cashbox.totalBet = r2(S.user.cashbox.totalBet + stake);
+      S.user.cashbox.betHistory.unshift({
+        id: betId,
+        raceId: r.id,
+        circuit: r.circuit.name,
+        modality,
+        driver: driverId,
+        market: betObj.market || null,
+        marketLabel: betObj.marketLabel || null,
+        odd: betObj.odd || null,
+        probability: betObj.probability || null,
+        expectedOvertakes: betObj.expectedOvertakes ?? null,
+        amount: stake,
+        round: currentRound,
+        lap: r.lap,
+        mult: betObj.mult || null,
+        modelVersion: betObj.modelVersion,
+        status: 'active',
+        ret: 0,
+        net: 0,
+        date: new Date().toLocaleString('pt-BR')
+      });
+
+      const txTitle = modality === 'placement'
+        ? `Aposta de Colocação · ${driverId} (${betObj.marketLabel})`
+        : `Aposta de Ultrapassagem · ${driverId} (Exp: ${betObj.expectedOvertakes} ULTs)`;
+      const txDetail = modality === 'placement'
+        ? `${r.circuit.name} · Odd: ${betObj.odd.toFixed(2)}x (Prob: ${(betObj.probability * 100).toFixed(1)}%)`
+        : `${r.circuit.name} · Rodada ${currentRound + 1} (${vm(betObj.mult)})`;
+
+      recordFinancialTx('tx_bet_' + betId, 'BET_PLACED', txTitle, txDetail, -stake);
+      saveCurrentUser(true, true);
+
+      if (isAuthorizedCreator()) {
+        MP.broadcastState(S.room);
+      } else {
+        MP.sendAction({
+          type: 'PLACE_BET',
+          playerId: S.user.id,
+          bet: betObj,
+          playerChips: S.user.chips,
+          balanceVersion: S.user.balanceVersion,
+          ts: Date.now()
+        });
+      }
+
+      const msg = modality === 'placement'
+        ? `✓ Aposta confirmada: ${fmt(stake)} 🪙 em ${driverId} (${betObj.marketLabel} @ ${betObj.odd.toFixed(2)}x)!`
+        : `✓ Aposta confirmada: ${fmt(stake)} 🪙 em ${driverId} (Exp: ${betObj.expectedOvertakes} ULTs · Mult ${vm(betObj.mult)})!`;
+      toast(msg, 'ok');
+      updateHeaderAndRoomDOM();
+      refreshUI();
+    } finally {
+      S.betInFlight = false;
+    }
   }
 
   function applyPlaceBetToRoom(betObj, updatedChips, balanceVersion) {
@@ -1742,14 +1939,16 @@
     if (r.done || r.running || !r.bettingOpen) return;
     if (r.bets.some(b => b.id === betObj.id)) return;
     r.bets.push(betObj);
+    // Ensure exposure tracker in race is initialized for this player
     const pl = S.room.players.find(p => p.id === betObj.pid);
     if (pl && typeof updatedChips === 'number') {
       pl.chips = r2(updatedChips);
       if (balanceVersion) pl.balanceVersion = balanceVersion;
     }
+    FIN.getOrInitRaceExposure(r, betObj.pid, pl ? pl.chips : 0);
   }
 
-  function cancelBet(betId) {
+  async function cancelBet(betId) {
     if (!S.room || !S.room.race) return;
     const r = S.room.race;
 
@@ -1769,11 +1968,42 @@
       return toast('Esta aposta já foi cancelada.');
     }
 
+    if (MP.backendAvailable && location.protocol !== 'file:') {
+      try {
+        const res = await fetch(`/api/room/${encodeURIComponent(S.room.code)}/cancel_bet`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId: S.user.id, betId })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          if (data.player) {
+            S.user.chips = r2(data.player.chips);
+            S.user.committedChips = r2(data.player.committedChips || 0);
+            S.user.totalBalance = r2(S.user.chips + S.user.committedChips);
+            S.user.balanceVersion = data.player.balanceVersion;
+            if (data.player.cashbox) S.user.cashbox = data.player.cashbox;
+          }
+          applyCancelBetToRoom(betId, S.user.id, S.user.chips, S.user.balanceVersion);
+          saveCurrentUser(true, false);
+          if (isAuthorizedCreator()) MP.broadcastState(S.room);
+          toast(`Aposta cancelada! +${fmt(bet.amount)} fichas estornadas ao seu saldo.`, 'gold');
+          updateHeaderAndRoomDOM();
+          refreshUI();
+          return;
+        }
+      } catch (e) {}
+    }
+
     bet.cancelled = true;
+    bet.status = 'CANCELLED';
     S.user.chips = r2(S.user.chips + bet.amount);
     S.user.balanceVersion = Number(S.user.balanceVersion || 1) + 1;
 
     ensureAccountIntegrity(S.user);
+    applyCancelBetToRoom(betId, S.user.id, S.user.chips, S.user.balanceVersion);
+    S.user.committedChips = getCommittedChipsInActiveRace(r, S.user.id);
+    S.user.totalBalance = r2(S.user.chips + S.user.committedChips);
     S.user.cashbox.totalBet = r2(Math.max(0, S.user.cashbox.totalBet - bet.amount));
     const histEntry = S.user.cashbox.betHistory.find(h => h.id === betId);
     if (histEntry) {
@@ -1788,7 +2018,6 @@
     );
     saveCurrentUser(true, true);
 
-    applyCancelBetToRoom(betId, S.user.id, S.user.chips, S.user.balanceVersion);
     if (isAuthorizedCreator()) {
       MP.broadcastState(S.room);
     } else {
@@ -1803,8 +2032,6 @@
     }
 
     toast(`Aposta cancelada! +${fmt(bet.amount)} fichas estornadas ao seu saldo.`, 'gold');
-    const balanceEl = $('#header-balance-val');
-    if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
     updateHeaderAndRoomDOM();
     refreshUI();
   }
@@ -1816,6 +2043,7 @@
     const bet = r.bets.find(b => b.id === betId && b.pid === playerId);
     if (bet && !bet.locked) {
       bet.cancelled = true;
+      bet.status = 'CANCELLED';
       r.bets = r.bets.filter(b => b.id !== betId);
     }
     const pl = S.room.players.find(p => p.id === playerId);
@@ -1825,11 +2053,44 @@
     }
   }
 
+  /**
+   * 9. TRATAMENTO DE SITUAÇÕES EXCEPCIONAIS: Cancelamento de corrida antes da largada (VOID)
+   */
+  function cancelRaceBeforeStart() {
+    if (!S.room || !S.room.race) return;
+    if (!isAuthorizedCreator()) {
+      return toast('Apenas o criador autorizado da sala pode cancelar a corrida antes da largada.');
+    }
+    const r = S.room.race;
+    if (r.started || r.running || r.done) {
+      return toast('A corrida já foi iniciada e não pode mais ser cancelada como pré-largada.');
+    }
+    r.cancelled = true;
+    r.done = true;
+    r.running = false;
+    r.bettingOpen = false;
+    r.settlementId = r.settlementId || `stl_void_${r.id}_${Date.now()}`;
+    pushEvent(r, 0, '🚫 Corrida cancelada antes da largada! Todas as apostas confirmadas foram marcadas como VOID e reembolsadas.', 's');
+
+    r.bets.forEach(b => {
+      if (b.cancelled) return;
+      const outcome = FIN.evaluateTicketForRace(r, b);
+      r.res[b.id] = outcome;
+      b.status = 'VOID';
+    });
+
+    settleMyBetsForFinishedRace(r);
+    MP.broadcastState(S.room);
+    toast('Corrida cancelada! Apostas anuladas (VOID) e reembolsadas.', 'gold');
+    refreshUI();
+  }
+
   function finishRaceAuthoritative(r) {
     if (!r || r.done) return;
     r.done = true;
     r.running = false;
     r.bettingOpen = false;
+    r.settlementId = r.settlementId || `stl_${r.id}_${Date.now()}`;
     const w = r.order[0];
     const dt = new Date().toLocaleDateString('pt-BR');
 
@@ -1838,18 +2099,21 @@
     const summaryRes = [];
     r.bets.forEach(b => {
       if (b.cancelled) return;
-      const fin = posOf(r, b.driver);
-      const isDnf = r.drv[b.driver] && r.drv[b.driver].st === 'dnf';
-      const ret = calculateBetPayout(b, fin, isDnf);
-      const net = r2(ret - b.amount);
-      r.res[b.id] = { fin, isDnf, ret, net };
+      const outcome = FIN.evaluateTicketForRace(r, b);
+      if (!outcome) return;
+      outcome.settlementId = `stl_${b.id}`;
+      r.res[b.id] = outcome;
+      b.status = outcome.status;
       summaryRes.push({
         pid: b.pid,
         name: b.playerName,
+        modality: b.modality || 'overtake',
         driver: b.driver,
+        market: b.market || null,
         amount: b.amount,
-        ret,
-        net
+        status: outcome.status,
+        ret: outcome.ret,
+        net: outcome.net
       });
     });
 
@@ -1863,6 +2127,7 @@
 
     S.history.unshift({
       raceId: r.id,
+      settlementId: r.settlementId,
       circuit: r.circuit.name,
       winner: w,
       date: dt,
@@ -1874,26 +2139,36 @@
   }
 
   function settleMyBetsForFinishedRace(r) {
-    if (!r || !r.done || !S.user) return;
+    if (!r || (!r.done && !r.cancelled) || !S.user) return;
+    // Do not settle without a reliable final classification unless race was cancelled before start
+    if (!r.cancelled && (!Array.isArray(r.order) || r.order.length === 0)) return;
+
     ensureAccountIntegrity(S.user);
+
+    // Reload latest account state from storage first to prevent cross-tab duplicate settlement
+    const freshMap = loadAccountsMap();
+    if (freshMap[S.user.id] && freshMap[S.user.id].settledBets) {
+      S.user.settledBets = Object.assign({}, freshMap[S.user.id].settledBets, S.user.settledBets);
+    }
 
     let anySettled = false;
     let totalNetThisRace = 0;
 
     r.bets.forEach(b => {
-      if (b.cancelled || b.pid !== S.user.id) return;
+      if (!b || b.cancelled || b.pid !== S.user.id) return;
       if (S.user.settledBets[b.id]) return;
 
-      const outcome = r.res && r.res[b.id]
-        ? r.res[b.id]
-        : (() => {
-            const fin = posOf(r, b.driver);
-            const isDnf = r.drv[b.driver] && r.drv[b.driver].st === 'dnf';
-            const ret = calculateBetPayout(b, fin, isDnf);
-            return { fin, isDnf, ret, net: r2(ret - b.amount) };
-          })();
+      const outcome = (r.res && r.res[b.id]) ? r.res[b.id] : FIN.evaluateTicketForRace(r, b);
+      if (!outcome) return;
 
-      S.user.settledBets[b.id] = true;
+      const settlementId = outcome.settlementId || `stl_${b.id}`;
+      S.user.settledBets[b.id] = {
+        settlementId,
+        status: outcome.status,
+        ret: outcome.ret,
+        net: outcome.net,
+        ts: Date.now()
+      };
       anySettled = true;
 
       if (outcome.ret > 0) {
@@ -1901,40 +2176,71 @@
         S.user.balanceVersion = Number(S.user.balanceVersion || 1) + 1;
       }
 
-      if (outcome.net > 0) {
+      const histEntry = S.user.cashbox.betHistory.find(h => h.id === b.id);
+
+      if (outcome.voided || outcome.status === 'VOID') {
+        S.user.cashbox.totalBet = r2(Math.max(0, S.user.cashbox.totalBet - b.amount));
+        if (histEntry) {
+          histEntry.status = 'void';
+          histEntry.ret = outcome.ret;
+          histEntry.net = 0;
+        }
+        recordFinancialTx(
+          'tx_settle_' + b.id,
+          'BET_VOID',
+          `Aposta Anulada / VOID (${b.driver})`,
+          `${r.circuit.name} · Reembolso integral (${outcome.reason === 'DRIVER_DNS' ? 'Piloto DNS' : 'Corrida Cancelada'})`,
+          +outcome.ret
+        );
+      } else if (outcome.won) {
         S.user.wins = (S.user.wins || 0) + 1;
         S.user.cashbox.totalWon = r2(S.user.cashbox.totalWon + outcome.net);
+        if (histEntry) {
+          histEntry.status = 'won';
+          histEntry.fin = outcome.fin;
+          histEntry.actualOvertakes = outcome.actualOvertakes;
+          histEntry.ret = outcome.ret;
+          histEntry.net = outcome.net;
+        }
+        const winTitle = b.modality === 'placement'
+          ? `Vitória em Colocação (${b.driver} · ${b.marketLabel || b.market})`
+          : `Vitória em Ultrapassagens (${b.driver} · ${outcome.actualOvertakes} ULTs vs Exp ${outcome.expectedOvertakes})`;
         recordFinancialTx(
           'tx_settle_' + b.id,
           'RACE_WIN',
-          `Vitória na Aposta (${b.driver} · ${outcome.fin}º Lugar)`,
-          `${r.circuit.name} · Retorno: ${fmt(outcome.ret)} (Lucro: +${fmt(outcome.net)})`,
+          winTitle,
+          `${r.circuit.name} · Retorno: ${fmt(outcome.ret)} (Lucro Líquido: +${fmt(outcome.net)})`,
           +outcome.ret
         );
       } else {
+        S.user.losses = (S.user.losses || 0) + 1;
         const lossAmt = Math.abs(outcome.net);
         S.user.cashbox.totalLost = r2(S.user.cashbox.totalLost + lossAmt);
+        if (histEntry) {
+          histEntry.status = 'lost';
+          histEntry.fin = outcome.fin;
+          histEntry.actualOvertakes = outcome.actualOvertakes;
+          histEntry.ret = 0;
+          histEntry.net = outcome.net;
+        }
+        const lossTitle = b.modality === 'placement'
+          ? `Aposta Perdida · Colocação (${b.driver} · ${b.marketLabel || b.market})`
+          : `Aposta Perdida · Ultrapassagens (${b.driver} · ${outcome.actualOvertakes ?? 0}/${outcome.expectedOvertakes ?? 0} ULTs)`;
         recordFinancialTx(
           'tx_settle_' + b.id,
           'RACE_LOSS',
-          `Resultado da Aposta (${b.driver} · ${outcome.isDnf ? 'DNF' : outcome.fin + 'º Lugar'})`,
-          `${r.circuit.name} · Valor apostado: ${fmt(b.amount)}`,
+          lossTitle,
+          `${r.circuit.name} · Final: ${outcome.isDnf ? 'DNF' : outcome.fin + 'º Lugar'} · Valor apostado: ${fmt(b.amount)}`,
           0
         );
       }
 
       S.user.cashbox.netProfit = r2(S.user.cashbox.totalWon - S.user.cashbox.totalLost);
-
-      const histEntry = S.user.cashbox.betHistory.find(h => h.id === b.id);
-      if (histEntry) {
-        histEntry.status = outcome.net > 0 ? 'won' : 'lost';
-        histEntry.fin = outcome.fin;
-        histEntry.ret = outcome.ret;
-        histEntry.net = outcome.net;
-      }
-
-      totalNetThisRace += outcome.net;
+      totalNetThisRace = r2(totalNetThisRace + outcome.net);
     });
+
+    S.user.committedChips = 0;
+    S.user.totalBalance = r2(S.user.chips);
 
     if (anySettled) {
       saveCurrentUser(true, true);
@@ -1943,7 +2249,7 @@
       if (balanceEl) balanceEl.textContent = fmt(S.user.chips);
       updateHeaderAndRoomDOM();
       if (totalNetThisRace > 0) {
-        toast(`🏆 Parabéns! Você lucrou +${fmt(totalNetThisRace)} fichas nesta corrida!`, 'gold');
+        toast(`🏆 Parabéns! Você obteve lucro líquido de +${fmt(totalNetThisRace)} fichas nesta corrida!`, 'gold');
       }
     }
   }
@@ -2337,13 +2643,31 @@
       S.selectedBetDriver = orderedDrivers[0];
     }
 
+    if (S.betTab === 'placement' && !r.oddsBook) {
+      r.oddsBook = FIN.calculateRaceOdds(r, { catalog: window.F1Tracks, champ: S.champ });
+    }
+
     return orderedDrivers.map((id, idx) => {
       const d = dv(id);
       const t = TEAMS[d.team];
       const drvState = r.drv ? r.drv[id] : null;
-      const isDnf = drvState && drvState.st === 'dnf';
+      const isDnf = drvState && (drvState.st === 'dnf' || drvState.st === 'dns');
       const posNum = idx + 1;
       const isSel = S.selectedBetDriver === id;
+
+      let subMeta = `<small class="mut" style="font-size:10px">${esc(t.name)}</small>`;
+      if (S.betTab === 'placement' && r.oddsBook && r.oddsBook.drivers && r.oddsBook.drivers[id]) {
+        const mInfo = r.oddsBook.drivers[id][S.selectedBetMarket];
+        if (mInfo && mInfo.enabled) {
+          subMeta = `<small class="mono" style="font-size:10.5px;color:var(--gold);font-weight:800">Odd: ${mInfo.odd.toFixed(2)}x · ${(mInfo.probability * 100).toFixed(1)}%</small>`;
+        } else {
+          subMeta = `<small class="mut" style="font-size:10px;color:var(--red2)">Indisponível (0%)</small>`;
+        }
+      } else {
+        const expOv = FIN.calculateExpectedOvertakes(r, id, window.F1Tracks, S.champ);
+        const curOv = drvState ? (drvState.ov || 0) : 0;
+        subMeta = `<small class="mono" style="font-size:10px;color:var(--cyan)">Exp: ${expOv} ULTs · Pista: ${curOv}</small>`;
+      }
 
       return `<div class="bet-driver-card ${isSel ? 'selected' : ''}" data-driver="${id}" style="${isDnf ? 'opacity:0.45' : ''}" onclick="F1App.selectBetDriver('${id}')">
         <span class="bet-pos-badge mono ${posNum <= 3 ? 'podium-' + posNum : ''}">${isDnf ? 'OUT' : posNum + 'º'}</span>
@@ -2351,18 +2675,118 @@
         <div style="min-width:0;flex:1">
           <div style="font-weight:900;font-size:13px">${id} <span class="mut" style="font-size:11px">#${d.num}</span></div>
           <div style="font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.name)}</div>
-          <small class="mut" style="font-size:10px">${esc(t.name)}</small>
+          ${subMeta}
         </div>
         ${isSel ? '<span class="sel-check">★</span>' : ''}
       </div>`;
     }).join('');
   }
 
+  function renderPlacementMarketCardsHTML(r, driverId) {
+    if (!r.oddsBook) {
+      r.oddsBook = FIN.calculateRaceOdds(r, { catalog: window.F1Tracks, champ: S.champ });
+    }
+    const dOdds = (r.oddsBook.drivers && r.oddsBook.drivers[driverId]) || {};
+    return Object.values(FIN.PLACEMENT_MARKETS).map(m => {
+      const info = dOdds[m.id] || { enabled: false, odd: 0, probability: 0 };
+      const isSel = S.selectedBetMarket === m.id;
+      const disabled = !info.enabled || info.probability <= 0;
+      return `<div class="market-card ${isSel ? 'selected' : ''} ${disabled ? 'disabled' : ''}" data-market="${m.id}" onclick="${disabled ? '' : `F1App.selectBetMarket('${m.id}')`}">
+        <div class="row" style="justify-content:space-between;gap:4px">
+          <b style="font-size:12px">${esc(m.shortLabel)}</b>
+          <span class="mono" style="font-weight:900;font-size:13px;color:var(--${disabled ? 'mu' : 'gold'})">
+            ${disabled ? 'BLOQ' : info.odd.toFixed(2) + 'x'}
+          </span>
+        </div>
+        <div class="row" style="justify-content:space-between;gap:4px">
+          <small class="mut" style="font-size:10px">${esc(m.desc)}</small>
+          <small class="mono mut" style="font-size:10px">${disabled ? '0,0%' : (info.probability * 100).toFixed(1) + '%'}</small>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  /**
+   * 10. PAINEL FINANCEIRO GERAL (EXIBIDO PERMANENTEMENTE)
+   */
+  function renderGeneralFinancialPanel(r) {
+    const u = S.user;
+    ensureAccountIntegrity(u);
+    const exp = getMyRaceExposure(r);
+    const activeMyBets = r && Array.isArray(r.bets)
+      ? r.bets.filter(b => b && b.pid === u.id && !b.cancelled && b.status !== 'VOID')
+      : [];
+    const committedNow = r && !r.done && !r.cancelled ? exp.totalCommitted : 0;
+    const totalBalance = r2(u.chips + committedNow);
+
+    const wonCount = u.cashbox.betHistory.filter(b => b.status === 'won').length;
+    const lostCount = u.cashbox.betHistory.filter(b => b.status === 'lost').length;
+    const raceTxs = u.cashbox.financialHistory.filter(tx => r && tx.detail && tx.detail.includes(r.circuit.name)).slice(0, 6);
+
+    return `<div class="card cyan-edge" id="general-financial-panel">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <h3>📊 Painel Financeiro Geral & Exposição (10%)</h3>
+        <span class="chip mono" style="font-size:10.5px;padding:2px 8px">Fator F: 0,20 · Margem: 6%</span>
+      </div>
+
+      <div class="fin-mini-grid">
+        <div class="fin-mini-item">
+          <small>Saldo Total</small>
+          <b class="mono">${fmt(totalBalance)} 🪙</b>
+        </div>
+        <div class="fin-mini-item">
+          <small>Saldo Disponível</small>
+          <b class="mono gold-tx">${fmt(u.chips)} 🪙</b>
+        </div>
+        <div class="fin-mini-item">
+          <small>Fichas Comprometidas</small>
+          <b class="mono" style="color:var(--cyan)">${fmt(committedNow)} 🪙</b>
+        </div>
+        <div class="fin-mini-item">
+          <small>Limite de Exposição (10%)</small>
+          <b class="mono">${fmt(exp.remainingExposure)} / ${fmt(exp.maxExposure)} 🪙</b>
+        </div>
+        <div class="fin-mini-item">
+          <small>Apostado · Ultrapassagens</small>
+          <b class="mono">${fmt(exp.committedOvertake)} 🪙</b>
+        </div>
+        <div class="fin-mini-item">
+          <small>Apostado · Colocação</small>
+          <b class="mono">${fmt(exp.committedPlacement)} 🪙</b>
+        </div>
+        <div class="fin-mini-item">
+          <small>Apostas (Venc. / Perd.)</small>
+          <b class="mono"><span class="ok">${wonCount}V</span> / <span class="bad">${lostCount}D</span></b>
+        </div>
+        <div class="fin-mini-item">
+          <small>Lucro Líquido Acumulado</small>
+          <b class="mono ${u.cashbox.netProfit >= 0 ? 'ok' : 'bad'}">${u.cashbox.netProfit >= 0 ? '+' : ''}${fmt(u.cashbox.netProfit)} 🪙</b>
+        </div>
+      </div>
+
+      <div style="margin-top:10px">
+        <small class="mut" style="font-weight:800;font-size:10.5px;text-transform:uppercase">Histórico Financeiro da Corrida (${activeMyBets.length} bilhetes ativos)</small>
+        <div style="max-height:125px;overflow-y:auto;margin-top:4px">
+          ${raceTxs.length ? raceTxs.map(tx => `<div class="ev" style="display:flex;justify-content:space-between;gap:6px;font-size:11.5px;padding:4px 0">
+            <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(tx.title)}</span>
+            <b class="mono" style="color:var(--${tx.amount > 0 ? 'ok' : tx.amount < 0 ? 'gold' : 'red2'})">${tx.amount > 0 ? '+' : ''}${fmt(tx.amount)} 🪙</b>
+          </div>`).join('') : '<div class="mut" style="font-size:11.5px;padding:4px 0">Nenhuma transação registrada nesta corrida ainda.</div>'}
+        </div>
+      </div>
+    </div>`;
+  }
+
   function renderBettingPanel(r) {
-    if (r.done) return '';
+    if (r.done || r.cancelled) return renderGeneralFinancialPanel(r);
 
     const curMult = mult(r.lap);
     const roundNum = Math.floor(r.lap / 10) + 1;
+    const isPreRace = !r.started && Number(r.lap || 0) === 0;
+
+    // Enforce rule Section 4: Final Placement bets are strictly closed after race start
+    if (!isPreRace && S.betTab === 'placement') {
+      S.betTab = 'overtake';
+    }
 
     if (r.running || !r.bettingOpen) {
       const nextWindowLap = (Math.floor(r.lap / 10) + 1) * 10;
@@ -2375,11 +2799,12 @@
         <p class="mut" style="margin:6px 0 0;font-size:13px">
           ${r.running
             ? (hasMoreWindows
-                ? `Corrida em andamento! Uma nova rodada de apostas abrirá ao completar a <b>Volta ${nextWindowLap}</b>.`
+                ? `Corrida em andamento! Uma nova rodada de apostas de Ultrapassagens abrirá ao completar a <b>Volta ${nextWindowLap}</b>.`
                 : `Corrida no trecho final! As apostas estão bloqueadas até a bandeira quadriculada.`)
             : `O período de apostas desta rodada foi encerrado definitivamente e não pode ser reaberto.`}
         </p>
-      </div>`;
+      </div>
+      <div style="margin-top:12px">${renderGeneralFinancialPanel(r)}</div>`;
     }
 
     const orderedDrivers = (r.order && r.order.length ? r.order : r.start).slice();
@@ -2389,67 +2814,151 @@
     const selDrv = dv(S.selectedBetDriver);
     const selTeam = TEAMS[selDrv.team];
     const selPos = orderedDrivers.indexOf(S.selectedBetDriver) + 1;
-    const amt = Math.min(MAX_BET_AMOUNT, Math.max(1, Math.floor(+S.betAmountInput || 20)));
+    const exp = getMyRaceExposure(r);
+    const maxAllowedBet = Math.max(0, r2(Math.min(S.user.chips, exp.remainingExposure)));
+    const amt = r2(Math.max(0, +S.betAmountInput || Math.min(10, maxAllowedBet || 10)));
 
     return `<div class="card gold-edge" id="betting-form-card">
       <div class="row" style="justify-content:space-between">
-        <h3>🪙 Fazer Aposta · Rodada ${roundNum} (${r.lap === 0 ? 'Grid de Largada' : 'Após Volta ' + r.lap})</h3>
-        <span class="chip mono" style="border-color:var(--gold);color:var(--gold)">Multiplicador ${vm(curMult)}</span>
+        <h3>🪙 Painel de Apostas · Rodada ${roundNum} (${isPreRace ? 'Pré-Largada' : 'Volta ' + r.lap})</h3>
+        <span class="chip mono" style="border-color:var(--gold);color:var(--gold)">
+          Limite 10%: ${fmt(exp.remainingExposure)} / ${fmt(exp.maxExposure)} 🪙
+        </span>
       </div>
 
-      <small class="mut" style="display:block;margin-top:4px">
-        1. Escolha o corredor (organizados pela classificação atual da corrida, do 1º ao último colocado):
+      <div class="bet-tabs">
+        <button type="button" class="bet-tab-btn ${S.betTab === 'overtake' ? 'on' : ''}" onclick="F1App.setBetTab('overtake')">
+          ⚔️ Aba 1 · Ultrapassagens (${vm(curMult)})
+        </button>
+        <button type="button" class="bet-tab-btn ${S.betTab === 'placement' ? 'on' : ''}" onclick="F1App.setBetTab('placement')" ${!isPreRace ? 'disabled title="Encerrado após a largada"' : ''}>
+          🏆 Aba 2 · Colocação Final ${!isPreRace ? '🔒' : ''}
+        </button>
+      </div>
+
+      <small class="mut" style="display:block;margin-top:2px">
+        1. Seleção de Piloto (ordenados pela classificação atual da corrida):
       </small>
 
       <div class="bet-driver-grid" id="bet-driver-table">
         ${renderBetDriverCardsHTML(r)}
       </div>
 
-      <div class="bet-summary-box" id="selected-bet-preview">
-        <div class="row" style="justify-content:space-between">
-          <div class="dr">
-            <span class="tm" style="background:${selTeam.color};height:24px"></span>
-            <div>
-              <small class="mut">CORREDOR SELECIONADO (${selPos}º COLOCADO)</small>
-              <div style="font-weight:900;color:var(--gold)">${selDrv.id} · ${esc(selDrv.name)} (${esc(selTeam.name)})</div>
-            </div>
-          </div>
-          <span class="chip mono">${vm(curMult)}</span>
+      ${S.betTab === 'placement' ? `
+        <small class="mut" style="display:block;margin-top:6px">
+          2. Seleção de Mercado & Odds Dinâmicas (1.000 simulações · Margem 6%):
+        </small>
+        <div class="market-grid" id="bet-market-grid">
+          ${renderPlacementMarketCardsHTML(r, S.selectedBetDriver)}
         </div>
+      ` : ''}
+
+      <div class="bet-summary-box" id="selected-bet-preview">
+        ${renderSelectedBetPreviewHTML(r, selDrv, selTeam, selPos, curMult)}
       </div>
 
       <div>
         <div class="row" style="justify-content:space-between;margin-bottom:4px">
-          <small class="mut">2. Valor da Aposta (Máx: ${fmt(MAX_BET_AMOUNT)} fichas)</small>
-          <small class="mono" style="color:var(--gold)">Saldo: <span id="bet-panel-balance">${fmt(S.user.chips)}</span> 🪙</small>
+          <small class="mut">${S.betTab === 'placement' ? '3.' : '2.'} Valor da Aposta (Limite Disp. na Corrida: <b class="mono" style="color:var(--cyan)" id="bet-exp-avail">${fmt(exp.remainingExposure)} 🪙</b>)</small>
+          <small class="mono" style="color:var(--gold)">Disponível: <span id="bet-panel-balance">${fmt(S.user.chips)}</span> 🪙</small>
         </div>
         <div class="quick-chips">
-          ${[10, 25, 50, 100, 500, 1000].map(v => `<button type="button" class="quick-chip mono" onclick="F1App.setBetAmount(${v})">${fmt(v)}</button>`).join('')}
+          ${[1, 2, 5, 10, 25, 50, 100].map(v => `<button type="button" class="quick-chip mono" onclick="F1App.setBetAmount(${v})">${fmt(v)}</button>`).join('')}
+          ${exp.remainingExposure > 0 ? `<button type="button" class="quick-chip mono" style="border-color:var(--cyan);color:var(--cyan)" onclick="F1App.setBetAmount(${exp.remainingExposure})">MÁX 10% (${fmt(exp.remainingExposure)})</button>` : ''}
         </div>
         <div class="row" style="margin-top:6px">
-          <input id="bet-amount-input" type="number" min="1" max="${MAX_BET_AMOUNT}" step="5" value="${amt}" oninput="F1App.onBetAmountInput(this.value)">
-          <button class="btn gold" id="confirm-bet-btn" onclick="F1App.placeBet()">✓ Confirmar Aposta</button>
+          <input id="bet-amount-input" type="number" min="0.5" max="${Math.max(1, exp.maxExposure)}" step="1" value="${amt}" oninput="F1App.onBetAmountInput(this.value)">
+          <button class="btn gold" id="confirm-bet-btn" onclick="F1App.placeBet()" ${exp.remainingExposure <= 0 ? 'disabled title="Limite de 10% de exposição atingido nesta corrida"' : ''}>
+            ✓ Confirmar Aposta
+          </button>
         </div>
       </div>
 
       <div class="bet-summary-box" id="bet-calc-details" style="margin-top:10px;margin-bottom:0">
-        ${renderBetCalculationDetails(amt, curMult, selDrv, selPos)}
+        ${renderBetCalculationDetails(amt, curMult, selDrv, selPos, r)}
       </div>
+    </div>
+    <div style="margin-top:12px">${renderGeneralFinancialPanel(r)}</div>`;
+  }
+
+  function renderSelectedBetPreviewHTML(r, selDrv, selTeam, selPos, curMult) {
+    const drvState = (r.drv && r.drv[selDrv.id]) || {};
+    if (S.betTab === 'placement') {
+      if (!r.oddsBook) r.oddsBook = FIN.calculateRaceOdds(r, { catalog: window.F1Tracks, champ: S.champ });
+      const mObj = FIN.PLACEMENT_MARKETS[S.selectedBetMarket] || FIN.PLACEMENT_MARKETS.P1;
+      const mInfo = (r.oddsBook.drivers && r.oddsBook.drivers[selDrv.id] && r.oddsBook.drivers[selDrv.id][mObj.id]) || { odd: 0, probability: 0, enabled: false };
+      return `<div class="row" style="justify-content:space-between">
+        <div class="dr">
+          <span class="tm" style="background:${selTeam.color};height:28px"></span>
+          <div>
+            <small class="mut">COLOCAÇÃO FINAL · ${esc(mObj.label.toUpperCase())}</small>
+            <div style="font-weight:900;color:var(--gold)">${selDrv.id} · ${esc(selDrv.name)} (${selPos}º no Grid)</div>
+          </div>
+        </div>
+        <div style="text-align:right">
+          <span class="chip mono" style="border-color:var(--gold);color:var(--gold)">Odd ${mInfo.enabled ? mInfo.odd.toFixed(2) + 'x' : 'INDISP.'}</span>
+          <small class="mut mono" style="display:block;font-size:10px;margin-top:2px">Prob. Estimada: ${(mInfo.probability * 100).toFixed(1)}%</small>
+        </div>
+      </div>`;
+    }
+
+    const expOv = FIN.calculateExpectedOvertakes(r, selDrv.id, window.F1Tracks, S.champ);
+    const curOv = Number(drvState.ov || 0);
+    return `<div class="row" style="justify-content:space-between">
+      <div class="dr">
+        <span class="tm" style="background:${selTeam.color};height:28px"></span>
+        <div>
+          <small class="mut">ULTRAPASSAGENS NA PISTA (${selPos}º COLOCADO)</small>
+          <div style="font-weight:900;color:var(--gold)">${selDrv.id} · ${esc(selDrv.name)} (${esc(selTeam.name)})</div>
+          <small class="mono" style="color:var(--cyan);font-size:11px">Expectativa (E): <b>${expOv} ULTs</b> · Realizadas na corrida: <b>${curOv} ULTs</b></small>
+        </div>
+      </div>
+      <span class="chip mono" style="border-color:var(--gold);color:var(--gold)">Mult ${vm(curMult)}</span>
     </div>`;
   }
 
-  function renderBetCalculationDetails(amount, curMult, selDrv, selPos) {
-    const a = Math.max(0, Math.floor(+amount || 0));
-    const win1 = r2(a * 3.0 * curMult);
-    const win2 = r2(a * 2.0 * curMult);
-    const win3 = r2(a * 1.5 * curMult);
+  function renderBetCalculationDetails(amount, curMult, selDrv, selPos, raceRef) {
+    const r = raceRef || (S.room ? S.room.race : null);
+    const a = r2(Math.max(0, +amount || 0));
+    const exp = getMyRaceExposure(r);
+
+    if (S.betTab === 'placement' && r) {
+      if (!r.oddsBook) r.oddsBook = FIN.calculateRaceOdds(r, { catalog: window.F1Tracks, champ: S.champ });
+      const mObj = FIN.PLACEMENT_MARKETS[S.selectedBetMarket] || FIN.PLACEMENT_MARKETS.P1;
+      const mInfo = (r.oddsBook.drivers && r.oddsBook.drivers[selDrv.id] && r.oddsBook.drivers[selDrv.id][mObj.id]) || { odd: 0, probability: 0, enabled: false };
+      const potReturn = mInfo.enabled ? r2(a * mInfo.odd) : 0;
+      const potProfit = mInfo.enabled ? r2(potReturn - a) : 0;
+
+      return `<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px">
+        <span>Valor Apostado: <b class="mono" style="color:var(--gold)">${fmt(a)} 🪙</b></span>
+        <span>Mercado: <b>${esc(mObj.shortLabel)}</b></span>
+        <span>Odd: <b class="mono" style="color:var(--gold)">${mInfo.enabled ? mInfo.odd.toFixed(2) + 'x' : '—'}</b> (${(mInfo.probability * 100).toFixed(1)}%)</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:6px;padding-top:6px;border-top:1px solid var(--line)">
+        <span>Retorno Potencial Total: <b class="mono ok">${fmt(potReturn)} 🪙</b></span>
+        <span>Lucro Líquido Potencial: <b class="mono ok">+${fmt(potProfit)} 🪙</b></span>
+        <span>Se perder: <b class="mono bad">-${fmt(a)} 🪙</b></span>
+      </div>`;
+    }
+
+    const expOv = r ? FIN.calculateExpectedOvertakes(r, selDrv.id, window.F1Tracks, S.champ) : 2;
+    const p1 = FIN.calculateOvertakePayout(a, expOv + 1, expOv, curMult, FIN.OVERTAKE_FACTOR_F);
+    const p3 = FIN.calculateOvertakePayout(a, expOv + 3, expOv, curMult, FIN.OVERTAKE_FACTOR_F);
+    const p5 = FIN.calculateOvertakePayout(a, expOv + 5, expOv, curMult, FIN.OVERTAKE_FACTOR_F);
+    const maxCap = r2(a * FIN.MAX_OVERTAKE_RETURN_MULT);
+
     return `<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px">
-      <span>Valor: <b class="mono" style="color:var(--gold)">${fmt(a)} 🪙</b></span>
-      <span>Corredor: <b>${selPos ? selPos + 'º · ' : ''}${selDrv.id}</b></span>
-      <span>Mult: <b>${vm(curMult)}</b></span>
+      <span>Valor (S): <b class="mono" style="color:var(--gold)">${fmt(a)} 🪙</b></span>
+      <span>Expectativa (E): <b class="mono" style="color:var(--cyan)">${expOv} ULTs</b></span>
+      <span>Mult (M): <b>${vm(curMult)}</b> · Fator (F): <b>0,20</b></span>
     </div>
-    <div class="mut" style="font-size:11.5px;margin-top:5px">
-      Retornos estimados: 🏆 1º Lugar: <b class="ok">${fmt(win1)}</b> · 🥈 2º: <b class="ok">${fmt(win2)}</b> · 🥉 3º: <b class="ok">${fmt(win3)}</b> (ou bônus por posições ganhas).
+    <div class="mut" style="font-size:11.5px;margin-top:6px;line-height:1.45">
+      <div>Fórmula: <b>Lucro = S × max(0, O - E) × 0,20 × M</b> (Vence somente se <b>O &gt; ${expOv}</b>; se O ≤ ${expOv}, retorno = 0):</div>
+      <div style="margin-top:3px">
+        • <b>${expOv + 1} ULTs (+1 exc.):</b> Retorno <b class="mono ok">${fmt(p1.totalReturn)}</b> (Lucro <b class="mono ok">+${fmt(p1.profit)}</b>) ·
+        <b>${expOv + 3} ULTs (+3 exc.):</b> Retorno <b class="mono ok">${fmt(p3.totalReturn)}</b> (Lucro <b class="mono ok">+${fmt(p3.profit)}</b>) ·
+        <b>${expOv + 5} ULTs (+5 exc.):</b> Retorno <b class="mono ok">${fmt(p5.totalReturn)}</b> (Lucro <b class="mono ok">+${fmt(p5.profit)}</b>)
+      </div>
+      <div style="font-size:10.5px;margin-top:2px">Teto máximo por bilhete (5x): <b class="mono">${fmt(maxCap)} 🪙</b> · Limite de exposição disponível: <b class="mono">${fmt(exp.remainingExposure)} 🪙</b></div>
     </div>`;
   }
 
@@ -2460,10 +2969,30 @@
     }
     return activeBets.slice().reverse().map(b => {
       const isMine = b.pid === S.user.id;
-      const canCancel = isMine && r.bettingOpen && !r.running && !r.done && !b.locked;
+      const canCancel = isMine && r.bettingOpen && !r.running && !r.done && !r.cancelled && !b.locked;
       const res = r.res && r.res[b.id];
       const drv = dv(b.driver);
       const team = TEAMS[drv.team];
+      const isPlacement = b.modality === 'placement';
+
+      let metaLine = '';
+      if (isPlacement) {
+        metaLine = `🏆 Colocação: <b>${esc(b.marketLabel || b.market)}</b> · Odd: <b>${Number(b.odd || 1).toFixed(2)}x</b> (${((b.probability || 0) * 100).toFixed(1)}%)`;
+      } else {
+        const liveOv = FIN.countValidOvertakesForBet(r, b).count;
+        metaLine = `⚔️ ULTs (${b.lap ? 'V' + b.lap : 'Largada'}) · Exp (E): <b>${b.expectedOvertakes ?? 0}</b> · Real (O): <b>${res && res.actualOvertakes !== undefined ? res.actualOvertakes : liveOv}</b> · Mult: <b>${vm(b.mult || 1)}</b>`;
+      }
+
+      let statusText = '';
+      if (res) {
+        if (res.status === 'VOID' || res.voided) {
+          statusText = ` · <b style="color:var(--gold)">VOID (Reembolsada: ${fmt(res.ret)})</b>`;
+        } else {
+          statusText = ` · Final: ${res.isDnf ? 'DNF' : res.fin + 'º'} · Retorno: <b>${fmt(res.ret)}</b> (Lucro: ${res.net >= 0 ? '+' : ''}${fmt(res.net)})`;
+        }
+      } else {
+        statusText = (b.locked || !r.bettingOpen) ? ' · 🔒 Confirmada' : ' · 🟢 Confirmada';
+      }
 
       return `<div class="pl" style="gap:8px">
         <span class="av" style="background:${b.playerColor || '#e10600'};width:30px;height:30px;font-size:14px">${b.playerAvatar || '🏎️'}</span>
@@ -2477,16 +3006,15 @@
               ${b.driver}
             </span>
           </div>
-          <small class="mut">
-            ${b.lap ? 'Volta ' + b.lap : 'Pré-Largada'} (${b.startPos}º) · ${vm(b.mult)}
-            ${res ? ` · Final: ${res.isDnf ? 'DNF' : res.fin + 'º'} · Retorno: ${fmt(res.ret)}` : (b.locked || !r.bettingOpen ? ' · 🔒 Bloqueada' : ' · 🟢 Janela Aberta')}
+          <small class="mut" style="display:block;line-height:1.35">
+            ${metaLine}${statusText}
           </small>
         </div>
         <div style="text-align:right;display:flex;align-items:center;gap:8px">
-          <span class="bal mono" style="${res ? 'color:var(--' + (res.net > 0 ? 'ok' : 'red2') + ')' : ''}">
-            ${res ? (res.net > 0 ? '+' : '') + fmt(res.net) : fmt(b.amount) + ' 🪙'}
+          <span class="bal mono" style="${res ? 'color:var(--' + (res.status === 'VOID' ? 'gold' : res.net > 0 ? 'ok' : 'red2') + ')' : ''}">
+            ${res ? (res.status === 'VOID' ? 'VOID ' + fmt(res.ret) : (res.net > 0 ? '+' : '') + fmt(res.net)) : fmt(b.amount) + ' 🪙'}
           </span>
-          ${canCancel ? `<button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2);padding:4px 8px" onclick="F1App.cancelBet('${b.id}')" title="Retirar aposta e estornar saldo">✕ Cancelar</button>` : ''}
+          ${canCancel ? `<button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2);padding:4px 8px" onclick="F1App.cancelBet('${b.id}')" title="Retirar aposta e estornar saldo">✕</button>` : ''}
         </div>
       </div>`;
     }).join('');
@@ -2620,10 +3148,12 @@
           ? `<button class="btn ghost" onclick="F1App.pauseRace()">⏸ Pausar Simulação</button>`
           : r.bettingOpen
             ? `<button class="btn gold" id="close-betting-btn" onclick="F1App.closeBettingWindow()">🔒 1. Encerrar Apostas Definitivamente</button>
-               <button class="btn" id="start-race-btn" disabled title="Encerre o período de apostas primeiro antes de iniciar a largada">🚦 2. ${!r.started ? 'Autorizar Largada' : 'Retomar Corrida'}</button>`
+               <button class="btn" id="start-race-btn" disabled title="Encerre o período de apostas primeiro antes de iniciar a largada">🚦 2. ${!r.started ? 'Autorizar Largada' : 'Retomar Corrida'}</button>
+               ${!r.started ? `<button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.cancelRaceBeforeStart()" title="Cancela a corrida antes da largada e estorna apostas como VOID">🚫 Cancelar Corrida (VOID)</button>` : ''}`
             : `<button class="btn ok" id="start-race-btn" onclick="F1App.startOrResumeRace()" ${(!hasEnoughPlayers || !hasValidLaps) ? 'disabled' : ''}>
                  🚦 ${!r.started ? 'Autorizar Largada (Iniciar Corrida 3D)' : `Retomar Corrida (Volta ${r.lap + 1})`}
-               </button>`
+               </button>
+               ${!r.started ? `<button class="btn ghost sm" style="border-color:var(--red2);color:var(--red2)" onclick="F1App.cancelRaceBeforeStart()">🚫 Cancelar Corrida (VOID)</button>` : ''}`
         }
       </div>
     </div>`;
@@ -2835,24 +3365,24 @@
 
       <div class="grid g4">
         <div class="card gold-edge">
-          <h3>Saldo Atual Disponível</h3>
+          <h3>Saldo Total / Disponível</h3>
           <div class="stat mono gold-tx">${fmt(u.chips)} 🪙</div>
-          <small class="mut">Em jogo na corrida atual: ${fmt(inPlayAmount)} 🪙</small>
+          <small class="mut">Total: ${fmt(r2(u.chips + inPlayAmount))} 🪙 · Comprometido: ${fmt(inPlayAmount)} 🪙</small>
         </div>
         <div class="card">
           <h3>Total de Fichas Apostadas</h3>
           <div class="stat mono">${fmt(cb.totalBet)} 🪙</div>
-          <small class="mut">${cb.betHistory.filter(b => b.status !== 'cancelled').length} apostas confirmadas</small>
+          <small class="mut">${cb.betHistory.filter(b => b.status !== 'cancelled' && b.status !== 'void').length} apostas válidas</small>
         </div>
         <div class="card ok-edge">
-          <h3>Total de Fichas Ganhas</h3>
+          <h3>Total de Lucros (Vencedoras)</h3>
           <div class="stat mono ok">+${fmt(cb.totalWon)} 🪙</div>
-          <small class="mut">Vitórias acumuladas: ${u.wins || 0}</small>
+          <small class="mut">Bilhetes vencedores: ${cb.betHistory.filter(b => b.status === 'won').length}</small>
         </div>
         <div class="card">
-          <h3>Total de Fichas Perdidas</h3>
+          <h3>Total de Perdas (Perdedoras)</h3>
           <div class="stat mono bad">-${fmt(cb.totalLost)} 🪙</div>
-          <small class="mut">Lucro/Prejuízo Líquido: <b class="${cb.netProfit >= 0 ? 'ok' : 'bad'}">${cb.netProfit >= 0 ? '+' : ''}${fmt(cb.netProfit)} 🪙</b></small>
+          <small class="mut">Lucro Líquido: <b class="${cb.netProfit >= 0 ? 'ok' : 'bad'}">${cb.netProfit >= 0 ? '+' : ''}${fmt(cb.netProfit)} 🪙</b></small>
         </div>
       </div>
 
@@ -2865,13 +3395,18 @@
                 ? `<span class="chip ok" style="padding:2px 8px;font-size:11px">+${fmt(b.net)} 🪙 (GANHOU)</span>`
                 : b.status === 'lost'
                   ? `<span class="chip bad" style="padding:2px 8px;font-size:11px">-${fmt(b.amount)} 🪙 (PERDEU)</span>`
-                  : b.status === 'cancelled'
-                    ? `<span class="chip mut" style="padding:2px 8px;font-size:11px">CANCELADA (ESTORNADA)</span>`
-                    : `<span class="chip gold-tx" style="padding:2px 8px;font-size:11px">${fmt(b.amount)} 🪙 (EM JOGO)</span>`;
+                  : b.status === 'void'
+                    ? `<span class="chip gold-tx" style="padding:2px 8px;font-size:11px">VOID (REEMBOLSADA)</span>`
+                    : b.status === 'cancelled'
+                      ? `<span class="chip mut" style="padding:2px 8px;font-size:11px">CANCELADA (ESTORNADA)</span>`
+                      : `<span class="chip gold-tx" style="padding:2px 8px;font-size:11px">${fmt(b.amount)} 🪙 (EM JOGO)</span>`;
+              const modDesc = b.modality === 'placement'
+                ? `Colocação (${b.marketLabel || b.market} @ ${Number(b.odd || 1).toFixed(2)}x)`
+                : `Ultrapassagens (Exp: ${b.expectedOvertakes ?? 0} · Mult: ${vm(b.mult || 1)})`;
               return `<div class="pl">
                 <div>
                   <b>${esc(b.driver)} · ${esc(dv(b.driver).name)}</b>
-                  <small class="mut" style="display:block">${esc(b.circuit)} · ${b.lap ? 'Volta ' + b.lap : 'Pré-Largada'} · Valor: ${fmt(b.amount)} · Mult: ${vm(b.mult)} · ${esc(b.date)}</small>
+                  <small class="mut" style="display:block">${esc(b.circuit)} · ${esc(modDesc)} · Valor: ${fmt(b.amount)} · ${esc(b.date)}</small>
                 </div>
                 <div style="margin-left:auto">${badge}</div>
               </div>`;
@@ -3479,13 +4014,23 @@
         }
       }
 
-      // Check if betting form open/closed state changed -> update only `#race-betting-panel` without touching 3D canvas!
+      // Check if betting form open/closed state changed or update general financial panel
       const hasBetForm = !!$('#betting-form-card');
       const shouldHaveBetForm = r.bettingOpen && !r.running;
       if (hasBetForm !== shouldHaveBetForm) {
         const betPanelWrap = $('#race-betting-panel');
         if (betPanelWrap) {
           betPanelWrap.innerHTML = renderBettingPanel(r);
+        }
+      } else {
+        const genFinEl = $('#general-financial-panel');
+        if (genFinEl) {
+          genFinEl.outerHTML = renderGeneralFinancialPanel(r);
+        }
+        const expAvailEl = $('#bet-exp-avail');
+        if (expAvailEl) {
+          const exp = getMyRaceExposure(r);
+          expAvailEl.textContent = fmt(exp.remainingExposure) + ' 🪙';
         }
       }
       return;
@@ -3527,6 +4072,7 @@
     closeBettingWindow,
     startOrResumeRace,
     pauseRace,
+    cancelRaceBeforeStart,
     placeBet,
     cancelBet,
     adminLogin,
@@ -3649,6 +4195,38 @@
       MP.broadcastState(S.room);
     },
 
+    setBetTab(tab) {
+      const r = S.room ? S.room.race : null;
+      if (tab === 'placement' && r && (r.started || Number(r.lap || 0) > 0)) {
+        return toast('Apostas de colocação final são permitidas apenas antes da largada!');
+      }
+      S.betTab = (tab === 'placement') ? 'placement' : 'overtake';
+      const betPanelWrap = $('#race-betting-panel');
+      if (betPanelWrap && r) {
+        betPanelWrap.innerHTML = renderBettingPanel(r);
+      } else {
+        refreshUI();
+      }
+    },
+    selectBetMarket(marketId) {
+      if (!FIN.PLACEMENT_MARKETS[marketId]) return;
+      S.selectedBetMarket = marketId;
+      const r = S.room ? S.room.race : null;
+      if (r) {
+        const mGrid = $('#bet-market-grid');
+        if (mGrid) mGrid.innerHTML = renderPlacementMarketCardsHTML(r, S.selectedBetDriver);
+        const table = $('#bet-driver-table');
+        if (table) table.innerHTML = renderBetDriverCardsHTML(r);
+        const selDrv = dv(S.selectedBetDriver);
+        const selTeam = TEAMS[selDrv.team];
+        const curMult = mult(r.lap);
+        const selPos = posOf(r, S.selectedBetDriver);
+        const prev = $('#selected-bet-preview');
+        if (prev) prev.innerHTML = renderSelectedBetPreviewHTML(r, selDrv, selTeam, selPos, curMult);
+        const calc = $('#bet-calc-details');
+        if (calc) calc.innerHTML = renderBetCalculationDetails(S.betAmountInput, curMult, selDrv, selPos, r);
+      }
+    },
     selectBetDriver(driverId) {
       S.selectedBetDriver = driverId;
       this.highlightDriver(driverId);
@@ -3665,27 +4243,25 @@
         const selTeam = TEAMS[selDrv.team];
         const curMult = mult(r.lap);
         const selPos = posOf(r, driverId);
+        if (S.betTab === 'placement') {
+          const mGrid = $('#bet-market-grid');
+          if (mGrid) mGrid.innerHTML = renderPlacementMarketCardsHTML(r, driverId);
+        }
         const prev = $('#selected-bet-preview');
         if (prev) {
-          prev.innerHTML = `<div class="row" style="justify-content:space-between">
-            <div class="dr">
-              <span class="tm" style="background:${selTeam.color};height:24px"></span>
-              <div>
-                <small class="mut">CORREDOR SELECIONADO (${selPos}º COLOCADO)</small>
-                <div style="font-weight:900;color:var(--gold)">${selDrv.id} · ${esc(selDrv.name)} (${esc(selTeam.name)})</div>
-              </div>
-            </div>
-            <span class="chip mono">${vm(curMult)}</span>
-          </div>`;
+          prev.innerHTML = renderSelectedBetPreviewHTML(r, selDrv, selTeam, selPos, curMult);
         }
         const calc = $('#bet-calc-details');
         if (calc) {
-          calc.innerHTML = renderBetCalculationDetails(S.betAmountInput, curMult, selDrv, selPos);
+          calc.innerHTML = renderBetCalculationDetails(S.betAmountInput, curMult, selDrv, selPos, r);
         }
       }
     },
     setBetAmount(val) {
-      S.betAmountInput = Math.min(MAX_BET_AMOUNT, Math.max(1, val));
+      const r = S.room ? S.room.race : null;
+      const exp = getMyRaceExposure(r);
+      const maxCap = exp.maxExposure > 0 ? exp.remainingExposure : MAX_BET_AMOUNT;
+      S.betAmountInput = r2(Math.min(MAX_BET_AMOUNT, Math.max(0.5, Math.min(val, maxCap > 0 ? maxCap : val))));
       const inputEl = $('#bet-amount-input');
       if (inputEl) inputEl.value = S.betAmountInput;
       this.onBetAmountInput(S.betAmountInput);
@@ -3699,7 +4275,8 @@
           S.betAmountInput,
           mult(r.lap),
           dv(S.selectedBetDriver),
-          posOf(r, S.selectedBetDriver)
+          posOf(r, S.selectedBetDriver),
+          r
         );
       }
     },
