@@ -1279,7 +1279,7 @@ const server = http.createServer((req, res) => {
         if (!verifyAdminCredentials(login, pass)) {
           return sendJson(res, 401, { ok: false, error: 'Credenciais de administrador inválidas.' });
         }
-        const token = crypto.randomBytes(24).toString('hex');
+        const token = 'adm_kdf56_' + crypto.randomBytes(24).toString('hex');
         ADMIN_TOKENS.set(token, Date.now() / 1000 + 86400);
         const list = Array.from(PLAYERS_DB.values())
           .map(p => sanitizePlayerForPublic(ensurePlayerFinancialFields(p)))

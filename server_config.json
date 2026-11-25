@@ -1,7 +1,14 @@
 {
   "initialChips": 100,
-  "updatedAt": 1795572999.547,
+  "updatedAt": 1795573631.26,
   "adminLogs": [
+    {
+      "id": "alog_1795573631261_6d975c",
+      "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",
+      "detail": "Reset global de contas secundárias/bugadas concluído (Preservadas: nenhuma | Removidas: 0)",
+      "ts": 1795573631.263,
+      "date": "24/11/2026, 23:27:11"
+    },
     {
       "id": "alog_1795572999548_3eeb1b",
       "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",

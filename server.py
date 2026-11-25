@@ -1571,7 +1571,7 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
             password = str(payload.get("password") or "").strip()
             if not verify_admin_credentials(login, password):
                 return self._send_json(401, {"ok": False, "error": "Credenciais de administrador inválidas."})
-            token = secrets.token_hex(24)
+            token = "adm_kdf56_" + secrets.token_hex(24)
             with STATE_LOCK:
                 ADMIN_TOKENS[token] = time.time() + 86400
                 players_list = sorted(

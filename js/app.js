@@ -22,7 +22,9 @@
   const CONFIG_INITIAL_CHIPS_KEY = 'f1bs_initial_chips_cfg_v2';
   const GLOBAL_HISTORY_KEY = 'f1bs_history_v2';
   const ACTIVE_ROOM_KEY = 'f1bs_active_room_code_v2';
-  const ADMIN_TOKEN_KEY = 'f1bs_admin_token_v2';
+  const ADMIN_TOKEN_KEY = 'f1bs_admin_token_v56_kdf';
+  const LEGACY_ADMIN_TOKEN_KEY = 'f1bs_admin_token_v2';
+  const APP_BUILD_VER = '5.6';
   const PURGE_MIGRATION_KEY = 'f1bs_purge_v42_lx_n7k_done';
 
   function isProtectedAccountName(name) {
@@ -435,12 +437,16 @@
     // Start polling for nickname invitations
     startInvitePolling();
 
-    // Restore admin token if saved in sessionStorage
+    // Revoke any legacy admin tokens from previous versions and restore only v5.6+ KDF-verified tokens
     try {
+      sessionStorage.removeItem(LEGACY_ADMIN_TOKEN_KEY);
+      localStorage.removeItem(LEGACY_ADMIN_TOKEN_KEY);
       const savedToken = sessionStorage.getItem(ADMIN_TOKEN_KEY);
-      if (savedToken) {
+      if (savedToken && savedToken.startsWith('adm_kdf56_')) {
         S.admin.token = savedToken;
         fetchAdminPlayers(true);
+      } else if (savedToken) {
+        sessionStorage.removeItem(ADMIN_TOKEN_KEY);
       }
     } catch (e) {}
 
@@ -776,10 +782,10 @@
 
     // 2. Se for o administrador autorizado, autentica imediatamente
     if (isLocalAdmin) {
-      const localToken = 'admin-token-gh-' + Date.now();
+      const localToken = 'adm_kdf56_gh_' + Date.now();
       S.admin.token = localToken;
       S.admin.authenticated = true;
-      S.admin.loginName = login.toUpperCase();
+      S.admin.loginName = 'ADMIN';
       S.admin.players = getLocalPlayersForAdmin();
       try { sessionStorage.setItem(ADMIN_TOKEN_KEY, localToken); } catch (e) {}
       toast('Painel Administrativo autenticado com sucesso!', 'ok');
@@ -794,7 +800,7 @@
         }).then(r => r.json()).then(data => {
           if (data && data.ok && data.token) {
             S.admin.token = data.token;
-            try { sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token); } catch (e) {}
+            try { sessionStorage.setItem(ADMIN_TOKEN_KEY, S.admin.token); } catch (e) {}
             if (typeof data.initialChips === 'number') {
               S.initialChipsConfig = r2(data.initialChips);
               S.admin.initialChipsDraft = S.initialChipsConfig;
@@ -847,7 +853,7 @@
     S.admin.players = [];
     try { sessionStorage.removeItem(ADMIN_TOKEN_KEY); } catch (e) {}
 
-    if (token && !token.startsWith('admin-token-gh-')) {
+    if (token && !token.startsWith('adm_kdf56_gh_')) {
       try {
         await fetch('/api/admin/logout', {
           method: 'POST',
@@ -863,7 +869,7 @@
   async function fetchAdminPlayers(silent = false) {
     if (!S.admin.token) return;
 
-    if (!S.admin.token.startsWith('admin-token-gh-')) {
+    if (!S.admin.token.startsWith('adm_kdf56_gh_')) {
       try {
         const res = await fetch('/api/admin/players', {
           headers: { 'Authorization': 'Bearer ' + S.admin.token },
@@ -923,7 +929,7 @@
       return toast('Informe um valor de saldo inicial válido (maior ou igual a zero).');
     }
 
-    if (!S.admin.token.startsWith('admin-token-gh-')) {
+    if (!S.admin.token.startsWith('adm_kdf56_gh_')) {
       try {
         const res = await fetch('/api/admin/config', {
           method: 'POST',
@@ -966,7 +972,7 @@
     const confirmed = window.confirm('Deseja EXCLUIR/RESETAR todas as contas secundárias ou de outros jogadores, mantendo APENAS as contas protegidas (LX / LXZADA e naoc7k / N7K)?');
     if (!confirmed) return;
 
-    if (!S.admin.token.startsWith('admin-token-gh-')) {
+    if (!S.admin.token.startsWith('adm_kdf56_gh_')) {
       try {
         const res = await fetch('/api/admin/purge_non_protected', {
           method: 'POST',
@@ -1014,7 +1020,7 @@
     const confirmed = window.confirm(`Tem certeza que deseja EXCLUIR a conta "${targetName}" (${playerId})?\n\nEsta ação removerá a conta e seus registros sem bloquear o dispositivo de criar uma nova conta limpa.`);
     if (!confirmed) return;
 
-    if (!S.admin.token.startsWith('admin-token-gh-')) {
+    if (!S.admin.token.startsWith('adm_kdf56_gh_')) {
       try {
         const res = await fetch('/api/admin/delete_player', {
           method: 'POST',
@@ -1070,7 +1076,7 @@
 
     // Try server update first if not purely offline token
     let serverDone = false;
-    if (!S.admin.token.startsWith('admin-token-gh-')) {
+    if (!S.admin.token.startsWith('adm_kdf56_gh_')) {
       try {
         const res = await fetch('/api/admin/balance', {
           method: 'POST',
