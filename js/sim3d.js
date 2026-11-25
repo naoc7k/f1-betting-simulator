@@ -76,7 +76,13 @@
       this.labelEls = new Map();
       this.visualGapMap = new Map();
       this.visualGapSecMap = new Map();
+      this.visualLateralMap = new Map();
+      this.driverPhaseMap = new Map();
       this.currentRaceId = null;
+      this.viewW = 0;
+      this.viewH = 0;
+      this._projVec = typeof THREE !== 'undefined' ? new THREE.Vector3() : null;
+      this._camTargetVec = typeof THREE !== 'undefined' ? new THREE.Vector3() : null;
 
       this.cameraMode = 'panorama';
       this.orbitAngle = 0.45;
@@ -113,6 +119,8 @@
         this.container.appendChild(this.overlayWrap);
 
         this.labelEls.clear();
+        this.viewW = 0;
+        this.viewH = 0;
         this._initRenderer();
         this._bindPointerEvents();
       }
@@ -231,6 +239,9 @@
       const rawW = this.canvasWrap.clientWidth || (isMobile ? maxMobileW : 860);
       const w = isMobile ? Math.min(rawW, maxMobileW) : rawW;
       const h = this.canvasWrap.clientHeight || (isMobile ? 275 : 500);
+      if (w === this.viewW && h === this.viewH) return;
+      this.viewW = w;
+      this.viewH = h;
       if (!this.useFallback25D && this.renderer && this.camera) {
         this.camera.aspect = Math.max(0.5, w / Math.max(1, h));
         this.camera.updateProjectionMatrix();
@@ -1312,13 +1323,22 @@
         this.currentRaceId = race.id;
         this.visualGapMap.clear();
         this.visualGapSecMap.clear();
+        this.visualLateralMap.clear();
       }
+
+      if (!this.driverPhaseMap.has(id)) {
+        let h = 0;
+        for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) & 0xffff;
+        this.driverPhaseMap.set(id, (h % 628) / 100);
+      }
+      const drvPhase = this.driverPhaseMap.get(id);
 
       if (!race.started || (race.lap === 0 && !race.running)) {
         const gridBack = -0.012 - rankIndex * 0.011;
         const gridSide = (rankIndex % 2 === 0 ? -1 : 1) * 1.35;
         this.visualGapMap.set(id, rankIndex * 0.014);
         this.visualGapSecMap.set(id, 0);
+        this.visualLateralMap.set(id, gridSide);
         return { progress: gridBack, lateral: gridSide, speedRatio: 0 };
       }
 
@@ -1335,7 +1355,7 @@
       if (race.running && tickRef) {
         const elapsedSinceTick = Math.max(0, Math.min(1200, Date.now() - tickRef));
         const lapDur = race.lapDurationMs || 30000;
-        baseLapProg = Math.min(0.999, baseLapProg + elapsedSinceTick / lapDur);
+        baseLapProg = Math.min(0.9995, baseLapProg + elapsedSinceTick / lapDur);
       }
 
       const leadId = race.order[0];
@@ -1345,13 +1365,15 @@
 
       let curGap = targetGap;
       let curGapSec = targetGapSec;
+      const frameDt = Math.min(0.05, Math.max(0.004, dt || 0.016));
       if (race.running && this.visualGapMap.has(id)) {
         const prevGap = this.visualGapMap.get(id);
         const prevSec = this.visualGapSecMap.has(id) ? this.visualGapSecMap.get(id) : targetGapSec;
-        const alpha = Math.min(1, Math.max(0.05, (dt || 0.016) * 6.5));
-        curGap = prevGap + (targetGap - prevGap) * alpha;
-        curGapSec = prevSec + (targetGapSec - prevSec) * alpha;
-        if (Math.abs(targetGap - curGap) < 0.0002) {
+        // Frame-rate independent exponential smoothing for buttery-smooth longitudinal overtaking
+        const gapAlpha = 1 - Math.exp(-frameDt * 4.2);
+        curGap = prevGap + (targetGap - prevGap) * gapAlpha;
+        curGapSec = prevSec + (targetGapSec - prevSec) * gapAlpha;
+        if (Math.abs(targetGap - curGap) < 0.00008) {
           curGap = targetGap;
           curGapSec = targetGapSec;
         }
@@ -1363,21 +1385,32 @@
       const totalCompletedLaps = Math.max(0, (Number(race.lap) || 0) - (isMidLap ? 1 : 0));
       const rawProgress = totalCompletedLaps + baseLapProg - curGap;
 
-      let lateral = Math.sin(rawProgress * Math.PI * 4 + rankIndex * 1.7) * 0.65;
+      // Use constant driver phase (drvPhase) instead of mutable rankIndex so lateral line never snaps on rank swap
+      let targetLateral = Math.sin(rawProgress * Math.PI * 4 + drvPhase) * 0.58;
       const gapDiff = targetGap - curGap;
-      if (Math.abs(gapDiff) > 0.0015 && race.running) {
-        const passDir = gapDiff < 0 ? -1.45 : 1.45;
-        lateral += passDir * Math.min(1, Math.abs(gapDiff) * 45);
+      if (Math.abs(gapDiff) > 0.0008 && race.running) {
+        const passDir = gapDiff < 0 ? -1.35 : 1.35;
+        // Smooth bell-shaped lane change that eases in and out cleanly
+        const intensity = Math.min(1, Math.abs(gapDiff) * 55);
+        const smoothWeave = Math.sin(intensity * Math.PI * 0.5);
+        targetLateral += passDir * smoothWeave;
       }
       if (d.pitLap === race.lap && baseLapProg < 0.22) {
-        lateral = -2.4;
+        targetLateral = -2.4;
       }
-      // Clamp lateral offset inside the asphalt track boundaries
-      lateral = Math.max(-2.5, Math.min(2.5, lateral));
+      targetLateral = Math.max(-2.5, Math.min(2.5, targetLateral));
+
+      let curLateral = targetLateral;
+      if (race.running && this.visualLateralMap.has(id)) {
+        const prevLat = this.visualLateralMap.get(id);
+        const latAlpha = 1 - Math.exp(-frameDt * 7.5);
+        curLateral = prevLat + (targetLateral - prevLat) * latAlpha;
+      }
+      this.visualLateralMap.set(id, curLateral);
 
       return {
         progress: rawProgress,
-        lateral,
+        lateral: curLateral,
         speedRatio: race.running ? (race.sc && race.sc.type ? 0.55 : 1.0) : 0
       };
     }
@@ -1459,13 +1492,11 @@
 
       if (!this.renderer || !this.scene || !this.camera) return;
 
-      const cw = this.canvasWrap.clientWidth;
-      const ch = this.canvasWrap.clientHeight;
-      if (cw > 0 && ch > 0 && this.renderer.domElement && (Math.abs(this.renderer.domElement.width - cw) > 2 || Math.abs(this.renderer.domElement.height - ch) > 2)) {
+      if (!this.viewW || !this.viewH) {
         this.handleResize();
       }
-      const w = cw || 340;
-      const h = ch || 275;
+      const w = this.viewW || 340;
+      const h = this.viewH || 275;
 
       // Animate circuit landmark props (Suzuka Ferris wheel, Silverstone turbines, etc.)
       for (const prop of this.animatedProps) {
@@ -1544,7 +1575,13 @@
         const targetCamY = chaseTargetSample.y + heightOffset;
         const targetCamZ = chaseTargetSample.z - chaseTargetSample.tz * backDist;
 
-        this.camera.position.lerp(new THREE.Vector3(targetCamX, targetCamY, targetCamZ), 0.12);
+        const camLerp = 1 - Math.exp(-Math.min(0.05, dt || 0.016) * 8.5);
+        if (this._camTargetVec) {
+          this._camTargetVec.set(targetCamX, targetCamY, targetCamZ);
+          this.camera.position.lerp(this._camTargetVec, camLerp);
+        } else {
+          this.camera.position.set(targetCamX, targetCamY, targetCamZ);
+        }
         const lookX = chaseTargetSample.x + chaseTargetSample.tx * 12;
         const lookY = chaseTargetSample.y + 1.2;
         const lookZ = chaseTargetSample.z + chaseTargetSample.tz * 12;
@@ -1568,9 +1605,18 @@
 
       const liveStandings = this.getVisualStandings(race);
       const isMobile = w <= 560;
-      const minBoxX = isMobile ? 48 : 44;
-      const minBoxY = isMobile ? 22 : 20;
+      const minBoxX = isMobile ? 46 : 42;
+      const minBoxY = isMobile ? 21 : 19;
       const placedBoxes = [];
+      const projVec = this._projVec || new THREE.Vector3();
+
+      const setLabelVisible = (el, vis) => {
+        if (el._vis !== vis) {
+          el._vis = vis;
+          el.style.opacity = vis ? '1' : '0';
+          el.style.pointerEvents = vis ? 'auto' : 'none';
+        }
+      };
 
       // Prioritize highlighted driver first, then podium (P1..P3), then others in current visual order
       const orderedForLabels = (liveStandings.order && liveStandings.order.length ? liveStandings.order : race.order).slice();
@@ -1591,34 +1637,32 @@
         const isSel = (this.selectedDriver === id);
 
         if (drvState.st === 'dnf' && !isSel) {
-          labelEl.style.display = 'none';
+          setLabelVisible(labelEl, false);
           return;
         }
 
-        // In chase camera mode or small mobile screen, avoid wall-of-text clutter by only showing selected + top 5 non-overlapping cars
         if (!isSel && this.cameraMode === 'chase' && visPos > (isMobile ? 4 : 6)) {
-          labelEl.style.display = 'none';
+          setLabelVisible(labelEl, false);
           return;
         }
 
-        const worldPos = entry.group.position.clone();
-        worldPos.y += (isSel ? 3.5 : 2.1);
-        worldPos.project(this.camera);
+        projVec.copy(entry.group.position);
+        projVec.y += (isSel ? 3.5 : 2.1);
+        projVec.project(this.camera);
 
-        if (worldPos.z > 1 || worldPos.z < -1) {
-          labelEl.style.display = 'none';
+        if (projVec.z > 1 || projVec.z < -1) {
+          setLabelVisible(labelEl, false);
           return;
         }
 
-        const sx = (worldPos.x * 0.5 + 0.5) * w;
-        const sy = (-(worldPos.y * 0.5) + 0.5) * h;
+        const sx = (projVec.x * 0.5 + 0.5) * w;
+        const sy = (-(projVec.y * 0.5) + 0.5) * h;
 
         if (sx < 18 || sx > w - 18 || sy < 18 || sy > h - 10) {
-          labelEl.style.display = 'none';
+          setLabelVisible(labelEl, false);
           return;
         }
 
-        // Screen-space collision check so car tags never pile on top of each other over the track
         if (!isSel) {
           let overlaps = false;
           for (let i = 0; i < placedBoxes.length; i++) {
@@ -1629,21 +1673,37 @@
             }
           }
           if (overlaps) {
-            labelEl.style.display = 'none';
+            setLabelVisible(labelEl, false);
             return;
           }
         }
 
         placedBoxes.push({ x: sx, y: sy });
 
-        labelEl.style.display = 'flex';
+        setLabelVisible(labelEl, true);
         labelEl.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
-        labelEl.classList.toggle('selected', isSel);
-        labelEl.classList.toggle('is-dnf', drvState.st === 'dnf');
-        labelEl.style.zIndex = isSel ? '30' : String(Math.max(1, 26 - visPos));
 
-        const posSpan = labelEl.querySelector('.c-pos');
-        if (posSpan) posSpan.textContent = drvState.st === 'dnf' ? 'OUT' : String(visPos);
+        if (labelEl._lastSel !== isSel) {
+          labelEl._lastSel = isSel;
+          labelEl.classList.toggle('selected', isSel);
+        }
+        const isDnf = drvState.st === 'dnf';
+        if (labelEl._lastDnf !== isDnf) {
+          labelEl._lastDnf = isDnf;
+          labelEl.classList.toggle('is-dnf', isDnf);
+        }
+        const zStr = isSel ? '30' : String(Math.max(1, 26 - visPos));
+        if (labelEl._lastZ !== zStr) {
+          labelEl._lastZ = zStr;
+          labelEl.style.zIndex = zStr;
+        }
+
+        const posText = isDnf ? 'OUT' : String(visPos);
+        if (labelEl._lastPosText !== posText) {
+          labelEl._lastPosText = posText;
+          const posSpan = labelEl._posSpan || (labelEl._posSpan = labelEl.querySelector('.c-pos'));
+          if (posSpan) posSpan.textContent = posText;
+        }
       });
     }
 

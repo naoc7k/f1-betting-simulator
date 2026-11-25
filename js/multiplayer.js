@@ -211,13 +211,18 @@
       this.roomCode = null;
     }
 
-    _saveLocalRoomState(state) {
+    _saveLocalRoomState(state, force = false) {
       if (!this.roomCode || !state) return;
+      const now = Date.now();
+      if (!force && this._lastLocalSaveTs && (now - this._lastLocalSaveTs) < 2200) {
+        return;
+      }
+      this._lastLocalSaveTs = now;
       try {
         localStorage.setItem(ROOM_STORAGE_PREFIX + this.roomCode, JSON.stringify({
           state,
           senderId: this.playerId,
-          ts: Date.now()
+          ts: now
         }));
       } catch (e) {}
     }
@@ -447,7 +452,7 @@
 
     broadcastState(state, tickOnly = false) {
       if (!this.roomCode || !state || this.isSpectator) return;
-      this._saveLocalRoomState(state);
+      this._saveLocalRoomState(state, !tickOnly);
 
       const env = {
         type: 'STATE',

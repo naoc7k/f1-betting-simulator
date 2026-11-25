@@ -698,7 +698,8 @@ input:focus, select:focus {
   font-weight: 800;
   color: #fff;
   box-shadow: 0 3px 8px rgba(0, 0, 0, 0.6);
-  transition: background 0.15s, border-color 0.15s;
+  transition: opacity 0.14s ease, background 0.15s, border-color 0.15s;
+  will-change: transform, opacity;
   white-space: nowrap;
 }
 

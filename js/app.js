@@ -2322,6 +2322,7 @@
       }
 
       if (r.lapProgress >= 1.0) {
+        const excessProg = Math.max(0, Math.min(0.25, r.lapProgress - 1.0));
         const completedLapNum = r.lap;
         r.lap = completedLapNum - 1;
         simCompleteLap(r);
@@ -2355,6 +2356,7 @@
         }
 
         r.lap = r.lap + 1;
+        r.lapProgress = excessProg;
         MP.broadcastState(S.room);
         refreshUI();
         return;
@@ -4784,13 +4786,23 @@
     const syncCountEl = $('#race-sync-players-count');
     if (syncCountEl) syncCountEl.textContent = String(getOnlinePlayers().length);
 
-    // Only update Classification Tower DOM if its content actually changed
+    // Only update Classification Tower DOM when visual order changes or at most once every 550ms for gap numbers
     const towerEl = $('#race-tower-wrap');
     if (towerEl) {
-      const newTowerHtml = renderClassificationTower(r);
-      if (S._lastTowerSig !== newTowerHtml) {
-        S._lastTowerSig = newTowerHtml;
-        towerEl.innerHTML = newTowerHtml;
+      const nowMs = Date.now();
+      const liveStandings = (SIM3D && typeof SIM3D.getVisualStandings === 'function')
+        ? SIM3D.getVisualStandings(r)
+        : null;
+      const curOrderSig = ((liveStandings && liveStandings.order) || r.order || []).join(',') + '|' + (S.highlightedDriver || '');
+      const orderChanged = S._lastTowerOrderSig !== curOrderSig;
+      if (orderChanged || !S._lastTowerUpdateTs || (nowMs - S._lastTowerUpdateTs) >= 550) {
+        S._lastTowerOrderSig = curOrderSig;
+        S._lastTowerUpdateTs = nowMs;
+        const newTowerHtml = renderClassificationTower(r);
+        if (S._lastTowerSig !== newTowerHtml) {
+          S._lastTowerSig = newTowerHtml;
+          towerEl.innerHTML = newTowerHtml;
+        }
       }
     }
 
@@ -4816,8 +4828,13 @@
 
     const selHud = $('#selected-driver-hud');
     if (selHud) {
-      const newHud = renderSelectedDriverTelemetryHUD(r);
-      if (selHud.innerHTML !== newHud) selHud.innerHTML = newHud;
+      const nowHudMs = Date.now();
+      if (!S.highlightedDriver || S._lastHudDrv !== S.highlightedDriver || !S._lastHudTs || (nowHudMs - S._lastHudTs) >= 450) {
+        S._lastHudDrv = S.highlightedDriver;
+        S._lastHudTs = nowHudMs;
+        const newHud = renderSelectedDriverTelemetryHUD(r);
+        if (selHud.innerHTML !== newHud) selHud.innerHTML = newHud;
+      }
     }
 
     // Support Spectator Mode Live HUD Updates
@@ -4930,12 +4947,16 @@
         }
       }
       const genFinWrap = $('#general-financial-panel-wrap');
-      if (genFinWrap) {
-        genFinWrap.innerHTML = renderGeneralFinancialPanel(r);
-      } else {
-        const genFinEl = $('#general-financial-panel');
-        if (genFinEl) {
-          genFinEl.outerHTML = renderGeneralFinancialPanel(r);
+      const finSig = `${S.user ? S.user.chips : 0}_${S.user ? S.user.balanceVersion : 0}_${(r.bets || []).length}_${r.lap}_${r.running}_${r.bettingOpen}`;
+      if (S._lastGenFinSig !== finSig) {
+        S._lastGenFinSig = finSig;
+        if (genFinWrap) {
+          genFinWrap.innerHTML = renderGeneralFinancialPanel(r);
+        } else {
+          const genFinEl = $('#general-financial-panel');
+          if (genFinEl) {
+            genFinEl.outerHTML = renderGeneralFinancialPanel(r);
+          }
         }
       }
       return;
