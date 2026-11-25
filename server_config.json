@@ -1,7 +1,21 @@
 {
   "initialChips": 100,
-  "updatedAt": 1795555203.709,
+  "updatedAt": 1795572999.547,
   "adminLogs": [
+    {
+      "id": "alog_1795572999548_3eeb1b",
+      "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",
+      "detail": "Reset global de contas secundárias/bugadas concluído (Preservadas: nenhuma | Removidas: 0)",
+      "ts": 1795572999.55,
+      "date": "24/11/2026, 23:16:39"
+    },
+    {
+      "id": "alog_1795572815958_1a9267",
+      "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",
+      "detail": "Reset global de contas secundárias/bugadas concluído (Preservadas: nenhuma | Removidas: 0)",
+      "ts": 1795572815.959,
+      "date": "24/11/2026, 23:13:35"
+    },
     {
       "id": "alog_1795555203710_c616d8",
       "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",

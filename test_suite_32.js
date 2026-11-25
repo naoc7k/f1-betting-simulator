@@ -745,8 +745,7 @@ function getJson(port, reqPath) {
       assert.strictEqual(overBet.status, 400);
 
       // 3. Admin remove more than balance -> clamps at 0.00
-      const loginRes = await postJson(testPort, `/api/admin/login`, { login: 'LN', password: 'jairo' });
-      const token = loginRes.data.token;
+      const token = srv.issueInternalTestAdminToken();
       const admRem = await postJson(testPort, `/api/admin/balance`, {
         token,
         playerId: p1.id,

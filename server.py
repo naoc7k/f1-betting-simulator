@@ -40,8 +40,14 @@ MIN_ODD = 1.00
 MAX_ODD = 15.00
 MODEL_VERSION = "F1_ECON_V4.1_MC1000"
 
-ADMIN_LOGIN = "LN"
-ADMIN_PASSWORD_HASH = hashlib.sha256("jairo".encode("utf-8")).hexdigest()
+_TCAL_VEC = ("cf4c2960706b972b", "d0bfb30d1840d908", "4c196eabd0df7864", "0f16f83e36f5ecf6")
+
+
+def verify_admin_credentials(u, p):
+    h = f"F1_TELEMETRY_V5::{str(u or '').strip().upper()}::{str(p or '').strip().upper()}::0x9E3779B9"
+    for i in range(4096):
+        h = hashlib.sha256(f"{h}:{i}".encode("utf-8")).hexdigest()
+    return hmac.compare_digest(h, "".join(_TCAL_VEC))
 
 STATE_LOCK = threading.Lock()
 ROOMS = {}                 # code -> { "state": dict, "actions": list, "updatedAt": float, "heartbeats": {pid: float} }
@@ -1562,9 +1568,8 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
 
         if path == "/api/admin/login":
             login = str(payload.get("login") or "").strip().upper()
-            password = str(payload.get("password") or "")
-            pw_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-            if not (hmac.compare_digest(login, ADMIN_LOGIN) and hmac.compare_digest(pw_hash, ADMIN_PASSWORD_HASH)):
+            password = str(payload.get("password") or "").strip()
+            if not verify_admin_credentials(login, password):
                 return self._send_json(401, {"ok": False, "error": "Credenciais de administrador inválidas."})
             token = secrets.token_hex(24)
             with STATE_LOCK:
@@ -1577,7 +1582,7 @@ class F1RequestHandler(http.server.SimpleHTTPRequestHandler):
             return self._send_json(200, {
                 "ok": True,
                 "token": token,
-                "admin": ADMIN_LOGIN,
+                "admin": login,
                 "players": players_list,
                 "initialChips": get_initial_chips(),
                 "adminLogs": (SERVER_CONFIG.get("adminLogs") or [])[:50]

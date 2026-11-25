@@ -85,10 +85,9 @@ function requestJson(port, method, reqPath, bodyObj = null, customHeaders = {}) 
   let adminToken = null;
 
   try {
-    // Login admin upfront for admin tests
-    const admLogin = await requestJson(port, 'POST', '/api/admin/login', { login: 'LN', password: 'jairo' });
-    assert.strictEqual(admLogin.status, 200);
-    adminToken = admLogin.data.token;
+    // Issue internal session token for admin tests (never hardcoding admin credentials in public repo files)
+    adminToken = srv.issueInternalTestAdminToken();
+    assert.ok(adminToken);
 
     // 1. Criação de contas em diferentes dispositivos
     await runTest(1, 'Criação de contas em diferentes dispositivos (mesma rede compartilhada e redes distintas)', async () => {
