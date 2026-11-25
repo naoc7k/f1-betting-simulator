@@ -1,7 +1,28 @@
 {
   "initialChips": 100,
-  "updatedAt": 1795573631.26,
+  "updatedAt": 1795576398.463,
   "adminLogs": [
+    {
+      "id": "alog_1795576398465_0aca5e",
+      "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",
+      "detail": "Reset global de contas secundárias/bugadas concluído (Preservadas: nenhuma | Removidas: 0)",
+      "ts": 1795576398.466,
+      "date": "25/11/2026, 00:13:18"
+    },
+    {
+      "id": "alog_1795576398416_2c584f",
+      "action": "BALANCE_REMOVE",
+      "detail": "ZeroNegTester (usr_t32): Admin removeu -9999.00 fichas (50.00 -> 0.00)",
+      "ts": 1795576398.416,
+      "date": "25/11/2026, 00:13:18"
+    },
+    {
+      "id": "alog_1795576398081_0698df",
+      "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",
+      "detail": "Reset global de contas secundárias/bugadas concluído (Preservadas: nenhuma | Removidas: 0)",
+      "ts": 1795576398.089,
+      "date": "25/11/2026, 00:13:18"
+    },
     {
       "id": "alog_1795573631261_6d975c",
       "action": "GLOBAL_PURGE_SECONDARY_ACCOUNTS",

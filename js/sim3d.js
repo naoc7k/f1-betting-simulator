@@ -77,7 +77,12 @@
       this.visualGapMap = new Map();
       this.visualGapSecMap = new Map();
       this.visualLateralMap = new Map();
+      this.visualLatVelMap = new Map();
+      this.carTrackPosMap = new Map();
+      this.carSpeedMap = new Map();
+      this.carSteerYawMap = new Map();
       this.driverPhaseMap = new Map();
+      this.pitSide = -1;
       this.currentRaceId = null;
       this.viewW = 0;
       this.viewH = 0;
@@ -636,6 +641,7 @@
             );
             pitRoof.position.y = 4.3;
             bGroup.add(pitRoof);
+            this.pitSide = cand.side;
             placedPit = true;
           } else {
             const stand = new THREE.Mesh(
@@ -657,6 +663,89 @@
 
           this.trackGroup.add(bGroup);
         }
+      }
+
+      // Build visible 3D Pit Lane asphalt ribbon, pit wall divider & team pit boxes parallel to the main straight
+      this._build3DPitLane(spline, style);
+    }
+
+    _build3DPitLane(spline, style) {
+      if (!spline || !spline.length || !this.trackGroup) return;
+      const n = spline.length;
+      const pSide = this.pitSide || -1;
+      const pitVerts = [];
+      const pitIndices = [];
+      const pitEdgePts = [];
+      const steps = 64;
+      const startU = 0.89;
+      const endU = 1.09; // wraps to 0.09
+
+      for (let s = 0; s <= steps; s++) {
+        const u = startU + (s / steps) * (endU - startU);
+        const normU = u % 1;
+        const idx = Math.floor(normU * n) % n;
+        const pt = spline[idx];
+
+        // Smooth blend from track edge (3.0m) out to pit lane center (5.0m) and back
+        let blend = 1.0;
+        if (u < 0.935) {
+          const t = Math.max(0, (u - startU) / (0.935 - startU));
+          blend = t * t * (3 - 2 * t);
+        } else if (u > 1.045) {
+          const t = Math.max(0, (endU - u) / (endU - 1.045));
+          blend = t * t * (3 - 2 * t);
+        }
+
+        const centerOff = pSide * (2.6 + blend * 2.5);
+        const halfW = 1.15;
+        const inOff = centerOff - pSide * halfW;
+        const outOff = centerOff + pSide * halfW;
+        const y = Math.max(0.06, pt.y + 0.06) + 0.012;
+
+        const ix = pt.x + pt.nx * inOff;
+        const iz = pt.z + pt.nz * inOff;
+        const ox = pt.x + pt.nx * outOff;
+        const oz = pt.z + pt.nz * outOff;
+
+        pitVerts.push(ix, y, iz, ox, y, oz);
+        pitEdgePts.push(new THREE.Vector3(ox, y + 0.02, oz));
+
+        if (s < steps) {
+          const b = s * 2;
+          pitIndices.push(b, b + 1, b + 2, b + 1, b + 3, b + 2);
+        }
+      }
+
+      const pitGeo = new THREE.BufferGeometry();
+      pitGeo.setAttribute('position', new THREE.Float32BufferAttribute(pitVerts, 3));
+      pitGeo.setIndex(pitIndices);
+      pitGeo.computeVertexNormals();
+      const pitMat = new THREE.MeshStandardMaterial({
+        color: 0x151922,
+        roughness: 0.55,
+        metalness: 0.2,
+        side: THREE.DoubleSide
+      });
+      const pitMesh = new THREE.Mesh(pitGeo, pitMat);
+      pitMesh.receiveShadow = true;
+      this.trackGroup.add(pitMesh);
+
+      const pitLineMat = new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.75 });
+      this.trackGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pitEdgePts), pitLineMat));
+
+      // Add 6 illuminated Pit Box bays along the pit lane (u = 0.962..0.985)
+      const boxMat = new THREE.MeshBasicMaterial({ color: 0xffc83d, side: THREE.DoubleSide });
+      for (let b = 0; b < 6; b++) {
+        const boxU = (0.985 - b * 0.0035) % 1;
+        const pt = spline[Math.floor(boxU * n) % n];
+        const bx = pt.x + pt.nx * (pSide * 5.15);
+        const bz = pt.z + pt.nz * (pSide * 5.15);
+        const by = Math.max(0.06, pt.y + 0.06) + 0.03;
+        const bay = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 2.6), boxMat);
+        bay.rotation.x = -Math.PI / 2;
+        bay.rotation.z = -pt.angleY;
+        bay.position.set(bx, by, bz);
+        this.trackGroup.add(bay);
       }
     }
 
@@ -1315,39 +1404,26 @@
       this.animFrame = requestAnimationFrame(tick);
     }
 
-    _getDriverVisualProgress(race, id, rankIndex, nowMs, dt = 0.016) {
-      const d = race.drv && race.drv[id];
-      if (!d) return { progress: 0, lateral: 0, speedRatio: 0 };
+    /**
+     * Coordinated multi-car kinematics engine:
+     *  - Enforces strictly monotonic forward motion on track (zero slingshot/backward recoil!).
+     *  - Simulates 3-stage visual Pit Stops (ENTRY deceleration -> STOPPED in pit box -> EXIT acceleration).
+     *  - Performs spatial multi-car collision avoidance and progressive lateral overtaking maneuvers.
+     *  - Modulates speed naturally for standing starts and tight corners.
+     */
+    _updateAllDriversKinematics(race, nowMs, dt) {
+      if (!race || !Array.isArray(race.order) || !race.drv) return;
+      const frameDt = Math.min(0.05, Math.max(0.004, dt || 0.016));
 
       if (this.currentRaceId !== race.id) {
         this.currentRaceId = race.id;
         this.visualGapMap.clear();
         this.visualGapSecMap.clear();
         this.visualLateralMap.clear();
-      }
-
-      if (!this.driverPhaseMap.has(id)) {
-        let h = 0;
-        for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) & 0xffff;
-        this.driverPhaseMap.set(id, (h % 628) / 100);
-      }
-      const drvPhase = this.driverPhaseMap.get(id);
-
-      if (!race.started || (race.lap === 0 && !race.running)) {
-        const gridBack = -0.012 - rankIndex * 0.011;
-        const gridSide = (rankIndex % 2 === 0 ? -1 : 1) * 1.35;
-        this.visualGapMap.set(id, rankIndex * 0.014);
-        this.visualGapSecMap.set(id, 0);
-        this.visualLateralMap.set(id, gridSide);
-        return { progress: gridBack, lateral: gridSide, speedRatio: 0 };
-      }
-
-      if (d.st === 'dnf') {
-        return {
-          progress: (d.dnfTrackPos !== undefined ? d.dnfTrackPos : ((d.lapsDone * 0.23 + rankIndex * 0.05) % 1)),
-          lateral: 3.1,
-          speedRatio: 0
-        };
+        this.visualLatVelMap.clear();
+        this.carTrackPosMap.clear();
+        this.carSpeedMap.clear();
+        this.carSteerYawMap.clear();
       }
 
       let baseLapProg = race.lapProgress || 0;
@@ -1358,66 +1434,268 @@
         baseLapProg = Math.min(0.9995, baseLapProg + elapsedSinceTick / lapDur);
       }
 
-      const leadId = race.order[0];
-      const leadDrv = race.drv[leadId];
-      const targetGapSec = leadDrv ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : rankIndex * 0.8;
-      const targetGap = Math.min(0.88, targetGapSec * 0.012 + rankIndex * 0.014);
-
-      let curGap = targetGap;
-      let curGapSec = targetGapSec;
-      const frameDt = Math.min(0.05, Math.max(0.004, dt || 0.016));
-      if (race.running && this.visualGapMap.has(id)) {
-        const prevGap = this.visualGapMap.get(id);
-        const prevSec = this.visualGapSecMap.has(id) ? this.visualGapSecMap.get(id) : targetGapSec;
-        // Frame-rate independent exponential smoothing for buttery-smooth longitudinal overtaking
-        const gapAlpha = 1 - Math.exp(-frameDt * 4.2);
-        curGap = prevGap + (targetGap - prevGap) * gapAlpha;
-        curGapSec = prevSec + (targetGapSec - prevSec) * gapAlpha;
-        if (Math.abs(targetGap - curGap) < 0.00008) {
-          curGap = targetGap;
-          curGapSec = targetGapSec;
-        }
-      }
-      this.visualGapMap.set(id, curGap);
-      this.visualGapSecMap.set(id, curGapSec);
-
       const isMidLap = race.started && !race.done && !race.bettingOpen;
       const totalCompletedLaps = Math.max(0, (Number(race.lap) || 0) - (isMidLap ? 1 : 0));
-      const rawProgress = totalCompletedLaps + baseLapProg - curGap;
+      const leaderBasePos = totalCompletedLaps + baseLapProg;
+      const baseLapSpeed = 1.0 / ((race.lapDurationMs || 30000) / 1000); // ~0.03333 laps/sec
+      const pSide = this.pitSide || -1;
 
-      // Use constant driver phase (drvPhase) instead of mutable rankIndex so lateral line never snaps on rank swap
-      let targetLateral = Math.sin(rawProgress * Math.PI * 4 + drvPhase) * 0.58;
-      const gapDiff = targetGap - curGap;
-      if (Math.abs(gapDiff) > 0.0008 && race.running) {
-        const passDir = gapDiff < 0 ? -1.35 : 1.35;
-        // Smooth bell-shaped lane change that eases in and out cleanly
-        const intensity = Math.min(1, Math.abs(gapDiff) * 55);
-        const smoothWeave = Math.sin(intensity * Math.PI * 0.5);
-        targetLateral += passDir * smoothWeave;
-      }
-      if (d.pitLap === race.lap && baseLapProg < 0.22) {
-        targetLateral = -2.4;
-      }
-      targetLateral = Math.max(-2.5, Math.min(2.5, targetLateral));
+      const leadId = race.order[0];
+      const leadDrv = race.drv[leadId];
 
-      let curLateral = targetLateral;
-      if (race.running && this.visualLateralMap.has(id)) {
-        const prevLat = this.visualLateralMap.get(id);
-        const latAlpha = 1 - Math.exp(-frameDt * 7.5);
-        curLateral = prevLat + (targetLateral - prevLat) * latAlpha;
-      }
-      this.visualLateralMap.set(id, curLateral);
+      // Pass 1: Longitudinal track progress & Pit Lane kinematics
+      race.order.forEach((id, rankIndex) => {
+        const d = race.drv[id];
+        if (!d) return;
 
-      return {
-        progress: rawProgress,
-        lateral: curLateral,
-        speedRatio: race.running ? (race.sc && race.sc.type ? 0.55 : 1.0) : 0
-      };
+        if (!this.driverPhaseMap.has(id)) {
+          let h = 0;
+          for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) & 0xffff;
+          this.driverPhaseMap.set(id, (h % 628) / 100);
+        }
+
+        // Pre-race standing grid slots
+        if (!race.started || (race.lap === 0 && !race.running)) {
+          const gridBack = -0.012 - rankIndex * 0.011;
+          const gridSide = (rankIndex % 2 === 0 ? -1 : 1) * 1.35;
+          this.carTrackPosMap.set(id, gridBack);
+          this.carSpeedMap.set(id, 0);
+          this.visualGapMap.set(id, rankIndex * 0.013);
+          this.visualGapSecMap.set(id, rankIndex * 0.28);
+          this.visualLateralMap.set(id, gridSide);
+          this.visualLatVelMap.set(id, 0);
+          this.carSteerYawMap.set(id, 0);
+          return;
+        }
+
+        if (d.st === 'dnf') {
+          const dnfPos = d.dnfTrackPos !== undefined ? d.dnfTrackPos : ((d.lapsDone * 0.23 + rankIndex * 0.05) % 1);
+          this.carTrackPosMap.set(id, dnfPos);
+          this.carSpeedMap.set(id, 0);
+          this.visualLateralMap.set(id, 3.1);
+          this.carSteerYawMap.set(id, 0);
+          return;
+        }
+
+        const targetGapSec = leadDrv ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : rankIndex * 0.6;
+        const targetGap = Math.min(0.88, targetGapSec * 0.0115 + rankIndex * 0.012);
+        const targetTrackPos = leaderBasePos - targetGap;
+
+        if (!this.carTrackPosMap.has(id) || !race.running) {
+          const snapPos = (!race.running && this.carTrackPosMap.has(id)) ? this.carTrackPosMap.get(id) : targetTrackPos;
+          this.carTrackPosMap.set(id, snapPos);
+          this.carSpeedMap.set(id, 0);
+          this.visualGapMap.set(id, Math.max(0, leaderBasePos - snapPos));
+          this.visualGapSecMap.set(id, targetGapSec);
+          return;
+        }
+
+        let curPos = this.carTrackPosMap.get(id);
+        let curVel = this.carSpeedMap.get(id) || baseLapSpeed;
+
+        // Check if car is executing a 3-stage visual Pit Stop
+        if (d.pitState) {
+          const ps = d.pitState;
+          const pitLapBase = Math.max(0, (Number(ps.lap) || 1) - 1);
+          const pitBoxAbsPos = pitLapBase + (ps.boxPos || 0.982);
+
+          if (ps.phase === 'ENTRY') {
+            // Smoothly decelerate into the pit lane toward the pit box
+            const distToBox = Math.max(0, pitBoxAbsPos - curPos);
+            const desiredVel = distToBox > 0.002
+              ? Math.max(baseLapSpeed * 0.65, Math.min(baseLapSpeed * 0.98, distToBox * 1.35))
+              : baseLapSpeed * 0.35;
+            curVel = curVel + (desiredVel - curVel) * (1 - Math.exp(-frameDt * 6.0));
+            curPos = Math.min(pitBoxAbsPos, curPos + curVel * frameDt);
+          } else if (ps.phase === 'STOPPED') {
+            // Smoothly brake to a complete standstill inside the pit box (0 km/h)
+            const distToBox = pitBoxAbsPos - curPos;
+            if (distToBox > 0.001) {
+              curVel = Math.max(baseLapSpeed * 0.55, distToBox * 2.5);
+              curPos = Math.min(pitBoxAbsPos, curPos + curVel * frameDt);
+            } else {
+              curPos = pitBoxAbsPos;
+              curVel = 0;
+            }
+          } else if (ps.phase === 'EXIT') {
+            // Accelerate progressively out of the pit box along the pit exit lane
+            const desiredVel = baseLapSpeed * 0.95;
+            curVel = curVel + (desiredVel - curVel) * (1 - Math.exp(-frameDt * 3.8));
+            curPos = curPos + curVel * frameDt;
+          }
+        } else {
+          // Normal on-track racing kinematics (strictly monotonic forward velocity: NEVER moves backward!)
+          const sampleNow = window.F1Tracks.sampleTrack(race.circuit.id, curPos, 0);
+          const curv = Math.abs(sampleNow.curvature || 0);
+          const cornerSlowdown = 1.0 - Math.min(0.13, curv * 0.14);
+
+          // Standing start progressive acceleration on Lap 1
+          let launchEnvelope = 1.0;
+          if (totalCompletedLaps === 0 && baseLapProg < 0.075) {
+            const t = Math.max(0, baseLapProg / 0.075);
+            launchEnvelope = 0.22 + 0.78 * (t * t * (3 - 2 * t));
+          }
+
+          const scFactor = (race.sc && race.sc.type === 'SC') ? 0.68 : (race.sc && race.sc.type === 'VSC') ? 0.80 : 1.0;
+          const localBaseVel = baseLapSpeed * cornerSlowdown * launchEnvelope * scFactor;
+
+          const posErr = targetTrackPos - curPos;
+          let desiredVel = localBaseVel;
+          if (Math.abs(posErr) > 1.8) {
+            // Re-sync only if tab was backgrounded for several laps
+            curPos = targetTrackPos;
+            desiredVel = localBaseVel;
+          } else if (posErr >= 0) {
+            // Closing gap or overtaking: smooth slipstream/DRS speed boost (up to +32% max)
+            const boost = Math.min(0.32, posErr * 9.5);
+            desiredVel = localBaseVel * (1.0 + boost);
+          } else {
+            // Losing time or being overtaken: slow down slightly (down to 72% speed), NEVER move backward!
+            const drag = Math.max(-0.28, posErr * 8.5);
+            desiredVel = localBaseVel * (1.0 + drag);
+          }
+
+          const velAlpha = 1 - Math.exp(-frameDt * 6.5);
+          curVel = Math.max(0, curVel + (desiredVel - curVel) * velAlpha);
+          curPos = curPos + curVel * frameDt;
+        }
+
+        this.carTrackPosMap.set(id, curPos);
+        this.carSpeedMap.set(id, curVel);
+
+        const actualVisualGap = Math.max(0, leaderBasePos - curPos);
+        this.visualGapMap.set(id, actualVisualGap);
+
+        const prevSec = this.visualGapSecMap.has(id) ? this.visualGapSecMap.get(id) : targetGapSec;
+        const secAlpha = 1 - Math.exp(-frameDt * 5.0);
+        this.visualGapSecMap.set(id, prevSec + (targetGapSec - prevSec) * secAlpha);
+      });
+
+      // Pass 2: Lateral Racing Line, Pit Lane Trajectory & Multi-Car Overtake Avoidance
+      const runningIds = race.order.filter(id => race.drv[id] && race.drv[id].st === 'run');
+      // Sort by current physical track position descending (leader first) so trailing cars react to cars ahead
+      runningIds.sort((a, b) => (this.carTrackPosMap.get(b) || 0) - (this.carTrackPosMap.get(a) || 0));
+
+      const chosenLaterals = new Map();
+
+      runningIds.forEach((id) => {
+        const d = race.drv[id];
+        const curPos = this.carTrackPosMap.get(id) || 0;
+        const drvPhase = this.driverPhaseMap.get(id) || 0;
+        const sampleNow = window.F1Tracks.sampleTrack(race.circuit.id, curPos, 0);
+        const prevLat = this.visualLateralMap.has(id) ? this.visualLateralMap.get(id) : 0;
+
+        let targetLateral = 0;
+
+        if (d.pitState) {
+          const ps = d.pitState;
+          const progMod = ((curPos % 1) + 1) % 1;
+          if (ps.phase === 'ENTRY') {
+            const entryT = progMod >= 0.80 ? Math.max(0, Math.min(1, (progMod - 0.84) / 0.10)) : 1.0;
+            const entrySmooth = entryT * entryT * (3 - 2 * entryT);
+            targetLateral = pSide * (1.2 + 3.55 * entrySmooth);
+          } else if (ps.phase === 'STOPPED') {
+            targetLateral = pSide * 5.15;
+          } else if (ps.phase === 'EXIT') {
+            const exitBlend = progMod > 0.80 || progMod < 0.03 ? 1.0 : Math.max(0, 1.0 - (progMod - 0.03) / 0.06);
+            const exitSmooth = exitBlend * exitBlend * (3 - 2 * exitBlend);
+            targetLateral = pSide * 4.75 * exitSmooth;
+          }
+        } else {
+          // Natural corner apex racing line + subtle organic weave
+          const apexHug = -Math.sign(sampleNow.curvature || 0) * Math.min(1.05, Math.abs(sampleNow.curvature || 0) * 1.45);
+          const organicLine = Math.sin(curPos * Math.PI * 2 + drvPhase) * 0.35;
+          targetLateral = Math.max(-1.8, Math.min(1.8, apexHug + organicLine));
+
+          // Check nearby cars on track for overtake pull-out & side-by-side spacing
+          const nearbyBlockedLanes = [];
+          for (const otherId of runningIds) {
+            if (otherId === id) continue;
+            const otherD = race.drv[otherId];
+            if (!otherD || otherD.pitState) continue;
+            const otherPos = this.carTrackPosMap.get(otherId) || 0;
+            const dLong = otherPos - curPos;
+            // Car is within ~2.2 car lengths ahead or side-by-side
+            if (dLong > -0.008 && dLong < 0.020) {
+              const otherLat = chosenLaterals.has(otherId)
+                ? chosenLaterals.get(otherId)
+                : (this.visualLateralMap.get(otherId) || 0);
+              nearbyBlockedLanes.push({ dLong, otherLat });
+            }
+          }
+
+          if (nearbyBlockedLanes.length > 0) {
+            // Evaluate candidate passing lanes (-1.65, 0.0, +1.65) and pick the clearest lane
+            const candidateLanes = [-1.65, 0.0, 1.65, -0.9, 0.9];
+            let bestLane = targetLateral;
+            let bestScore = -999;
+
+            for (const cand of candidateLanes) {
+              let minClearance = 99;
+              for (const nb of nearbyBlockedLanes) {
+                const latDist = Math.abs(cand - nb.otherLat);
+                if (latDist < minClearance) minClearance = latDist;
+              }
+              // Prefer lanes with wide lateral clearance (>1.25m) while minimizing violent jumps from prevLat
+              const stabilityBonus = -Math.abs(cand - prevLat) * 0.28 - Math.abs(cand - targetLateral) * 0.12;
+              const score = minClearance + stabilityBonus;
+              if (score > bestScore) {
+                bestScore = score;
+                bestLane = cand;
+              }
+            }
+
+            // Smooth bell blend into passing lane as car gets closer
+            const closestLong = Math.min(...nearbyBlockedLanes.map(n => Math.abs(n.dLong)));
+            const proxBlend = Math.max(0, Math.min(1, 1.0 - (closestLong / 0.020)));
+            const smoothProx = proxBlend * proxBlend * (3 - 2 * proxBlend);
+            targetLateral = targetLateral + (bestLane - targetLateral) * Math.max(0.55, smoothProx);
+          }
+
+          targetLateral = Math.max(-2.35, Math.min(2.35, targetLateral));
+        }
+
+        chosenLaterals.set(id, targetLateral);
+
+        // Critically-damped smooth lateral transition with bounded lateral steering rate
+        const latRate = d.pitState ? 4.8 : 4.2;
+        const latAlpha = 1 - Math.exp(-frameDt * latRate);
+        const desiredStep = (targetLateral - prevLat) * latAlpha;
+        const maxLatSpeed = d.pitState ? 3.2 : 2.2; // meters/sec lateral cap
+        const maxStep = maxLatSpeed * frameDt;
+        const clampedStep = Math.max(-maxStep, Math.min(maxStep, desiredStep));
+        const curLateral = prevLat + clampedStep;
+        const latVel = clampedStep / Math.max(0.001, frameDt);
+
+        this.visualLateralMap.set(id, curLateral);
+        this.visualLatVelMap.set(id, latVel);
+
+        const rawSteerYaw = (this.carSpeedMap.get(id) || 0) > 0.002
+          ? Math.max(-0.22, Math.min(0.22, latVel * 0.038))
+          : 0;
+        const prevYaw = this.carSteerYawMap.get(id) || 0;
+        const curYaw = prevYaw + (rawSteerYaw - prevYaw) * (1 - Math.exp(-frameDt * 10.0));
+        this.carSteerYawMap.set(id, curYaw);
+      });
+    }
+
+    _getDriverVisualProgress(race, id, rankIndex) {
+      const d = race.drv && race.drv[id];
+      if (!d) return { progress: 0, lateral: 0, speedRatio: 0, steerYaw: 0 };
+
+      const progress = this.carTrackPosMap.has(id) ? this.carTrackPosMap.get(id) : (-0.012 - rankIndex * 0.011);
+      const lateral = this.visualLateralMap.has(id) ? this.visualLateralMap.get(id) : 0;
+      const curVel = this.carSpeedMap.get(id) || 0;
+      const baseLapSpeed = 1.0 / ((race.lapDurationMs || 30000) / 1000);
+      const speedRatio = race.running ? Math.max(0, Math.min(1.35, curVel / baseLapSpeed)) : 0;
+      const steerYaw = this.carSteerYawMap.get(id) || 0;
+
+      return { progress, lateral, speedRatio, steerYaw };
     }
 
     /**
-     * Returns the live visual standings synchronized 1:1 with the 3D cars on the map.
-     * Ensures the Live Classification Table and the 3D Map update at the exact same moment!
+     * Returns the live visual standings synchronized 1:1 with the physical 3D cars on the map.
+     * Orders running drivers by their actual monotonic 3D track distance (`carTrackPosMap`).
      */
     getVisualStandings(race) {
       if (!race || !Array.isArray(race.order)) {
@@ -1426,7 +1704,7 @@
       const leadId = race.order[0];
       const leadDrv = race.drv && race.drv[leadId];
 
-      if (!race.running || this.visualGapMap.size === 0 || this.currentRaceId !== race.id) {
+      if (!race.running || this.carTrackPosMap.size === 0 || this.currentRaceId !== race.id) {
         const rankMap = new Map();
         const gapSecMap = new Map();
         race.order.forEach((id, idx) => {
@@ -1443,27 +1721,29 @@
       race.order.forEach((id, idx) => {
         const d = race.drv && race.drv[id];
         if (d && d.st === 'run') {
-          const fallbackGap = Math.min(0.88, Math.max(0, (d.t || 0) - (leadDrv ? leadDrv.t || 0 : 0)) * 0.012 + idx * 0.014);
-          const vGap = this.visualGapMap.has(id) ? this.visualGapMap.get(id) : fallbackGap;
-          running.push({ id, vGap, authIdx: idx });
+          const trackPos = this.carTrackPosMap.has(id) ? this.carTrackPosMap.get(id) : (-idx * 0.014);
+          running.push({ id, trackPos, authIdx: idx });
         } else {
           nonRunning.push(id);
         }
       });
 
-      running.sort((a, b) => (a.vGap - b.vGap) || (a.authIdx - b.authIdx));
+      // Higher trackPos = further ahead along the race distance = better rank (P1, P2, P3...)
+      running.sort((a, b) => (b.trackPos - a.trackPos) || (a.authIdx - b.authIdx));
       const visualOrder = running.map(x => x.id).concat(nonRunning);
       const rankMap = new Map();
       const gapSecMap = new Map();
-      const leaderVisualSec = running.length && this.visualGapSecMap.has(running[0].id)
-        ? this.visualGapSecMap.get(running[0].id)
-        : 0;
+      const leaderTrackPos = running.length ? running[0].trackPos : 0;
+      const lapDurSec = ((race.lapDurationMs || 30000) / 1000);
 
       visualOrder.forEach((id, idx) => {
         rankMap.set(id, idx + 1);
         const d = race.drv && race.drv[id];
-        if (this.visualGapSecMap.has(id)) {
-          gapSecMap.set(id, Math.max(0, this.visualGapSecMap.get(id) - leaderVisualSec));
+        if (this.carTrackPosMap.has(id) && d && d.st === 'run') {
+          const posDiff = Math.max(0, leaderTrackPos - this.carTrackPosMap.get(id));
+          // Convert visual track distance gap into coherent live gap seconds
+          const authGapSec = this.visualGapSecMap.has(id) ? this.visualGapSecMap.get(id) : (posDiff * lapDurSec);
+          gapSecMap.set(id, Math.max(0, authGapSec));
         } else {
           const gSec = (d && leadDrv) ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : idx * 0.8;
           gapSecMap.set(id, gSec);
@@ -1523,17 +1803,20 @@
         ? this.selectedDriver
         : race.order[0];
 
+      // Step coordinated kinematics for all cars once per frame
+      this._updateAllDriversKinematics(race, nowMs, dt);
+
       race.order.forEach((id, idx) => {
         const entry = this.carMeshes.get(id);
         const drvState = race.drv ? race.drv[id] : null;
         if (!entry || !drvState) return;
 
-        const vis = this._getDriverVisualProgress(race, id, idx, nowMs, dt);
+        const vis = this._getDriverVisualProgress(race, id, idx);
         const sample = window.F1Tracks.sampleTrack(race.circuit.id, vis.progress, vis.lateral);
 
         entry.group.position.set(sample.x, Math.max(0.06, sample.y + 0.06), sample.z);
-        const steerAngle = Math.max(-0.35, Math.min(0.35, sample.curvature * 1.4));
-        entry.group.rotation.set(0, sample.angleY, 0);
+        const steerAngle = Math.max(-0.38, Math.min(0.38, sample.curvature * 1.4 + (vis.steerYaw || 0) * 1.2));
+        entry.group.rotation.set(0, sample.angleY + (vis.steerYaw || 0), 0);
 
         const curTyre = drvState.tyre || 'S';
         if (entry.lastTyre !== curTyre) {
@@ -1552,13 +1835,16 @@
         }
 
         const isSel = (this.selectedDriver === id);
-        entry.highlightRing.visible = isSel;
+        const isInPitBox = !!(drvState.pitState && drvState.pitState.phase === 'STOPPED');
+        entry.highlightRing.visible = isSel || isInPitBox;
         entry.beacon.visible = isSel;
-        if (isSel) {
-          const pulse = 1 + Math.sin(nowMs * 0.008) * 0.15;
+        if (isSel || isInPitBox) {
+          const pulse = 1 + Math.sin(nowMs * 0.012) * 0.18;
           entry.highlightRing.scale.set(pulse, pulse, 1);
-          entry.beacon.position.y = 2.5 + Math.sin(nowMs * 0.008) * 0.35;
-          entry.beacon.rotation.y += dt * 3.5;
+          if (isSel) {
+            entry.beacon.position.y = 2.5 + Math.sin(nowMs * 0.008) * 0.35;
+            entry.beacon.rotation.y += dt * 3.5;
+          }
         }
 
         entry.group.visible = true;
@@ -1698,7 +1984,8 @@
           labelEl.style.zIndex = zStr;
         }
 
-        const posText = isDnf ? 'OUT' : String(visPos);
+        const isPitting = !!drvState.pitState;
+        const posText = isDnf ? 'OUT' : isPitting ? `P${visPos}·PIT` : String(visPos);
         if (labelEl._lastPosText !== posText) {
           labelEl._lastPosText = posText;
           const posSpan = labelEl._posSpan || (labelEl._posSpan = labelEl.querySelector('.c-pos'));
@@ -1745,8 +2032,10 @@
       ctx.lineWidth = 17;
       ctx.stroke();
 
+      this._updateAllDriversKinematics(race, nowMs, 0.016);
+
       race.order.forEach((id, idx) => {
-        const vis = this._getDriverVisualProgress(race, id, idx, nowMs, dt);
+        const vis = this._getDriverVisualProgress(race, id, idx, nowMs);
         const sample = window.F1Tracks.sampleTrack(race.circuit.id, vis.progress, vis.lateral);
         const s = project(sample.x, sample.y, sample.z);
         const drv = window.F1Tracks.DRIVERS.find(d => d.id === id);
