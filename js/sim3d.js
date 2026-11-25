@@ -1428,6 +1428,9 @@
 
       let baseLapProg = race.lapProgress || 0;
       const tickRef = race._localTickTs || race.lastTickTs;
+      const subTickSec = (race.running && tickRef)
+        ? Math.max(0, Math.min(0.25, (Date.now() - tickRef) / 1000))
+        : 0;
       if (race.running && tickRef) {
         const elapsedSinceTick = Math.max(0, Math.min(1200, Date.now() - tickRef));
         const lapDur = race.lapDurationMs || 30000;
@@ -1456,11 +1459,11 @@
 
         // Pre-race standing grid slots
         if (!race.started || (race.lap === 0 && !race.running)) {
-          const gridBack = -0.012 - rankIndex * 0.011;
-          const gridSide = (rankIndex % 2 === 0 ? -1 : 1) * 1.35;
+          const gridBack = typeof d.trackPos === 'number' ? d.trackPos : (-0.004 - rankIndex * 0.0055);
+          const gridSide = typeof d.latPos === 'number' ? d.latPos : ((rankIndex % 2 === 0 ? -1 : 1) * 1.35);
           this.carTrackPosMap.set(id, gridBack);
           this.carSpeedMap.set(id, 0);
-          this.visualGapMap.set(id, rankIndex * 0.013);
+          this.visualGapMap.set(id, rankIndex * 0.0055);
           this.visualGapSecMap.set(id, rankIndex * 0.28);
           this.visualLateralMap.set(id, gridSide);
           this.visualLatVelMap.set(id, 0);
@@ -1478,102 +1481,86 @@
         }
 
         const targetGapSec = leadDrv ? Math.max(0, (d.t || 0) - (leadDrv.t || 0)) : rankIndex * 0.6;
-        const targetGap = Math.min(0.88, targetGapSec * 0.0115 + rankIndex * 0.012);
-        const targetTrackPos = leaderBasePos - targetGap;
+        const hasAuthTrackPos = typeof d.trackPos === 'number' && !Number.isNaN(d.trackPos);
+        const fallbackTargetPos = leaderBasePos - Math.min(0.88, targetGapSec * 0.0115 + rankIndex * 0.006);
+        const authTrackPos = hasAuthTrackPos ? d.trackPos : fallbackTargetPos;
 
         if (!this.carTrackPosMap.has(id) || !race.running) {
-          const snapPos = (!race.running && this.carTrackPosMap.has(id)) ? this.carTrackPosMap.get(id) : targetTrackPos;
+          const snapPos = hasAuthTrackPos
+            ? d.trackPos
+            : ((!race.running && this.carTrackPosMap.has(id)) ? this.carTrackPosMap.get(id) : fallbackTargetPos);
           this.carTrackPosMap.set(id, snapPos);
           this.carSpeedMap.set(id, 0);
-          this.visualGapMap.set(id, Math.max(0, leaderBasePos - snapPos));
+          this.visualGapMap.set(id, Math.max(0, (leadDrv && typeof leadDrv.trackPos === 'number' ? leadDrv.trackPos : leaderBasePos) - snapPos));
           this.visualGapSecMap.set(id, targetGapSec);
+          if (typeof d.latPos === 'number' && !this.visualLateralMap.has(id)) {
+            this.visualLateralMap.set(id, d.latPos);
+          }
           return;
         }
 
         let curPos = this.carTrackPosMap.get(id);
         let curVel = this.carSpeedMap.get(id) || baseLapSpeed;
 
-        // Check if car is executing a 3-stage visual Pit Stop
         if (d.pitState) {
           const ps = d.pitState;
-          const pitLapBase = Math.max(0, (Number(ps.lap) || 1) - 1);
-          const pitBoxAbsPos = pitLapBase + (ps.boxPos || 0.982);
+          const pitLapBase = ps.lapBase !== undefined ? ps.lapBase : Math.max(0, (Number(ps.lap) || 1) - 1);
+          const pitBoxAbsPos = ps.boxAbsPos !== undefined ? ps.boxAbsPos : (pitLapBase + (ps.boxPos || 0.978));
 
-          if (ps.phase === 'ENTRY') {
-            // Smoothly decelerate into the pit lane toward the pit box
-            const distToBox = Math.max(0, pitBoxAbsPos - curPos);
-            const desiredVel = distToBox > 0.002
-              ? Math.max(baseLapSpeed * 0.65, Math.min(baseLapSpeed * 0.98, distToBox * 1.35))
-              : baseLapSpeed * 0.35;
-            curVel = curVel + (desiredVel - curVel) * (1 - Math.exp(-frameDt * 6.0));
-            curPos = Math.min(pitBoxAbsPos, curPos + curVel * frameDt);
-          } else if (ps.phase === 'STOPPED') {
-            // Smoothly brake to a complete standstill inside the pit box (0 km/h)
-            const distToBox = pitBoxAbsPos - curPos;
-            if (distToBox > 0.001) {
-              curVel = Math.max(baseLapSpeed * 0.55, distToBox * 2.5);
-              curPos = Math.min(pitBoxAbsPos, curPos + curVel * frameDt);
-            } else {
-              curPos = pitBoxAbsPos;
-              curVel = 0;
+          if (ps.phase === 'STOPPED') {
+            curPos = pitBoxAbsPos;
+            curVel = 0;
+          } else {
+            const authVel = typeof d.trackVel === 'number' ? d.trackVel : (baseLapSpeed * 0.48);
+            let predictedPos = authTrackPos + authVel * subTickSec;
+            if (ps.phase === 'APPROACH' || ps.phase === 'ENTRY') {
+              predictedPos = Math.min(pitBoxAbsPos, predictedPos);
             }
-          } else if (ps.phase === 'EXIT') {
-            // Accelerate progressively out of the pit box along the pit exit lane
-            const desiredVel = baseLapSpeed * 0.95;
-            curVel = curVel + (desiredVel - curVel) * (1 - Math.exp(-frameDt * 3.8));
-            curPos = curPos + curVel * frameDt;
+            const nextPos = subTickSec === 0
+              ? predictedPos
+              : (curPos + (predictedPos - curPos) * (1 - Math.exp(-frameDt * 25.0)));
+            const safeNextPos = Math.max(curPos, nextPos);
+            curVel = Math.max(0, (safeNextPos - curPos) / Math.max(0.001, frameDt));
+            curPos = safeNextPos;
+          }
+        } else if (hasAuthTrackPos) {
+          // Direct 60 FPS continuous forward interpolation coupled 1:1 to authoritative physical kinematics
+          const authVel = typeof d.trackVel === 'number' ? d.trackVel : baseLapSpeed;
+          const predictedPos = authTrackPos + authVel * subTickSec;
+
+          if (Math.abs(predictedPos - curPos) > 1.5) {
+            curPos = predictedPos;
+            curVel = authVel;
+          } else {
+            const nextPos = subTickSec === 0
+              ? predictedPos
+              : (curPos + (predictedPos - curPos) * (1 - Math.exp(-frameDt * 25.0)));
+            const safeNextPos = Math.max(curPos, nextPos);
+            curVel = subTickSec === 0 ? authVel : Math.max(0, (safeNextPos - curPos) / Math.max(0.001, frameDt));
+            curPos = safeNextPos;
           }
         } else {
-          // Normal on-track racing kinematics (strictly monotonic forward velocity: NEVER moves backward!)
-          const sampleNow = window.F1Tracks.sampleTrack(race.circuit.id, curPos, 0);
-          const curv = Math.abs(sampleNow.curvature || 0);
-          const cornerSlowdown = 1.0 - Math.min(0.13, curv * 0.14);
-
-          // Standing start progressive acceleration on Lap 1
-          let launchEnvelope = 1.0;
-          if (totalCompletedLaps === 0 && baseLapProg < 0.075) {
-            const t = Math.max(0, baseLapProg / 0.075);
-            launchEnvelope = 0.22 + 0.78 * (t * t * (3 - 2 * t));
-          }
-
-          const scFactor = (race.sc && race.sc.type === 'SC') ? 0.68 : (race.sc && race.sc.type === 'VSC') ? 0.80 : 1.0;
-          const localBaseVel = baseLapSpeed * cornerSlowdown * launchEnvelope * scFactor;
-
-          const posErr = targetTrackPos - curPos;
-          let desiredVel = localBaseVel;
-          if (Math.abs(posErr) > 1.8) {
-            // Re-sync only if tab was backgrounded for several laps
-            curPos = targetTrackPos;
-            desiredVel = localBaseVel;
-          } else if (posErr >= 0) {
-            // Closing gap or overtaking: smooth slipstream/DRS speed boost (up to +32% max)
-            const boost = Math.min(0.32, posErr * 9.5);
-            desiredVel = localBaseVel * (1.0 + boost);
-          } else {
-            // Losing time or being overtaken: slow down slightly (down to 72% speed), NEVER move backward!
-            const drag = Math.max(-0.28, posErr * 8.5);
-            desiredVel = localBaseVel * (1.0 + drag);
-          }
-
-          const velAlpha = 1 - Math.exp(-frameDt * 6.5);
-          curVel = Math.max(0, curVel + (desiredVel - curVel) * velAlpha);
+          // Fallback if race state has no d.trackPos
+          const posErr = fallbackTargetPos - curPos;
+          const desiredVel = baseLapSpeed * Math.max(0.82, Math.min(1.14, 1.0 + posErr * 4.0));
+          curVel = Math.max(0, curVel + (desiredVel - curVel) * (1 - Math.exp(-frameDt * 6.0)));
           curPos = curPos + curVel * frameDt;
         }
 
         this.carTrackPosMap.set(id, curPos);
         this.carSpeedMap.set(id, curVel);
 
-        const actualVisualGap = Math.max(0, leaderBasePos - curPos);
+        const refLeadPos = (leadDrv && this.carTrackPosMap.has(leadId)) ? this.carTrackPosMap.get(leadId) : leaderBasePos;
+        const actualVisualGap = Math.max(0, refLeadPos - curPos);
         this.visualGapMap.set(id, actualVisualGap);
 
         const prevSec = this.visualGapSecMap.has(id) ? this.visualGapSecMap.get(id) : targetGapSec;
-        const secAlpha = 1 - Math.exp(-frameDt * 5.0);
+        const secAlpha = 1 - Math.exp(-frameDt * 6.0);
         this.visualGapSecMap.set(id, prevSec + (targetGapSec - prevSec) * secAlpha);
       });
 
-      // Pass 2: Lateral Racing Line, Pit Lane Trajectory & Multi-Car Overtake Avoidance
+      // Pass 2: Lateral Racing Line, 4-Phase Pit Lane Trajectory & Multi-Car 5-Stage Overtake Lanes
       const runningIds = race.order.filter(id => race.drv[id] && race.drv[id].st === 'run');
-      // Sort by current physical track position descending (leader first) so trailing cars react to cars ahead
       runningIds.sort((a, b) => (this.carTrackPosMap.get(b) || 0) - (this.carTrackPosMap.get(a) || 0));
 
       const chosenLaterals = new Map();
@@ -1583,31 +1570,46 @@
         const curPos = this.carTrackPosMap.get(id) || 0;
         const drvPhase = this.driverPhaseMap.get(id) || 0;
         const sampleNow = window.F1Tracks.sampleTrack(race.circuit.id, curPos, 0);
-        const prevLat = this.visualLateralMap.has(id) ? this.visualLateralMap.get(id) : 0;
+        const prevLat = this.visualLateralMap.has(id)
+          ? this.visualLateralMap.get(id)
+          : (typeof d.latPos === 'number' ? d.latPos : 0);
 
-        let targetLateral = 0;
+        let targetLateral = typeof d.latTarget === 'number' ? d.latTarget : 0;
 
         if (d.pitState) {
           const ps = d.pitState;
-          const progMod = ((curPos % 1) + 1) % 1;
-          if (ps.phase === 'ENTRY') {
-            const entryT = progMod >= 0.80 ? Math.max(0, Math.min(1, (progMod - 0.84) / 0.10)) : 1.0;
-            const entrySmooth = entryT * entryT * (3 - 2 * entryT);
-            targetLateral = pSide * (1.2 + 3.55 * entrySmooth);
+          if (ps.phase === 'APPROACH') {
+            const span = Math.max(0.01, (ps.laneStartPos || (ps.lapBase + 0.90)) - (ps.entryStartPos || (ps.lapBase + 0.82)));
+            const tApp = Math.max(0, Math.min(1, (curPos - (ps.entryStartPos || (ps.lapBase + 0.82))) / span));
+            const sApp = tApp * tApp * (3 - 2 * tApp);
+            targetLateral = pSide * (1.10 + 3.65 * sApp);
+          } else if (ps.phase === 'ENTRY') {
+            const boxAbs = ps.boxAbsPos || (ps.lapBase + 0.978);
+            const distToBox = Math.max(0, boxAbs - curPos);
+            const boxBlend = distToBox < 0.018 ? (1.0 - distToBox / 0.018) : 0;
+            const boxSmooth = boxBlend * boxBlend * (3 - 2 * boxBlend);
+            targetLateral = pSide * (4.75 + 0.40 * boxSmooth);
           } else if (ps.phase === 'STOPPED') {
             targetLateral = pSide * 5.15;
           } else if (ps.phase === 'EXIT') {
-            const exitBlend = progMod > 0.80 || progMod < 0.03 ? 1.0 : Math.max(0, 1.0 - (progMod - 0.03) / 0.06);
-            const exitSmooth = exitBlend * exitBlend * (3 - 2 * exitBlend);
-            targetLateral = pSide * 4.75 * exitSmooth;
+            const exitStart = ps.exitLaneEndPos || ((ps.lapBase || 0) + 1.035);
+            const exitEnd = ps.exitMergePos || ((ps.lapBase || 0) + 1.095);
+            if (curPos < exitStart) {
+              targetLateral = pSide * 4.75;
+            } else {
+              const tEx = Math.max(0, Math.min(1, (curPos - exitStart) / Math.max(0.01, exitEnd - exitStart)));
+              const sEx = tEx * tEx * (3 - 2 * tEx);
+              targetLateral = pSide * 4.75 * (1 - sEx);
+            }
           }
         } else {
-          // Natural corner apex racing line + subtle organic weave
-          const apexHug = -Math.sign(sampleNow.curvature || 0) * Math.min(1.05, Math.abs(sampleNow.curvature || 0) * 1.45);
-          const organicLine = Math.sin(curPos * Math.PI * 2 + drvPhase) * 0.35;
-          targetLateral = Math.max(-1.8, Math.min(1.8, apexHug + organicLine));
+          if (typeof d.latTarget !== 'number') {
+            const apexHug = -Math.sign(sampleNow.curvature || 0) * Math.min(1.05, Math.abs(sampleNow.curvature || 0) * 1.40);
+            const organicLine = Math.sin(curPos * Math.PI * 2 + drvPhase) * 0.30;
+            targetLateral = Math.max(-1.75, Math.min(1.75, apexHug + organicLine));
+          }
 
-          // Check nearby cars on track for overtake pull-out & side-by-side spacing
+          // Multi-car spatial collision avoidance (ensures 3+ battling cars fan out into distinct lanes)
           const nearbyBlockedLanes = [];
           for (const otherId of runningIds) {
             if (otherId === id) continue;
@@ -1615,8 +1617,7 @@
             if (!otherD || otherD.pitState) continue;
             const otherPos = this.carTrackPosMap.get(otherId) || 0;
             const dLong = otherPos - curPos;
-            // Car is within ~2.2 car lengths ahead or side-by-side
-            if (dLong > -0.008 && dLong < 0.020) {
+            if (dLong > -0.0075 && dLong < 0.018) {
               const otherLat = chosenLaterals.has(otherId)
                 ? chosenLaterals.get(otherId)
                 : (this.visualLateralMap.get(otherId) || 0);
@@ -1625,43 +1626,44 @@
           }
 
           if (nearbyBlockedLanes.length > 0) {
-            // Evaluate candidate passing lanes (-1.65, 0.0, +1.65) and pick the clearest lane
-            const candidateLanes = [-1.65, 0.0, 1.65, -0.9, 0.9];
-            let bestLane = targetLateral;
-            let bestScore = -999;
+            // Check if current targetLateral conflicts with any nearby car (< 1.25m lateral separation)
+            const hasConflict = nearbyBlockedLanes.some(nb => Math.abs(targetLateral - nb.otherLat) < 1.25);
+            if (hasConflict) {
+              const candidateLanes = [-1.70, 0.0, 1.70, -0.88, 0.88];
+              let bestLane = targetLateral;
+              let bestScore = -999;
 
-            for (const cand of candidateLanes) {
-              let minClearance = 99;
-              for (const nb of nearbyBlockedLanes) {
-                const latDist = Math.abs(cand - nb.otherLat);
-                if (latDist < minClearance) minClearance = latDist;
+              for (const cand of candidateLanes) {
+                let minClearance = 99;
+                for (const nb of nearbyBlockedLanes) {
+                  const latDist = Math.abs(cand - nb.otherLat);
+                  if (latDist < minClearance) minClearance = latDist;
+                }
+                const stabilityBonus = -Math.abs(cand - prevLat) * 0.32 - Math.abs(cand - targetLateral) * 0.18;
+                const score = minClearance + stabilityBonus;
+                if (score > bestScore) {
+                  bestScore = score;
+                  bestLane = cand;
+                }
               }
-              // Prefer lanes with wide lateral clearance (>1.25m) while minimizing violent jumps from prevLat
-              const stabilityBonus = -Math.abs(cand - prevLat) * 0.28 - Math.abs(cand - targetLateral) * 0.12;
-              const score = minClearance + stabilityBonus;
-              if (score > bestScore) {
-                bestScore = score;
-                bestLane = cand;
-              }
+
+              const closestLong = Math.min(...nearbyBlockedLanes.map(n => Math.abs(n.dLong)));
+              const proxBlend = Math.max(0, Math.min(1, 1.0 - (closestLong / 0.018)));
+              const smoothProx = proxBlend * proxBlend * (3 - 2 * proxBlend);
+              targetLateral = targetLateral + (bestLane - targetLateral) * Math.max(0.50, smoothProx);
             }
-
-            // Smooth bell blend into passing lane as car gets closer
-            const closestLong = Math.min(...nearbyBlockedLanes.map(n => Math.abs(n.dLong)));
-            const proxBlend = Math.max(0, Math.min(1, 1.0 - (closestLong / 0.020)));
-            const smoothProx = proxBlend * proxBlend * (3 - 2 * proxBlend);
-            targetLateral = targetLateral + (bestLane - targetLateral) * Math.max(0.55, smoothProx);
           }
 
-          targetLateral = Math.max(-2.35, Math.min(2.35, targetLateral));
+          targetLateral = Math.max(-2.30, Math.min(2.30, targetLateral));
         }
 
         chosenLaterals.set(id, targetLateral);
 
-        // Critically-damped smooth lateral transition with bounded lateral steering rate
-        const latRate = d.pitState ? 4.8 : 4.2;
+        // Smooth lateral transition with realistic physical lateral steering speed limit
+        const latRate = d.pitState ? 4.4 : 3.6;
         const latAlpha = 1 - Math.exp(-frameDt * latRate);
         const desiredStep = (targetLateral - prevLat) * latAlpha;
-        const maxLatSpeed = d.pitState ? 3.2 : 2.2; // meters/sec lateral cap
+        const maxLatSpeed = d.pitState ? 2.8 : 1.55; // m/s lateral steering cap
         const maxStep = maxLatSpeed * frameDt;
         const clampedStep = Math.max(-maxStep, Math.min(maxStep, desiredStep));
         const curLateral = prevLat + clampedStep;
@@ -1671,10 +1673,10 @@
         this.visualLatVelMap.set(id, latVel);
 
         const rawSteerYaw = (this.carSpeedMap.get(id) || 0) > 0.002
-          ? Math.max(-0.22, Math.min(0.22, latVel * 0.038))
+          ? Math.max(-0.20, Math.min(0.20, latVel * 0.042))
           : 0;
         const prevYaw = this.carSteerYawMap.get(id) || 0;
-        const curYaw = prevYaw + (rawSteerYaw - prevYaw) * (1 - Math.exp(-frameDt * 10.0));
+        const curYaw = prevYaw + (rawSteerYaw - prevYaw) * (1 - Math.exp(-frameDt * 9.0));
         this.carSteerYawMap.set(id, curYaw);
       });
     }

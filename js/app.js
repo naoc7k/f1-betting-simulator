@@ -2052,24 +2052,45 @@
   }
 
   function ensureContinuousLapPlan(r, L) {
-    if (!r || !r.drv || r._plannedLap === L) return;
-    r._plannedLap = L;
+    if (!r || !r.drv) return;
     const c = r.circuit;
     const sc = r.sc || { type: null, left: 0 };
     const T = (i) => r.drv[i];
     const ord = (r.order || []).filter(i => T(i) && T(i).st === 'run');
-    ord.forEach((id) => {
+
+    ord.forEach((id, idx) => {
       const d = T(id);
-      const rawLt = sc.type === 'SC' ? c.bl * 1.45 : lapT(r, d, id) * (sc.type === 'VSC' ? 1.3 : 1);
-      d._plannedLapTime = rawLt;
-      d._accruedLapTime = 0;
+      if (typeof d.trackPos !== 'number' || Number.isNaN(d.trackPos)) {
+        const completed = Math.max(0, (Number(r.lap) || 1) - 1);
+        d.trackPos = completed === 0
+          ? (-0.004 - idx * 0.0055)
+          : Math.max(0, completed + (r.lapProgress || 0) - idx * 0.012);
+        d.trackVel = 0;
+        d.latPos = (idx % 2 === 0 ? -1 : 1) * 1.35;
+        d.latTarget = d.latPos;
+      }
+      if (d._plannedLapFor !== L || !d._plannedLapTime) {
+        d._plannedLapFor = L;
+        const rawLt = sc.type === 'SC' ? c.bl * 1.45 : lapT(r, d, id) * (sc.type === 'VSC' ? 1.3 : 1);
+        d._plannedLapTime = rawLt;
+        d._accruedLapTime = 0;
+      }
     });
+    r._plannedLap = L;
   }
 
   /**
-   * Continuous real-time physics step executed on every 100ms tick during live race simulation.
-   * Evolves driver times smoothly, triggers physical 3-stage pit stops (ENTRY -> STOPPED -> EXIT),
-   * and executes progressive overtakes when faster cars close into striking distance of cars ahead.
+   * Authoritative Continuous Race Physics & Kinematics Engine (executed every 100ms tick).
+   * - Every vehicle has an authoritative physical coordinate `d.trackPos` (in continuous laps)
+   *   and lateral coordinate `d.latPos` (in meters from track centerline).
+   * - Pit stops execute a full 4-phase physical trajectory driven by each car's own position:
+   *     1. APPROACH (0.82 -> 0.90): gradual deceleration & smooth lateral turn-in toward pit entry.
+   *     2. ENTRY    (0.90 -> boxPos): driving along the Pit Lane asphalt ribbon & braking into the team bay.
+   *     3. STOPPED  (at boxPos, 0 km/h): stationary inside the pit box for ~3.2s while tyres are changed
+   *                                      and rivals on the main straight physically pass one by one.
+   *     4. EXIT     (boxPos -> 1.095): accelerating along the pit exit lane and merging smoothly after Turn 1.
+   * - Overtakes execute a natural 5-stage physical maneuver (APPROACH -> PREPARE -> DUEL -> PASS -> COMPLETE)
+   *   with bounded relative speeds (+7% to +11%) and zero backward recoil or position jumps.
    */
   function stepContinuousRacePhysics(r, prevProg, newProg, dtMs) {
     if (!r || !r.running || !r.drv) return;
@@ -2082,143 +2103,352 @@
     ensureContinuousLapPlan(r, L);
     r._continuousLapActive = L;
 
-    const dProg = Math.max(0, Math.min(0.25, newProg - prevProg));
-    const act = (r.order || []).filter(i => T(i) && T(i).st === 'run');
+    const dtSec = Math.max(0.005, Math.min(0.25, (Number(dtMs) || 100) / 1000));
+    const lapDurSec = (r.lapDurationMs || LAP_DURATION_MS) / 1000; // 30.0s visual lap
+    const baseSpeed = 1.0 / lapDurSec; // ~0.033333 laps/sec
+    const pSide = (window.F1Sim3D && window.F1Sim3D.pitSide) ? window.F1Sim3D.pitSide : -1;
 
-    // 1. Trigger pit stop decisions as cars approach the pit entry zone (lapProgress >= 0.84)
-    if (newProg >= 0.84 && L < r.total) {
-      act.forEach((id, idx) => {
-        const d = T(id);
-        if (!d || d.pitState || d._pitCheckedLap === L) return;
-        d._pitCheckedLap = L;
-        const pc = pitCheck(r, d, L);
+    const act = (r.order || []).filter(i => T(i) && T(i).st === 'run');
+    if (act.length === 0) return;
+
+    // 1. Trigger pit stop decisions per driver based on THAT driver's own track coordinate
+    act.forEach((id, idx) => {
+      const d = T(id);
+      if (!d || d.st !== 'run' || d.pitState) return;
+      if (d.trackPos < 0.80) return;
+
+      const drvLapComp = Math.floor(Math.max(0, d.trackPos));
+      const drvLap = drvLapComp + 1;
+      const drvLapProg = d.trackPos - drvLapComp;
+
+      // Do not start a new pit entry at the end of a 10-lap betting pause lap (they will pit on lap 11/21/etc.)
+      if (drvLap >= r.total || (drvLap % 10 === 0 && drvLap < r.total)) return;
+
+      if (drvLapProg >= 0.82 && drvLapProg <= 0.90 && d._pitCheckedLap !== drvLap) {
+        d._pitCheckedLap = drvLap;
+        const pc = pitCheck(r, d, drvLap);
         if (pc) {
-          const totalLoss = c.pl * (sc.type === 'SC' ? 0.55 : sc.type === 'VSC' ? 0.65 : 1) + rnd(r) * 1.5;
+          d.battleState = null;
+          const slotIdx = ((Number(d.gp) || (idx + 1)) - 1) % 6;
+          const boxOffset = 0.968 + slotIdx * 0.0038; // 0.968 .. 0.987 alongside Pit Building
+          const stopDurMs = Math.round((2700 + rnd(r) * 700) * (sc.type === 'SC' ? 0.75 : 1.0));
           d.pitState = {
-            lap: L,
+            lap: drvLap,
+            lapBase: drvLapComp,
             newTyre: pc,
-            phase: 'ENTRY',
-            boxPos: 0.985 - (idx % 6) * 0.0035,
-            stopDurationMs: 3200,
-            stopRemainingMs: 3200,
-            totalLossSec: r2(totalLoss),
-            accruedLossSec: 0,
+            phase: 'APPROACH',
+            entryStartPos: d.trackPos,
+            laneStartPos: drvLapComp + 0.90,
+            boxAbsPos: drvLapComp + boxOffset,
+            exitLaneEndPos: drvLapComp + 1.035,
+            exitMergePos: drvLapComp + 1.095,
+            stopDurationMs: stopDurMs,
+            stopRemainingMs: stopDurMs,
             tyreFitted: false
           };
-          d.pitLap = L;
-          if (idx < 14) {
-            ev(`🔧 ${id} desacelera e entra no Pit Lane para parada nos boxes...`, 'p');
-          }
-        }
-      });
-    }
-
-    // 2. Evolve continuous lap times and active pit stop states
-    act.forEach((id) => {
-      const d = T(id);
-      if (!d || d.st !== 'run') return;
-
-      const plannedLt = d._plannedLapTime || (c.bl + 0.5);
-      const stepTime = plannedLt * dProg;
-      d.t += stepTime;
-      d._accruedLapTime = (d._accruedLapTime || 0) + stepTime;
-
-      if (d.pitState) {
-        const ps = d.pitState;
-        if (ps.phase === 'ENTRY') {
-          // Progressive deceleration loss on pit entry
-          const entryLoss = Math.min(ps.totalLossSec * 0.16 - ps.accruedLossSec, (ps.totalLossSec * 0.16) * (dProg / 0.12));
-          if (entryLoss > 0) {
-            d.t += entryLoss;
-            ps.accruedLossSec += entryLoss;
-          }
-          if (newProg >= 0.96 || (L > ps.lap)) {
-            ps.phase = 'STOPPED';
-          }
-        } else if (ps.phase === 'STOPPED') {
-          ps.stopRemainingMs = Math.max(0, (ps.stopRemainingMs || 0) - dtMs);
-          const serviceTargetLoss = ps.totalLossSec * 0.86;
-          const remLoss = Math.max(0, serviceTargetLoss - ps.accruedLossSec);
-          const tickLoss = Math.min(remLoss, (ps.totalLossSec * 0.70) * (dtMs / (ps.stopDurationMs || 3200)));
-          if (tickLoss > 0) {
-            d.t += tickLoss;
-            ps.accruedLossSec += tickLoss;
-          }
-          if (!ps.tyreFitted && ps.stopRemainingMs <= (ps.stopDurationMs || 3200) * 0.5) {
-            ps.tyreFitted = true;
-            d.tyre = ps.newTyre;
-            d.age = 0;
-            d.stops = (Number(d.stops) || 0) + 1;
-            ev(`🔧 ${id} troca pneus nos boxes → Pneu ${d.tyre} instalado!`, 'p');
-          }
-          if (ps.stopRemainingMs <= 0) {
-            ps.phase = 'EXIT';
-          }
-        } else if (ps.phase === 'EXIT') {
-          const remTotal = Math.max(0, ps.totalLossSec - ps.accruedLossSec);
-          const exitLoss = Math.min(remTotal, (ps.totalLossSec * 0.14) * (dProg / 0.08));
-          if (exitLoss > 0) {
-            d.t += exitLoss;
-            ps.accruedLossSec += exitLoss;
-          }
-          // Finish pit exit once car merges back onto main straight after Turn 1
-          if ((L > ps.lap && newProg >= 0.09) || (L === ps.lap && newProg < 0.5 && newProg >= 0.09)) {
-            if (remTotal - exitLoss > 0) {
-              d.t += (remTotal - exitLoss);
-            }
-            d.pitState = null;
+          d.pitLap = drvLap;
+          if (idx < 16) {
+            ev(`🔧 ${id} desacelera e diverge para a entrada do Pit Lane...`, 'p');
           }
         }
       }
     });
 
-    // 3. Evaluate progressive position changes (pit lane passes + real on-track overtakes)
-    for (let pass = 0; pass < 4; pass++) {
+    // 2. Build on-track order (excluding cars currently in pit lane) for 5-stage overtake pairing
+    const onTrackIds = act
+      .filter(id => !T(id).pitState)
+      .sort((a, b) => (T(b).trackPos || 0) - (T(a).trackPos || 0));
+
+    // Pre-calculate natural speed for each car on track
+    const naturalVelMap = new Map();
+    act.forEach((id, idx) => {
+      const d = T(id);
+      const plannedLt = d._plannedLapTime || c.bl;
+      const paceRatio = Math.max(0.955, Math.min(1.045, c.bl / plannedLt));
+      const sectorWave = Math.sin((d.trackPos || 0) * Math.PI * 4 + idx * 1.7) * 0.010;
+
+      let cornerFactor = 1.0;
+      let sample = null;
+      if (window.F1Tracks && typeof window.F1Tracks.sampleTrack === 'function') {
+        sample = window.F1Tracks.sampleTrack(c.id, d.trackPos || 0, 0);
+        const curv = Math.abs((sample && sample.curvature) || 0);
+        cornerFactor = 1.0 - Math.min(0.11, curv * 0.12);
+      }
+
+      let launchFactor = 1.0;
+      if ((d.trackPos || 0) < 0.06) {
+        const tLaunch = Math.max(0, Math.min(1, ((d.trackPos || 0) + 0.14) / 0.20));
+        launchFactor = 0.26 + 0.74 * (tLaunch * tLaunch * (3 - 2 * tLaunch));
+      }
+
+      const scFactor = sc.type === 'SC' ? 0.68 : sc.type === 'VSC' ? 0.80 : 1.0;
+      naturalVelMap.set(id, baseSpeed * (paceRatio + sectorWave) * cornerFactor * launchFactor * scFactor);
+    });
+
+    // 3. Manage 5-Stage Overtake Battles (APPROACH -> PREPARE -> DUEL -> PASS -> COMPLETE)
+    const defendedByMap = new Map(); // aheadId -> side being used by attacker
+    for (let i = 1; i < onTrackIds.length; i++) {
+      const id = onTrackIds[i];
+      const aheadId = onTrackIds[i - 1];
+      const db = T(id);
+      const da = T(aheadId);
+      if (!db || !da) continue;
+
+      // Validate existing battleState
+      if (db.battleState) {
+        const bsTarget = T(db.battleState.targetId);
+        if (!bsTarget || bsTarget.st !== 'run' || bsTarget.pitState || sc.type) {
+          db.battleState = null;
+        } else {
+          const dS = bsTarget.trackPos - db.trackPos;
+          if (dS > 0.045 || dS < -0.015) {
+            db.battleState = null;
+          }
+        }
+      }
+
+      // Initiate new 5-stage overtake battle when closing within slipstream range of car ahead
+      const deltaS = da.trackPos - db.trackPos;
+      if (!db.battleState && !sc.type && deltaS > 0.001 && deltaS <= 0.028) {
+        const vB = naturalVelMap.get(id) || baseSpeed;
+        const vA = naturalVelMap.get(aheadId) || baseSpeed;
+        const cooldownOk = !db._battleCooldownUntil || (db.trackPos > db._battleCooldownUntil);
+        if (cooldownOk && (vB >= vA * 0.992 || deltaS < 0.012)) {
+          const paceAdv = Math.max(0, (da._plannedLapTime || c.bl) - (db._plannedLapTime || c.bl));
+          const pSuccess = Math.min(0.90, Math.max(0.28, (c.ot || 0.5) * 0.65 + paceAdv * 0.35 + (L === 1 ? 0.15 : 0)));
+          const preferredSide = (da.latPos || 0) > 0.25 ? -1 : (da.latPos || 0) < -0.25 ? 1 : (i % 2 === 0 ? 1 : -1);
+          db.battleState = {
+            targetId: aheadId,
+            stage: deltaS > 0.014 ? 'APPROACH' : deltaS > 0.006 ? 'PREPARE' : 'DUEL',
+            side: preferredSide,
+            willSucceed: paceAdv > 0.65 ? true : (rnd(r) < pSuccess),
+            duelTimerMs: 0
+          };
+        }
+      }
+    }
+
+    // 4. Advance longitudinal & lateral kinematics for every active car
+    act.forEach((id, idx) => {
+      const d = T(id);
+      if (!d || d.st !== 'run') return;
+
+      let targetVel = naturalVelMap.get(id) || baseSpeed;
+      let sample = null;
+      if (window.F1Tracks && typeof window.F1Tracks.sampleTrack === 'function') {
+        sample = window.F1Tracks.sampleTrack(c.id, d.trackPos || 0, 0);
+      }
+      const curv = (sample && sample.curvature) || 0;
+      const apexLat = -Math.sign(curv) * Math.min(1.05, Math.abs(curv) * 1.40);
+      const weaveLat = Math.sin((d.trackPos || 0) * Math.PI * 2 + idx * 1.3) * 0.28;
+      let desiredLat = Math.max(-1.75, Math.min(1.75, apexLat + weaveLat));
+
+      if (d.pitState) {
+        const ps = d.pitState;
+        if (ps.phase === 'APPROACH') {
+          const span = Math.max(0.01, ps.laneStartPos - ps.entryStartPos);
+          const tApp = Math.max(0, Math.min(1, (d.trackPos - ps.entryStartPos) / span));
+          const sApp = tApp * tApp * (3 - 2 * tApp);
+          targetVel = baseSpeed * (0.92 - 0.48 * sApp);
+          desiredLat = pSide * (1.10 + 3.65 * sApp);
+          if (d.trackPos >= ps.laneStartPos) {
+            ps.phase = 'ENTRY';
+          }
+        } else if (ps.phase === 'ENTRY') {
+          const distToBox = Math.max(0, ps.boxAbsPos - d.trackPos);
+          if (distToBox > 0.018) {
+            targetVel = baseSpeed * 0.44;
+            desiredLat = pSide * 4.75;
+          } else {
+            const brakeT = Math.max(0, Math.min(1, distToBox / 0.018));
+            targetVel = baseSpeed * Math.max(0.10, 0.44 * brakeT);
+            const boxSmooth = (1 - brakeT) * (1 - brakeT) * (3 - 2 * (1 - brakeT));
+            desiredLat = pSide * (4.75 + 0.40 * boxSmooth);
+          }
+          if (d.trackPos + targetVel * dtSec >= ps.boxAbsPos - 0.00025) {
+            d.trackPos = ps.boxAbsPos;
+            d.trackVel = 0;
+            targetVel = 0;
+            desiredLat = pSide * 5.15;
+            ps.phase = 'STOPPED';
+          }
+        } else if (ps.phase === 'STOPPED') {
+          d.trackPos = ps.boxAbsPos;
+          d.trackVel = 0;
+          targetVel = 0;
+          desiredLat = pSide * 5.15;
+          ps.stopRemainingMs = Math.max(0, (ps.stopRemainingMs || 0) - dtMs);
+          if (!ps.tyreFitted && ps.stopRemainingMs <= (ps.stopDurationMs || 2800) * 0.5) {
+            ps.tyreFitted = true;
+            d.tyre = ps.newTyre;
+            d.age = 0;
+            d.stops = (Number(d.stops) || 0) + 1;
+            ev(`🔧 ${id} nos boxes: equipe conclui troca → Pneu ${d.tyre} instalado!`, 'p');
+          }
+          if (ps.stopRemainingMs <= 0) {
+            ps.phase = 'EXIT';
+            if (idx < 16) {
+              ev(`🟢 ${id} sai do box e acelera pelo canal de saída do Pit Lane!`, 'p');
+            }
+          }
+        } else if (ps.phase === 'EXIT') {
+          if (d.trackPos < ps.exitLaneEndPos) {
+            targetVel = baseSpeed * 0.52;
+            desiredLat = pSide * 4.75;
+          } else {
+            const span = Math.max(0.01, ps.exitMergePos - ps.exitLaneEndPos);
+            const tEx = Math.max(0, Math.min(1, (d.trackPos - ps.exitLaneEndPos) / span));
+            const sEx = tEx * tEx * (3 - 2 * tEx);
+            targetVel = baseSpeed * (0.52 + 0.48 * sEx);
+            desiredLat = pSide * 4.75 * (1 - sEx);
+          }
+          if (d.trackPos >= ps.exitMergePos) {
+            d.pitState = null;
+          }
+        }
+      } else if (d.battleState) {
+        const bs = d.battleState;
+        const da = T(bs.targetId);
+        if (da && da.st === 'run' && !da.pitState) {
+          const deltaS = da.trackPos - d.trackPos; // > 0 when da is ahead, < 0 when d has passed da
+          const vAhead = naturalVelMap.get(bs.targetId) || baseSpeed;
+          const maxOvertakeVel = baseSpeed * 1.135;
+
+          if (bs.stage === 'APPROACH') {
+            // Stage 1: Slipstream approach
+            targetVel = Math.min(maxOvertakeVel, Math.max(targetVel, vAhead * 1.065));
+            desiredLat = (da.latPos || 0) * 0.75;
+            if (deltaS <= 0.014) {
+              bs.stage = 'PREPARE';
+            }
+          } else if (bs.stage === 'PREPARE') {
+            // Stage 2: Smooth lateral pull-out to passing lane
+            const prepT = Math.max(0, Math.min(1, (0.014 - deltaS) / 0.0085));
+            const prepSmooth = prepT * prepT * (3 - 2 * prepT);
+            desiredLat = (da.latPos || 0) * (1 - prepSmooth) + (bs.side * 1.65) * prepSmooth;
+            defendedByMap.set(bs.targetId, -bs.side * 0.78 * prepSmooth);
+            targetVel = Math.min(maxOvertakeVel, Math.max(targetVel, vAhead * 1.078));
+            if (deltaS <= 0.0055) {
+              bs.stage = 'DUEL';
+              bs.duelTimerMs = 0;
+            }
+          } else if (bs.stage === 'DUEL') {
+            // Stage 3: Wheel-to-wheel side-by-side battle
+            bs.duelTimerMs = (bs.duelTimerMs || 0) + dtMs;
+            desiredLat = bs.side * 1.65;
+            defendedByMap.set(bs.targetId, -bs.side * 0.82);
+
+            if (bs.willSucceed) {
+              targetVel = Math.min(maxOvertakeVel, Math.max(targetVel, vAhead * 1.088));
+              if (deltaS < -0.0015) {
+                bs.stage = 'PASS';
+                da._battleCooldownUntil = (da.trackPos || 0) + 0.045;
+              }
+            } else {
+              // Defended wheel-to-wheel battle: pulls alongside, then car ahead holds position
+              if (bs.duelTimerMs < 1500 && deltaS > 0.0010) {
+                targetVel = Math.min(maxOvertakeVel, vAhead * 1.040);
+              } else {
+                targetVel = Math.max(baseSpeed * 0.86, vAhead * 0.945);
+                if (deltaS >= 0.0068 || bs.duelTimerMs > 3400) {
+                  d._battleCooldownUntil = d.trackPos + 0.09;
+                  d.battleState = null;
+                }
+              }
+            }
+          } else if (bs.stage === 'PASS') {
+            // Stage 4: Complete the pass in the passing lane until clear ahead
+            desiredLat = bs.side * 1.60;
+            defendedByMap.set(bs.targetId, -bs.side * 0.70);
+            targetVel = Math.min(maxOvertakeVel, Math.max(targetVel, vAhead * 1.058));
+            if (deltaS < -0.0085) {
+              bs.stage = 'COMPLETE';
+            }
+          } else if (bs.stage === 'COMPLETE') {
+            // Stage 5: Smooth return to normal racing line
+            d._battleCooldownUntil = d.trackPos + 0.05;
+            d.battleState = null;
+          }
+        } else {
+          d.battleState = null;
+        }
+      }
+
+      // Apply defensive line offset if being attacked from behind
+      if (!d.pitState && !d.battleState && defendedByMap.has(id)) {
+        desiredLat = defendedByMap.get(id);
+      }
+
+      // Safety Car / non-overtaking spacing guard so cars never rear-end without a battle
+      if (!d.pitState && !d.battleState) {
+        const myOnTrackIdx = onTrackIds.indexOf(id);
+        if (myOnTrackIdx > 0) {
+          const aheadId = onTrackIds[myOnTrackIdx - 1];
+          const da = T(aheadId);
+          if (da) {
+            const gapAhead = da.trackPos - d.trackPos;
+            const minSafeGap = sc.type === 'SC' ? 0.014 : 0.0055;
+            if (gapAhead > 0 && gapAhead < minSafeGap) {
+              targetVel = Math.min(targetVel, (da.trackVel || baseSpeed) * 0.96);
+            }
+          }
+        }
+      }
+
+      // Smooth longitudinal velocity & strictly monotonic position integration
+      if (d.pitState && d.pitState.phase === 'STOPPED') {
+        d.trackVel = 0;
+        d.trackPos = d.pitState.boxAbsPos;
+      } else {
+        targetVel = Math.max(0, Math.min(baseSpeed * 1.14, targetVel));
+        const prevVel = typeof d.trackVel === 'number' ? d.trackVel : targetVel;
+        const velRate = d.pitState ? 5.0 : 3.8;
+        const velAlpha = 1 - Math.exp(-dtSec * velRate);
+        d.trackVel = Math.max(0, Math.min(baseSpeed * 1.14, prevVel + (targetVel - prevVel) * velAlpha));
+        d.trackPos = (d.trackPos || 0) + d.trackVel * dtSec;
+      }
+
+      // Smooth lateral transition with physical lateral steering speed cap
+      d.latTarget = desiredLat;
+      const prevLat = typeof d.latPos === 'number' ? d.latPos : desiredLat;
+      const latRate = d.pitState ? 4.2 : 3.4;
+      const latAlpha = 1 - Math.exp(-dtSec * latRate);
+      const maxLatSpeed = d.pitState ? 2.8 : 1.55; // m/s lateral steering cap
+      const maxLatStep = maxLatSpeed * dtSec;
+      const rawLatStep = (desiredLat - prevLat) * latAlpha;
+      const clampedLatStep = Math.max(-maxLatStep, Math.min(maxLatStep, rawLatStep));
+      d.latPos = prevLat + clampedLatStep;
+    });
+
+    // 5. Evaluate progressive position swaps strictly when physical track coordinates cross
+    for (let pass = 0; pass < act.length; pass++) {
       let anySwap = false;
       for (let i = 1; i < act.length; i++) {
         const a = act[i - 1], b = act[i];
         const ta = T(a), tb = T(b);
         if (!ta || !tb || ta.st !== 'run' || tb.st !== 'run') continue;
 
-        const aInPit = !!(ta.pitState && (ta.pitState.phase === 'ENTRY' || ta.pitState.phase === 'STOPPED' || ta.pitState.phase === 'EXIT'));
-        const bInPit = !!(tb.pitState && (tb.pitState.phase === 'ENTRY' || tb.pitState.phase === 'STOPPED' || tb.pitState.phase === 'EXIT'));
+        const aInPit = !!ta.pitState;
+        const bInPit = !!tb.pitState;
 
-        if (tb.t < ta.t) {
-          const dd = ta.t - tb.t;
-          if (aInPit && !bInPit) {
-            // Rival car on main straight passes pitted car coherently while it is in the pit lane/box (NOT counted as an on-track overtake!)
-            act[i - 1] = b;
-            act[i] = a;
-            anySwap = true;
-            continue;
-          }
-          if (sc.type || bInPit) {
-            tb.t = ta.t + 0.22;
-            continue;
-          }
-          // Real on-track overtake attempt when trailing car has closed into striking distance
-          const checkGate = Math.floor(newProg * 12) !== Math.floor(prevProg * 12);
-          if (dd > 0.42 || checkGate) {
-            const p = dd > 1.15 ? 1 : Math.min(0.90, Math.max(0.12, (c.ot * 0.55 + dd * 0.35) * (r.w > 0.4 ? 1.15 : 1) * (L === 1 ? 1.3 : 1)));
-            if (rnd(r) < p) {
-              act[i - 1] = b;
-              act[i] = a;
-              // Keep both cars moving strictly forward: never push `ta.t` backward!
-              tb.t = Math.min(tb.t, ta.t - 0.14);
+        if ((tb.trackPos || 0) > (ta.trackPos || 0)) {
+          act[i - 1] = b;
+          act[i] = a;
+          anySwap = true;
+
+          if (!aInPit && !bInPit && !sc.type) {
+            const pairKey = `${L}_${b}_${a}`;
+            if (tb._lastOvKey !== pairKey) {
+              tb._lastOvKey = pairKey;
               tb.overtakingTarget = a;
-              tb.overtakeUntilTs = Date.now() + 2100;
-              tb.overtakeSide = (i % 2 === 0) ? -1 : 1;
-              anySwap = true;
-              const secNum = newProg < 0.34 ? 1 : newProg < 0.67 ? 2 : 3;
+              tb.overtakeUntilTs = Date.now() + 2200;
+              tb.overtakeSide = (tb.latPos || 0) >= (ta.latPos || 0) ? 1 : -1;
+              const drvProg = ((tb.trackPos % 1) + 1) % 1;
+              const secNum = drvProg < 0.34 ? 1 : drvProg < 0.67 ? 2 : 3;
               recordRealOvertakeEvent(r, L, b, a, i, secNum);
               if (i <= 12) {
-                ev(`⚔️ Setor ${secNum}: ${b} aproxima no vácuo, abre de lado e ultrapassa ${a} pela P${i}!`, 'o');
+                ev(`⚔️ Setor ${secNum}: ${b} conclui manobra lado a lado e ultrapassa ${a} pela P${i}!`, 'o');
               }
-            } else {
-              // Defended: trailing car stays close in the slipstream battling for position without recoiling
-              tb.t = ta.t + 0.14;
-              tb.battlingTarget = a;
-              tb.battleUntilTs = Date.now() + 1600;
             }
           }
         }
@@ -2226,14 +2456,23 @@
       if (!anySwap) break;
     }
 
-    if (sc.type === 'SC') {
-      act.forEach((id, i) => {
+    // 6. Synchronize cumulative driver times `d.t` 1:1 with physical track distance `d.trackPos`
+    const leadId = act[0];
+    const leadDrv = T(leadId);
+    if (leadDrv) {
+      const leadPlannedLt = leadDrv._plannedLapTime || c.bl;
+      const dProg = Math.max(0, Math.min(0.25, newProg - prevProg));
+      leadDrv.t = (leadDrv.t || 0) + leadPlannedLt * dProg;
+      const leadPos = leadDrv.trackPos || 0;
+      const leadTime = leadDrv.t;
+
+      for (let i = 1; i < act.length; i++) {
+        const id = act[i];
         const d = T(id);
-        if (d && !d.pitState) {
-          const targetScT = T(act[0]).t + i * 0.55;
-          d.t = d.t + (targetScT - d.t) * 0.15;
-        }
-      });
+        if (!d) continue;
+        const gapLaps = Math.max(0, leadPos - (d.trackPos || 0));
+        d.t = leadTime + gapLaps * c.bl;
+      }
     }
 
     r.order = act.concat((r.dnf || []).slice().reverse().sort((a, b) => T(b).lapsDone - T(a).lapsDone));
@@ -2269,8 +2508,7 @@
     ord.forEach((id, i) => {
       const d = T(id), s = sk(id);
       let loss = 0;
-      const alreadyCheckedPit = (wasContinuous && d._pitCheckedLap === L);
-      if (alreadyCheckedPit) {
+      if (wasContinuous) {
         if (d.pitLap === L || d.pitState) pit[id] = 1;
       } else {
         const pc = pitCheck(r, d, L);
@@ -2307,14 +2545,15 @@
       } else if (rnd(r) < 0.0008 * (d.age > 26 ? 2 : 1) * q) {
         out('Motor', ' abandona com falha mecânica');
         if (!trig && rnd(r) < 0.4) trig = 'VSC';
-      } else if (rnd(r) < 0.004 * (1 + s * 2) * (1 + r.w * 2) * q) {
+      } else if (!wasContinuous && rnd(r) < 0.004 * (1 + s * 2) * (1 + r.w * 2) * q) {
         loss += 2.5 + rnd(r) * 5;
         ev(`${id} trava rodas na freada e perde tempo`, 'e');
       }
 
       if (d.st === 'run') {
-        const remainingLt = wasContinuous ? Math.max(0, lt - (d._accruedLapTime || 0)) : lt;
-        d.t += remainingLt + loss;
+        if (!wasContinuous) {
+          d.t += lt + loss;
+        }
         d._accruedLapTime = 0;
         d._plannedLapTime = 0;
         d.age++;
@@ -2331,33 +2570,35 @@
     }
 
     const act = ord.filter(i => T(i).st === 'run');
-    for (let k = 0; k < 30; k++) {
-      let ch = false;
-      for (let i = 1; i < act.length; i++) {
-        const a = act[i - 1], b = act[i], ta = T(a), tb = T(b);
-        if (tb.t < ta.t) {
-          const dd = ta.t - tb.t;
-          const aPitted = !!(pit[a] || ta.pitState);
-          const bPitted = !!(pit[b] || tb.pitState);
-          const p = sc.type ? 0 : dd > 1.4 || aPitted ? 1 : Math.min(0.92, Math.max(0.08, (c.ot * 0.6 + dd * 0.25) * (r.w > 0.4 ? 1.15 : 1) * (L === 1 ? 1.4 : 1)));
-          if (rnd(r) < p) {
-            act[i - 1] = b;
-            act[i] = a;
-            ch = true;
-            if (!aPitted && !bPitted && ta.st === 'run' && tb.st === 'run' && dd <= 1.5) {
-              recordRealOvertakeEvent(r, L, b, a, i, null);
-              if (i < 12) ev(`${b} ultrapassa ${a} na pista e assume a P${i}!`, 'o');
+    if (!wasContinuous) {
+      for (let k = 0; k < 30; k++) {
+        let ch = false;
+        for (let i = 1; i < act.length; i++) {
+          const a = act[i - 1], b = act[i], ta = T(a), tb = T(b);
+          if (tb.t < ta.t) {
+            const dd = ta.t - tb.t;
+            const aPitted = !!(pit[a] || ta.pitState);
+            const bPitted = !!(pit[b] || tb.pitState);
+            const p = sc.type ? 0 : dd > 1.4 || aPitted ? 1 : Math.min(0.92, Math.max(0.08, (c.ot * 0.6 + dd * 0.25) * (r.w > 0.4 ? 1.15 : 1) * (L === 1 ? 1.4 : 1)));
+            if (rnd(r) < p) {
+              act[i - 1] = b;
+              act[i] = a;
+              ch = true;
+              if (!aPitted && !bPitted && ta.st === 'run' && tb.st === 'run' && dd <= 1.5) {
+                recordRealOvertakeEvent(r, L, b, a, i, null);
+                if (i < 12) ev(`${b} ultrapassa ${a} na pista e assume a P${i}!`, 'o');
+              }
+            } else {
+              tb.t = ta.t + 0.22;
             }
-          } else {
-            tb.t = ta.t + 0.22;
           }
         }
+        if (!ch) break;
       }
-      if (!ch) break;
-    }
 
-    if (sc.type === 'SC') {
-      act.forEach((id, i) => { T(id).t = T(act[0]).t + i * 0.65; });
+      if (sc.type === 'SC') {
+        act.forEach((id, i) => { T(id).t = T(act[0]).t + i * 0.65; });
+      }
     }
 
     r.order = act.concat(r.dnf.slice().reverse().sort((a, b) => T(b).lapsDone - T(a).lapsDone));
@@ -2443,6 +2684,10 @@
       }
       r.drv[id] = {
         t: i * 0.28,
+        trackPos: -0.004 - i * 0.0055,
+        trackVel: 0,
+        latPos: (i % 2 === 0 ? -1 : 1) * 1.35,
+        latTarget: (i % 2 === 0 ? -1 : 1) * 1.35,
         prevRank: i,
         prevGapSec: i * 0.28,
         tyre: r.ws ? 'I' : p < 0.45 ? 'S' : p < 0.82 ? 'M' : 'H',
